@@ -1,243 +1,163 @@
-"""Initial schema: bloggers, raw_contents, opinions, opinion details, verification records
+"""Initial schema
 
 Revision ID: 001
 Revises:
 Create Date: 2024-01-01 00:00:00.000000
 """
-
 from typing import Sequence, Union
-
-import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.dialects import postgresql
+from sqlalchemy import text
 
 revision: str = "001"
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+ENUMS = [
+    ("platform_enum",                       "('x', 'youtube', 'manual')"),
+    ("content_type_enum",                   "('text', 'video')"),
+    ("opinion_type_enum",                   "('prediction', 'history', 'advice', 'commentary')"),
+    ("opinion_status_enum",                 "('pending', 'tracking', 'verified', 'refuted', 'expired', 'closed')"),
+    ("prediction_verification_status_enum", "('pending', 'verified_true', 'verified_false', 'expired')"),
+    ("assumption_level_enum",               "('none', 'low', 'medium', 'high')"),
+    ("sentiment_enum",                      "('positive', 'negative', 'neutral', 'mixed')"),
+    ("verification_result_enum",            "('supports', 'refutes', 'inconclusive', 'pending')"),
+]
+
+TABLES = [
+    """CREATE TABLE IF NOT EXISTS bloggers (
+        id              SERIAL PRIMARY KEY,
+        platform        platform_enum NOT NULL,
+        url             VARCHAR(2048),
+        name            VARCHAR(255) NOT NULL,
+        description     TEXT,
+        is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+        last_crawled_at TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_bloggers_id ON bloggers(id)",
+
+    """CREATE TABLE IF NOT EXISTS raw_contents (
+        id           SERIAL PRIMARY KEY,
+        blogger_id   INTEGER NOT NULL REFERENCES bloggers(id) ON DELETE CASCADE,
+        platform     VARCHAR(50) NOT NULL,
+        content_type content_type_enum NOT NULL,
+        raw_text     TEXT,
+        video_url    VARCHAR(2048),
+        transcript   TEXT,
+        source_url   VARCHAR(2048),
+        source_id    VARCHAR(512),
+        published_at TIMESTAMPTZ,
+        crawled_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        is_processed BOOLEAN NOT NULL DEFAULT FALSE
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_raw_contents_id ON raw_contents(id)",
+    "CREATE INDEX IF NOT EXISTS ix_raw_contents_blogger_id ON raw_contents(blogger_id)",
+    "CREATE INDEX IF NOT EXISTS ix_raw_contents_source_id ON raw_contents(source_id)",
+
+    """CREATE TABLE IF NOT EXISTS opinions (
+        id             SERIAL PRIMARY KEY,
+        blogger_id     INTEGER NOT NULL REFERENCES bloggers(id) ON DELETE CASCADE,
+        raw_content_id INTEGER REFERENCES raw_contents(id) ON DELETE SET NULL,
+        text           TEXT NOT NULL,
+        abstract_level INTEGER NOT NULL DEFAULT 1,
+        opinion_type   opinion_type_enum NOT NULL,
+        status         opinion_status_enum NOT NULL DEFAULT 'pending',
+        importance     INTEGER NOT NULL DEFAULT 3,
+        influence      INTEGER NOT NULL DEFAULT 3,
+        domain_tags    TEXT[],
+        topic_tags     TEXT[],
+        language       VARCHAR(20),
+        source_quote   TEXT,
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_opinions_id ON opinions(id)",
+    "CREATE INDEX IF NOT EXISTS ix_opinions_blogger_id ON opinions(blogger_id)",
+    "CREATE INDEX IF NOT EXISTS ix_opinions_raw_content_id ON opinions(raw_content_id)",
+    "CREATE INDEX IF NOT EXISTS ix_opinions_opinion_type ON opinions(opinion_type)",
+    "CREATE INDEX IF NOT EXISTS ix_opinions_status ON opinions(status)",
+
+    """CREATE TABLE IF NOT EXISTS prediction_details (
+        id                    SERIAL PRIMARY KEY,
+        opinion_id            INTEGER NOT NULL UNIQUE REFERENCES opinions(id) ON DELETE CASCADE,
+        prediction_summary    TEXT NOT NULL,
+        deadline              DATE,
+        verification_status   prediction_verification_status_enum NOT NULL DEFAULT 'pending',
+        evidence_links        TEXT[],
+        authoritative_sources TEXT[],
+        last_checked_at       TIMESTAMPTZ
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_prediction_details_id ON prediction_details(id)",
+
+    """CREATE TABLE IF NOT EXISTS history_details (
+        id                 SERIAL PRIMARY KEY,
+        opinion_id         INTEGER NOT NULL UNIQUE REFERENCES opinions(id) ON DELETE CASCADE,
+        claim_summary      TEXT NOT NULL,
+        is_complete        BOOLEAN NOT NULL DEFAULT FALSE,
+        assumption_level   assumption_level_enum NOT NULL DEFAULT 'none',
+        has_assumptions    BOOLEAN NOT NULL DEFAULT FALSE,
+        assumption_list    TEXT[],
+        can_verify         BOOLEAN NOT NULL DEFAULT FALSE,
+        verification_notes TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_history_details_id ON history_details(id)",
+
+    """CREATE TABLE IF NOT EXISTS advice_details (
+        id                 SERIAL PRIMARY KEY,
+        opinion_id         INTEGER NOT NULL UNIQUE REFERENCES opinions(id) ON DELETE CASCADE,
+        advice_summary     TEXT NOT NULL,
+        basis              TEXT,
+        rarity_score       INTEGER NOT NULL DEFAULT 3,
+        importance_score   INTEGER NOT NULL DEFAULT 3,
+        source_credibility TEXT,
+        action_items       TEXT[]
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_advice_details_id ON advice_details(id)",
+
+    """CREATE TABLE IF NOT EXISTS commentary_details (
+        id                     SERIAL PRIMARY KEY,
+        opinion_id             INTEGER NOT NULL UNIQUE REFERENCES opinions(id) ON DELETE CASCADE,
+        sentiment              sentiment_enum NOT NULL DEFAULT 'neutral',
+        target_subject         TEXT,
+        public_opinion_summary TEXT,
+        followup_opinions      TEXT[],
+        last_tracked_at        TIMESTAMPTZ
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_commentary_details_id ON commentary_details(id)",
+
+    """CREATE TABLE IF NOT EXISTS verification_records (
+        id            SERIAL PRIMARY KEY,
+        opinion_id    INTEGER NOT NULL REFERENCES opinions(id) ON DELETE CASCADE,
+        check_type    VARCHAR(100) NOT NULL,
+        result        verification_result_enum NOT NULL DEFAULT 'pending',
+        evidence_text TEXT,
+        source_url    VARCHAR(2048),
+        authoritative BOOLEAN NOT NULL DEFAULT FALSE,
+        checked_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_verification_records_id ON verification_records(id)",
+    "CREATE INDEX IF NOT EXISTS ix_verification_records_opinion_id ON verification_records(opinion_id)",
+]
+
 
 def upgrade() -> None:
-    # --- Enums ---
-    platform_enum = postgresql.ENUM(
-        "x", "youtube", "manual", name="platform_enum", create_type=True
-    )
-    platform_enum.create(op.get_bind(), checkfirst=True)
-
-    content_type_enum = postgresql.ENUM(
-        "text", "video", name="content_type_enum", create_type=True
-    )
-    content_type_enum.create(op.get_bind(), checkfirst=True)
-
-    opinion_type_enum = postgresql.ENUM(
-        "prediction", "history", "advice", "commentary",
-        name="opinion_type_enum", create_type=True
-    )
-    opinion_type_enum.create(op.get_bind(), checkfirst=True)
-
-    opinion_status_enum = postgresql.ENUM(
-        "pending", "tracking", "verified", "refuted", "expired", "closed",
-        name="opinion_status_enum", create_type=True
-    )
-    opinion_status_enum.create(op.get_bind(), checkfirst=True)
-
-    prediction_verification_status_enum = postgresql.ENUM(
-        "pending", "verified_true", "verified_false", "expired",
-        name="prediction_verification_status_enum", create_type=True
-    )
-    prediction_verification_status_enum.create(op.get_bind(), checkfirst=True)
-
-    assumption_level_enum = postgresql.ENUM(
-        "none", "low", "medium", "high",
-        name="assumption_level_enum", create_type=True
-    )
-    assumption_level_enum.create(op.get_bind(), checkfirst=True)
-
-    sentiment_enum = postgresql.ENUM(
-        "positive", "negative", "neutral", "mixed",
-        name="sentiment_enum", create_type=True
-    )
-    sentiment_enum.create(op.get_bind(), checkfirst=True)
-
-    verification_result_enum = postgresql.ENUM(
-        "supports", "refutes", "inconclusive", "pending",
-        name="verification_result_enum", create_type=True
-    )
-    verification_result_enum.create(op.get_bind(), checkfirst=True)
-
-    # --- Tables ---
-
-    # bloggers
-    op.create_table(
-        "bloggers",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column("platform", sa.Enum("x", "youtube", "manual", name="platform_enum"), nullable=False),
-        sa.Column("url", sa.String(2048), nullable=True),
-        sa.Column("name", sa.String(255), nullable=False),
-        sa.Column("description", sa.Text(), nullable=True),
-        sa.Column("is_active", sa.Boolean(), default=True, nullable=False),
-        sa.Column("last_crawled_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now(), nullable=False),
-    )
-    op.create_index("ix_bloggers_id", "bloggers", ["id"])
-
-    # raw_contents
-    op.create_table(
-        "raw_contents",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column("blogger_id", sa.Integer(), sa.ForeignKey("bloggers.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("platform", sa.String(50), nullable=False),
-        sa.Column("content_type", sa.Enum("text", "video", name="content_type_enum"), nullable=False),
-        sa.Column("raw_text", sa.Text(), nullable=True),
-        sa.Column("video_url", sa.String(2048), nullable=True),
-        sa.Column("transcript", sa.Text(), nullable=True),
-        sa.Column("source_url", sa.String(2048), nullable=True),
-        sa.Column("source_id", sa.String(512), nullable=True),
-        sa.Column("published_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("crawled_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("is_processed", sa.Boolean(), default=False, nullable=False),
-    )
-    op.create_index("ix_raw_contents_id", "raw_contents", ["id"])
-    op.create_index("ix_raw_contents_blogger_id", "raw_contents", ["blogger_id"])
-    op.create_index("ix_raw_contents_source_id", "raw_contents", ["source_id"])
-
-    # opinions
-    op.create_table(
-        "opinions",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column("blogger_id", sa.Integer(), sa.ForeignKey("bloggers.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("raw_content_id", sa.Integer(), sa.ForeignKey("raw_contents.id", ondelete="SET NULL"), nullable=True),
-        sa.Column("text", sa.Text(), nullable=False),
-        sa.Column("abstract_level", sa.Integer(), default=1, nullable=False),
-        sa.Column("opinion_type", sa.Enum("prediction", "history", "advice", "commentary", name="opinion_type_enum"), nullable=False),
-        sa.Column("status", sa.Enum("pending", "tracking", "verified", "refuted", "expired", "closed", name="opinion_status_enum"), default="pending", nullable=False),
-        sa.Column("importance", sa.Integer(), default=3, nullable=False),
-        sa.Column("influence", sa.Integer(), default=3, nullable=False),
-        sa.Column("domain_tags", postgresql.ARRAY(sa.String()), nullable=True),
-        sa.Column("topic_tags", postgresql.ARRAY(sa.String()), nullable=True),
-        sa.Column("language", sa.String(20), nullable=True),
-        sa.Column("source_quote", sa.Text(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now(), nullable=False),
-    )
-    op.create_index("ix_opinions_id", "opinions", ["id"])
-    op.create_index("ix_opinions_blogger_id", "opinions", ["blogger_id"])
-    op.create_index("ix_opinions_raw_content_id", "opinions", ["raw_content_id"])
-    op.create_index("ix_opinions_opinion_type", "opinions", ["opinion_type"])
-    op.create_index("ix_opinions_status", "opinions", ["status"])
-
-    # prediction_details
-    op.create_table(
-        "prediction_details",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column("opinion_id", sa.Integer(), sa.ForeignKey("opinions.id", ondelete="CASCADE"), nullable=False, unique=True),
-        sa.Column("prediction_summary", sa.Text(), nullable=False),
-        sa.Column("deadline", sa.Date(), nullable=True),
-        sa.Column(
-            "verification_status",
-            sa.Enum("pending", "verified_true", "verified_false", "expired", name="prediction_verification_status_enum"),
-            default="pending",
-            nullable=False,
-        ),
-        sa.Column("evidence_links", postgresql.ARRAY(sa.String()), nullable=True),
-        sa.Column("authoritative_sources", postgresql.ARRAY(sa.String()), nullable=True),
-        sa.Column("last_checked_at", sa.DateTime(timezone=True), nullable=True),
-    )
-    op.create_index("ix_prediction_details_id", "prediction_details", ["id"])
-
-    # history_details
-    op.create_table(
-        "history_details",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column("opinion_id", sa.Integer(), sa.ForeignKey("opinions.id", ondelete="CASCADE"), nullable=False, unique=True),
-        sa.Column("claim_summary", sa.Text(), nullable=False),
-        sa.Column("is_complete", sa.Boolean(), default=False, nullable=False),
-        sa.Column(
-            "assumption_level",
-            sa.Enum("none", "low", "medium", "high", name="assumption_level_enum"),
-            default="none",
-            nullable=False,
-        ),
-        sa.Column("has_assumptions", sa.Boolean(), default=False, nullable=False),
-        sa.Column("assumption_list", postgresql.ARRAY(sa.String()), nullable=True),
-        sa.Column("can_verify", sa.Boolean(), default=False, nullable=False),
-        sa.Column("verification_notes", sa.Text(), nullable=True),
-    )
-    op.create_index("ix_history_details_id", "history_details", ["id"])
-
-    # advice_details
-    op.create_table(
-        "advice_details",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column("opinion_id", sa.Integer(), sa.ForeignKey("opinions.id", ondelete="CASCADE"), nullable=False, unique=True),
-        sa.Column("advice_summary", sa.Text(), nullable=False),
-        sa.Column("basis", sa.Text(), nullable=True),
-        sa.Column("rarity_score", sa.Integer(), default=3, nullable=False),
-        sa.Column("importance_score", sa.Integer(), default=3, nullable=False),
-        sa.Column("source_credibility", sa.Text(), nullable=True),
-        sa.Column("action_items", postgresql.ARRAY(sa.String()), nullable=True),
-    )
-    op.create_index("ix_advice_details_id", "advice_details", ["id"])
-
-    # commentary_details
-    op.create_table(
-        "commentary_details",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column("opinion_id", sa.Integer(), sa.ForeignKey("opinions.id", ondelete="CASCADE"), nullable=False, unique=True),
-        sa.Column(
-            "sentiment",
-            sa.Enum("positive", "negative", "neutral", "mixed", name="sentiment_enum"),
-            default="neutral",
-            nullable=False,
-        ),
-        sa.Column("target_subject", sa.Text(), nullable=True),
-        sa.Column("public_opinion_summary", sa.Text(), nullable=True),
-        sa.Column("followup_opinions", postgresql.ARRAY(sa.String()), nullable=True),
-        sa.Column("last_tracked_at", sa.DateTime(timezone=True), nullable=True),
-    )
-    op.create_index("ix_commentary_details_id", "commentary_details", ["id"])
-
-    # verification_records
-    op.create_table(
-        "verification_records",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column("opinion_id", sa.Integer(), sa.ForeignKey("opinions.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("check_type", sa.String(100), nullable=False),
-        sa.Column(
-            "result",
-            sa.Enum("supports", "refutes", "inconclusive", "pending", name="verification_result_enum"),
-            default="pending",
-            nullable=False,
-        ),
-        sa.Column("evidence_text", sa.Text(), nullable=True),
-        sa.Column("source_url", sa.String(2048), nullable=True),
-        sa.Column("authoritative", sa.Boolean(), default=False, nullable=False),
-        sa.Column("checked_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-    )
-    op.create_index("ix_verification_records_id", "verification_records", ["id"])
-    op.create_index("ix_verification_records_opinion_id", "verification_records", ["opinion_id"])
+    conn = op.get_bind()
+    for name, values in ENUMS:
+        conn.execute(text(
+            f"DO $$ BEGIN CREATE TYPE {name} AS ENUM {values}; "
+            f"EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+        ))
+    for stmt in TABLES:
+        conn.execute(text(stmt))
 
 
 def downgrade() -> None:
-    op.drop_table("verification_records")
-    op.drop_table("commentary_details")
-    op.drop_table("advice_details")
-    op.drop_table("history_details")
-    op.drop_table("prediction_details")
-    op.drop_table("opinions")
-    op.drop_table("raw_contents")
-    op.drop_table("bloggers")
-
-    # Drop enums
-    for enum_name in [
-        "verification_result_enum",
-        "sentiment_enum",
-        "assumption_level_enum",
-        "prediction_verification_status_enum",
-        "opinion_status_enum",
-        "opinion_type_enum",
-        "content_type_enum",
-        "platform_enum",
-    ]:
-        op.execute(f"DROP TYPE IF EXISTS {enum_name}")
+    conn = op.get_bind()
+    for tbl in ["verification_records", "commentary_details", "advice_details",
+                "history_details", "prediction_details", "opinions",
+                "raw_contents", "bloggers"]:
+        conn.execute(text(f"DROP TABLE IF EXISTS {tbl} CASCADE"))
+    for name, _ in reversed(ENUMS):
+        conn.execute(text(f"DROP TYPE IF EXISTS {name}"))

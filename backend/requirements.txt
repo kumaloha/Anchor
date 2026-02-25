@@ -20,7 +20,7 @@ tweepy==4.14.0
 
 # YouTube + Transcription
 yt-dlp==2024.5.27
-openai-whisper==20231117
+faster-whisper==1.0.3
 
 # Pydantic & settings
 pydantic==2.7.1

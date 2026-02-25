@@ -1,5 +1,7 @@
+import asyncio
 import logging
 from datetime import datetime, timezone
+from functools import partial
 from typing import List, Optional
 from urllib.parse import urlparse
 
@@ -12,7 +14,6 @@ from app.services.collectors.base import BaseCollector
 
 logger = logging.getLogger(__name__)
 
-# Maximum tweets to retrieve per crawl
 MAX_RESULTS_PER_REQUEST = 10
 MAX_PAGES = 3
 
@@ -23,36 +24,29 @@ class TwitterCollector(BaseCollector):
     def supports_platform(self, platform: str) -> bool:
         return platform == "x"
 
-    def _get_client(self) -> tweepy.AsyncClient:
+    def _get_client(self) -> tweepy.Client:
         if not settings.TWITTER_BEARER_TOKEN:
             raise RuntimeError("TWITTER_BEARER_TOKEN is not configured")
-        return tweepy.AsyncClient(bearer_token=settings.TWITTER_BEARER_TOKEN)
+        return tweepy.Client(bearer_token=settings.TWITTER_BEARER_TOKEN, wait_on_rate_limit=False)
 
     def _extract_username(self, blogger: Blogger) -> str:
-        """
-        Extract a Twitter username from the blogger's URL or name.
-        Handles:
-          - https://twitter.com/username
-          - https://x.com/username
-          - @username
-          - username
-        """
         url = blogger.url or ""
         if url:
             path = urlparse(url).path
             parts = [p for p in path.split("/") if p]
             if parts:
                 return parts[0].lstrip("@")
-        # Fall back to name field
         return blogger.name.lstrip("@")
 
     async def fetch(self, blogger: Blogger) -> List[RawContent]:
+        loop = asyncio.get_event_loop()
         client = self._get_client()
         username = self._extract_username(blogger)
 
         try:
-            # Resolve username -> user id
-            user_resp = await client.get_user(username=username)
+            user_resp = await loop.run_in_executor(
+                None, partial(client.get_user, username=username)
+            )
             if not user_resp.data:
                 logger.warning("TwitterCollector: user '%s' not found", username)
                 return []
@@ -66,13 +60,14 @@ class TwitterCollector(BaseCollector):
 
         for page_num in range(MAX_PAGES):
             try:
-                resp = await client.get_users_tweets(
+                resp = await loop.run_in_executor(None, partial(
+                    client.get_users_tweets,
                     id=user_id,
                     max_results=MAX_RESULTS_PER_REQUEST,
                     pagination_token=pagination_token,
                     tweet_fields=["created_at", "text", "id"],
                     exclude=["retweets", "replies"],
-                )
+                ))
             except tweepy.TooManyRequests:
                 logger.warning("TwitterCollector: rate limited on page %d for '%s'", page_num, username)
                 break
@@ -86,7 +81,6 @@ class TwitterCollector(BaseCollector):
             for tweet in resp.data:
                 published_at: Optional[datetime] = None
                 if tweet.created_at:
-                    # tweepy returns datetime objects for created_at
                     if isinstance(tweet.created_at, datetime):
                         published_at = tweet.created_at
                         if published_at.tzinfo is None:
@@ -95,9 +89,9 @@ class TwitterCollector(BaseCollector):
                         try:
                             published_at = datetime.fromisoformat(str(tweet.created_at))
                         except ValueError:
-                            published_at = None
+                            pass
 
-                raw = RawContent(
+                results.append(RawContent(
                     blogger_id=blogger.id,
                     platform="x",
                     content_type=ContentTypeEnum.text,
@@ -106,19 +100,13 @@ class TwitterCollector(BaseCollector):
                     source_id=str(tweet.id),
                     published_at=published_at,
                     is_processed=False,
-                )
-                results.append(raw)
+                ))
 
-            # Check for next page
             meta = getattr(resp, "meta", None)
             if meta and hasattr(meta, "next_token") and meta.next_token:
                 pagination_token = meta.next_token
             else:
                 break
 
-        logger.info(
-            "TwitterCollector: fetched %d tweets for blogger '%s'",
-            len(results),
-            blogger.name,
-        )
+        logger.info("TwitterCollector: fetched %d tweets for '%s'", len(results), blogger.name)
         return results

@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
 import yt_dlp
-import whisper
+from faster_whisper import WhisperModel
 
 from app.core.config import settings
 from app.models.blogger import Blogger
@@ -23,7 +23,7 @@ def _get_whisper_model() -> Any:
     global _whisper_model
     if _whisper_model is None:
         logger.info("Loading Whisper model '%s'...", settings.WHISPER_MODEL)
-        _whisper_model = whisper.load_model(settings.WHISPER_MODEL)
+        _whisper_model = WhisperModel(settings.WHISPER_MODEL, device="cpu", compute_type="int8")
     return _whisper_model
 
 
@@ -117,8 +117,9 @@ def _transcribe_video(video_url: str) -> Optional[str]:
 
         try:
             model = _get_whisper_model()
-            result = model.transcribe(mp3_file, fp16=False)
-            return result.get("text", "").strip()
+            segments, _ = model.transcribe(mp3_file, beam_size=5)
+            text = " ".join(seg.text for seg in segments).strip()
+            return text
         except Exception as exc:
             logger.error("Whisper transcription failed for %s: %s", video_url, exc)
             return None
