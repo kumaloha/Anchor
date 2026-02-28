@@ -1,257 +1,165 @@
-# Anchor
+# Anchor — 经济观点准确性追踪系统
 
-**Opinion tracking and verification system for X (Twitter) and YouTube content.**
+> 锚定经济预测，验证观点价值
 
-Anchor collects posts and videos from public commentators, uses LLMs to extract and classify opinions into four types (prediction / history / advice / commentary), and tracks/verifies them over time.
-
----
-
-## Features
-
-- 🐦 **X (Twitter) & YouTube collection** — automated crawling via tweepy and yt-dlp
-- 🎙️ **Video transcription** — openai-whisper for YouTube audio-to-text
-- 🤖 **LLM extraction** — GPT-4o extracts distinct opinions from raw text/transcripts
-- 🏷️ **4-type classification** — prediction, history, advice, commentary with type-specific attributes
-- ✅ **Automated verification** — per-type trackers check predictions, validate historical claims, evaluate advice
-- 📋 **REST API** — full CRUD + async task dispatch via Celery
-- ⏰ **Beat scheduling** — crawls all active bloggers every 6 hours
+Anchor 是一个三层架构的经济观点数据库，系统性地收集社交媒体上的经济相关观点，对其进行分类打标，并长期追踪验证其准确性。
 
 ---
 
-## Architecture
+## 系统架构
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Layer 1  信息采集层  (Collector)                      │
+│  从 Twitter/X、微博、财经 RSS 等来源抓取原始内容          │
+└─────────────────────────┬────────────────────────────┘
+                          │ 原始帖子
+┌─────────────────────────▼────────────────────────────┐
+│  Layer 2  观点分类层  (Classifier)                     │
+│  用 Claude API 提取可验证的经济观点，识别实体与类别        │
+└─────────────────────────┬────────────────────────────┘
+                          │ 结构化观点
+┌─────────────────────────▼────────────────────────────┐
+│  Layer 3  追踪验证层  (Tracker)                        │
+│  对接金融数据源，到期自动验证观点准确性并打分               │
+└──────────────────────────────────────────────────────┘
+```
+
+### Layer 1 — 信息采集
+
+| 采集器 | 数据源 | 说明 |
+|--------|--------|------|
+| `TwitterCollector` | Twitter/X API v2 | 关键词搜索 + 指定账号时间线 |
+| `WeiboCollector` | 微博 API / 爬虫 | 热门财经话题、大 V 博文 |
+| `RSSCollector` | 财经 RSS 源 | 财联社、36氪、彭博、路透等 |
+
+### Layer 2 — 观点分类
+
+使用 Claude API 对原始文本做结构化提取：
+
+- **观点类型**：预测型 / 分析型 / 评论型
+- **资产类别**：股票 / 债券 / 大宗商品 / 汇率 / 宏观经济
+- **方向性**：看多 / 看空 / 中性
+- **时间跨度**：短期（<1个月）/ 中期（1–12个月）/ 长期（>1年）
+- **可验证性评分**：0–1，越高代表越容易客观核实
+
+### Layer 3 — 追踪验证
+
+- 到期后自动拉取金融数据（Yahoo Finance / AKShare 等）
+- 对照观点预测方向判定结果（正确 / 错误 / 部分正确 / 无法判定）
+- 统计每位作者的历史准确率，构建可信度档案
+
+---
+
+## 技术栈
+
+| 模块 | 技术 |
+|------|------|
+| 后端框架 | Python 3.12 + FastAPI |
+| 数据库 | PostgreSQL + SQLModel |
+| 任务调度 | APScheduler |
+| AI 分类 | Anthropic Claude API |
+| 金融数据 | AKShare / yfinance |
+| 采集工具 | Tweepy / feedparser / httpx |
+
+---
+
+## 目录结构
 
 ```
 Anchor/
-├── backend/
-│   ├── app/
-│   │   ├── core/           # Config, database, Celery setup
-│   │   ├── models/         # SQLAlchemy ORM models (PostgreSQL)
-│   │   ├── schemas/        # Pydantic v2 schemas
-│   │   ├── services/
-│   │   │   ├── collectors/ # Twitter + YouTube data collection
-│   │   │   ├── extractors/ # LLM opinion extraction
-│   │   │   ├── processors/ # Opinion classification
-│   │   │   └── trackers/   # Per-type verification trackers
-│   │   ├── api/            # FastAPI routers and endpoints
-│   │   └── tasks/          # Celery tasks
-│   ├── alembic/            # Database migrations
-│   ├── requirements.txt
-│   └── run.py              # Convenience runner
-└── docker-compose.yml      # PostgreSQL + Redis
+├── anchor/
+│   ├── collector/          # Layer 1: 数据采集
+│   │   ├── base.py         # 抽象基类
+│   │   ├── twitter.py      # Twitter/X 采集器
+│   │   ├── weibo.py        # 微博采集器
+│   │   ├── rss.py          # RSS 采集器
+│   │   └── manager.py      # 采集调度管理器
+│   ├── classifier/         # Layer 2: 观点分类
+│   │   ├── extractor.py    # Claude API 观点提取
+│   │   └── pipeline.py     # 分类流水线
+│   ├── tracker/            # Layer 3: 追踪验证
+│   │   ├── verifier.py     # 验证逻辑
+│   │   ├── data_sources.py # 金融数据接口
+│   │   └── scorer.py       # 准确率评分
+│   ├── database/
+│   │   ├── models.py       # SQLModel 数据模型
+│   │   └── session.py      # 数据库连接
+│   ├── api/
+│   │   ├── routers/        # FastAPI 路由
+│   │   └── main.py         # 应用入口
+│   └── config.py           # 配置管理
+├── tests/
+├── .env.example
+├── requirements.txt
+└── README.md
 ```
 
 ---
 
-## Quick Start
+## 快速开始
 
-### 1. Prerequisites
-
-- Python 3.11+
-- Docker + Docker Compose
-- ffmpeg (for yt-dlp audio processing)
+### 1. 环境准备
 
 ```bash
-# macOS
-brew install ffmpeg
-
-# Ubuntu/Debian
-sudo apt install ffmpeg
-```
-
-### 2. Start Infrastructure
-
-```bash
-cd /path/to/Anchor
-docker-compose up -d
-```
-
-This starts:
-- PostgreSQL on `localhost:5432` (user/pass/db: `anchor`)
-- Redis on `localhost:6379`
-
-### 3. Install Python Dependencies
-
-```bash
-cd backend
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Configure Environment
+### 2. 配置环境变量
 
 ```bash
 cp .env.example .env
-# Edit .env with your keys:
-# - OPENAI_API_KEY
-# - TWITTER_BEARER_TOKEN (optional, only needed for X crawling)
+# 编辑 .env，填入各平台 API Key
 ```
 
-### 5. Run Database Migrations
+### 3. 初始化数据库
 
 ```bash
-cd backend
-alembic upgrade head
+python -m anchor.database.session --create
 ```
 
-Or use the convenience runner:
+### 4. 启动采集任务
 
 ```bash
-python run.py migrate
+# 单次采集
+python -m anchor.collector.manager --run-once
+
+# 持续调度（默认每小时采集一次）
+python -m anchor.collector.manager
 ```
 
-### 6. Start the API Server
+### 5. 启动 API 服务
 
 ```bash
-python run.py
-# or
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn anchor.api.main:app --reload
 ```
 
-API docs available at: http://localhost:8000/docs
+访问 `http://localhost:8000/docs` 查看 API 文档。
 
-### 7. Start the Celery Worker (separate terminal)
+---
 
-```bash
-cd backend
-python run.py worker
+## 数据模型概览
+
 ```
-
-### 8. Start the Beat Scheduler (separate terminal, optional)
-
-```bash
-cd backend
-python run.py beat
+RawPost          原始帖子（来自各平台的未处理文本）
+  └─► Opinion    提取后的结构化观点
+        └─► Verification  到期验证结果
 ```
 
 ---
 
-## API Reference
+## 路线图
 
-### Bloggers
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/bloggers` | Add a new blogger |
-| `GET` | `/api/bloggers` | List all bloggers |
-| `GET` | `/api/bloggers/{id}` | Get blogger by ID |
-| `PATCH` | `/api/bloggers/{id}` | Update blogger |
-| `DELETE` | `/api/bloggers/{id}` | Delete blogger |
-
-**Add a blogger:**
-```json
-POST /api/bloggers
-{
-  "platform": "youtube",
-  "url": "https://www.youtube.com/@SomeChannel",
-  "name": "Some Channel",
-  "description": "Finance commentary"
-}
-```
-
-### Ingest
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/ingest/crawl/{blogger_id}` | Trigger crawl for a blogger |
-| `POST` | `/api/ingest/url` | Ingest a single URL |
-| `POST` | `/api/ingest/manual` | Submit raw text manually |
-
-**Manual ingest:**
-```json
-POST /api/ingest/manual
-{
-  "blogger_id": 1,
-  "text": "I believe BTC will reach $200k by end of 2025.",
-  "language": "en"
-}
-```
-
-### Opinions
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/opinions` | List opinions (with filters) |
-| `GET` | `/api/opinions/{id}` | Get opinion detail |
-| `PATCH` | `/api/opinions/{id}` | Update opinion |
-| `DELETE` | `/api/opinions/{id}` | Delete opinion |
-| `GET` | `/api/opinions/{id}/verifications` | List verification records |
-
-**Filter opinions:**
-```
-GET /api/opinions?opinion_type=prediction&status=pending&blogger_id=1
-```
-
-### Tracking
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/tracking/run/{opinion_id}` | Trigger tracking for an opinion |
-| `GET` | `/api/tracking/summary` | Get overview statistics |
-
----
-
-## Opinion Types
-
-| Type | Description | Key Attributes |
-|------|-------------|----------------|
-| **prediction** | Forward-looking claim about future events | deadline, verification status |
-| **history** | Claim about past events | completeness, assumption level, verifiability |
-| **advice** | Recommendation or prescriptive guidance | basis, rarity score, importance score, action items |
-| **commentary** | Analysis or critique of a person/event | sentiment, target subject, public opinion |
-
----
-
-## Data Models
-
-### Opinion Status Flow
-
-```
-pending → tracking → verified
-                   → refuted
-                   → expired
-                   → closed
-```
-
-### Opinion Abstraction Levels
-
-- **Level 1**: Raw/verbatim — closely mirrors source wording
-- **Level 2**: Summary — paraphrased/compressed
-- **Level 3**: Core theme — high-level synthesis
-
----
-
-## Configuration
-
-All settings are in `backend/.env`. See `.env.example` for the full list.
-
-| Variable | Description |
-|----------|-------------|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `REDIS_URL` | Redis connection string |
-| `OPENAI_API_KEY` | OpenAI API key (required for extraction/classification) |
-| `TWITTER_BEARER_TOKEN` | Twitter API v2 bearer token (required for X crawling) |
-| `OPENAI_MODEL` | Model to use (default: `gpt-4o`) |
-| `WHISPER_MODEL` | Whisper model size (default: `base`) |
-| `CRAWL_INTERVAL_HOURS` | How often to crawl all bloggers (default: `6`) |
-| `YT_MAX_RECENT_VIDEOS` | Max videos to fetch per YouTube channel (default: `5`) |
-
----
-
-## Development
-
-```bash
-# Check API docs
-open http://localhost:8000/docs
-
-# Check task status
-celery -A app.core.celery_app.celery_app inspect active
-
-# Monitor Celery (optional)
-pip install flower
-celery -A app.core.celery_app.celery_app flower
-```
+- [x] Layer 1: 多平台采集器框架
+- [ ] Layer 1: Twitter/X、微博、RSS 采集器实现
+- [ ] Layer 2: Claude API 观点提取 Pipeline
+- [ ] Layer 3: 金融数据对接与自动验证
+- [ ] Web Dashboard: 观点浏览与作者准确率排行
 
 ---
 
 ## License
 
-See [LICENSE](LICENSE).
+MIT
