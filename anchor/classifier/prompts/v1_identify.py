@@ -7,7 +7,7 @@ Prompt v1 — 四类观点提取（事实/结论/解决方案/逻辑）
   Step C：提取结论（含回顾型 retrospective 和预测型 predictive）
   Step D：提取解决方案（作者提出的具体行动建议）
   Step E：建立逻辑关系
-    - inference：哪些事实支撑哪个结论，哪些是假设条件
+    - inference：事实/假设性事实/其他结论 → 目标结论（隐含条件由 Layer3 识别）
     - derivation：哪些结论推导出哪个解决方案
 """
 
@@ -49,7 +49,9 @@ _OUTPUT_SCHEMA = f'''
       "canonical_claim": "概念归一化标准形式（≤60字，标准术语）",
       "conclusion_type": "retrospective",
       "time_horizon_note": "结论有效时效描述或null",
-      "valid_until_note": "仅predictive时填写预测有效期，否则null"
+      "valid_until_note": "仅predictive时填写预测有效期，否则null",
+      "author_confidence": "certain|likely|uncertain|speculative",
+      "author_confidence_note": "作者原文中表达自信/不确定性的具体语句（≤40字），无则null"
     }}
   ],
   "solutions": [
@@ -67,7 +69,8 @@ _OUTPUT_SCHEMA = f'''
       "logic_type": "inference",
       "target_index": 0,
       "supporting_fact_indices": [0, 1],
-      "assumption_fact_indices": []
+      "assumption_fact_indices": [2],
+      "supporting_conclusion_indices": []
     }},
     {{
       "logic_type": "derivation",
@@ -124,6 +127,15 @@ class PromptV1Identify(BasePrompt):
 
 > 注意：两类结论统一放在 conclusions 数组中，用 conclusion_type 区分。
 
+**作者自信度（author_confidence）：**
+从作者的表达语气判断其对该结论的确信程度，填入以下四档之一：
+- `certain`     — 作者明确断言，如"一定会"、"毫无疑问"、"必然"、"肯定"
+- `likely`      — 作者认为很可能，如"预计"、"很可能"、"应该"（无显著限定词时默认）
+- `uncertain`   — 作者明确表达不确定，如"也许"、"不太确定"、"有可能不准"
+- `speculative` — 作者明确标注为猜测，如"只是猜测"、"纯属个人看法"、"仅供参考"
+
+若原文有对应的具体表达语句，摘录到 author_confidence_note（≤40字）；否则填 null。
+
 ### 解决方案（Solution）
 作者从结论推导出的具体行动建议。
 - 必须是可执行的金融/投资/资产配置建议（买什么、卖什么、持有什么）
@@ -133,10 +145,14 @@ class PromptV1Identify(BasePrompt):
 
 ### 逻辑（Logic）
 建立推理链，分两种类型：
-- **inference**（事实→结论）：
+- **inference**（多种前提→结论）：
   - 每个结论都必须关联一条 inference Logic
-  - supporting_fact_indices：已知支撑事实（已发生或可核实的证据）
-  - assumption_fact_indices：假设条件（尚未发生或待验证的前提）
+  - 前提可来自以下四类（按实际情况填写，可组合）：
+    - `supporting_fact_indices`：**事实**——作者明确引用的、已发生或可核实的证据（指向 facts[]）
+    - `assumption_fact_indices`：**假设性事实**——尚未发生或待验证的假设前提（指向 facts[]）
+    - `supporting_conclusion_indices`：**结论**——以另一个结论作为论证起点时使用（指向 conclusions[]）
+    - 隐含条件（Layer3 自动识别，此处不填）
+  - 无对应前提时填空数组 []
 - **derivation**（结论→解决方案）：
   - 每个解决方案都必须关联一条 derivation Logic
   - source_conclusion_indices：推导所基于的结论索引
@@ -200,6 +216,7 @@ class PromptV1Identify(BasePrompt):
 - 识别作者的每个判断：是回顾型（对已发生/当前事件的判断）还是预测型（对未来的判断）？
 - 统一放在 conclusions 数组，用 conclusion_type 区分
 - 预测型结论填写 valid_until_note
+- 判断作者对每个结论的自信程度（author_confidence），并摘录原文语句（author_confidence_note）
 
 **Step D：提取解决方案**
 - 识别作者提出的具体行动建议（买入/卖出/持有等资产配置建议）
@@ -208,7 +225,7 @@ class PromptV1Identify(BasePrompt):
 - 若无具体投资建议，solutions 填 []
 
 **Step E：建立逻辑关系**
-- 为每个结论创建一条 inference Logic：区分支撑事实 vs 假设条件
+- 为每个结论创建一条 inference Logic：区分四类前提（事实 / 假设性事实 / 其他结论 / 隐含条件留空）
 - 为每个解决方案创建一条 derivation Logic：关联推导所基于的结论
 
 {_OUTPUT_SCHEMA}

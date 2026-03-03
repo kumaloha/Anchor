@@ -4,9 +4,9 @@ Layer3 Step 9 — 作者综合评估更新器
 在所有验证/裁定步骤完成后，聚合每位作者在 7 个维度的表现数据，更新 AuthorStats 记录。
 
 7 个维度：
-  1. 事实准确率       — FactEvaluations(true) / (true+false)
+  1. 事实准确率       — FactEvaluations(true) / (true+false)（兼容旧数据）
   2. 结论准确性       — ConclusionVerdicts(confirmed) / 已裁定结论
-  3. 预测准确性       — ConclusionVerdicts(confirmed, predictive) / 已裁定预测
+  3. 预测准确性       — PredictionVerdicts(confirmed) / 已裁定预测（v2；旧数据兼容 ConclusionVerdicts predictive）
   4. 逻辑严谨性       — Logic.logic_completeness 均值（complete=1.0/partial=0.6/weak=0.3/invalid=0.0）
   5. 建议可靠性       — SolutionAssessments(confirmed) / 已裁定建议
   6. 内容独特性       — PostQualityAssessment.uniqueness_score 均值
@@ -35,11 +35,14 @@ from anchor.models import (
     Logic,
     LogicCompleteness,
     PostQualityAssessment,
+    Prediction,
+    PredictionVerdict,
     Solution,
     SolutionAssessment,
     VerdictResult,
     _utcnow,
 )
+from anchor.tracker.author_stance_updater import AuthorStanceUpdater
 
 _RIGOR_SCORES: dict[LogicCompleteness, float] = {
     LogicCompleteness.COMPLETE: 1.0,
@@ -85,6 +88,13 @@ class AuthorStatsUpdater:
         conclusions = list(conc_r.all())
         conclusion_ids = [c.id for c in conclusions]
         predictive_ids = {c.id for c in conclusions if c.conclusion_type == "predictive"}
+
+        # ── 作者的所有预测 (v2) ───────────────────────────────────────────
+        pred_r = await session.exec(
+            select(Prediction).where(Prediction.author_id == author.id)
+        )
+        predictions = list(pred_r.all())
+        prediction_ids = [p.id for p in predictions]
 
         # ── 推理逻辑（inference 类型） ────────────────────────────────────────
         if conclusion_ids:
@@ -173,11 +183,26 @@ class AuthorStatsUpdater:
         else:
             conclusion_accuracy = (None, 0)
 
-        # 3. 预测准确性（仅 predictive 类型，已裁定）
-        pred_decided = [
+        # 3. 预测准确性（v2：读 PredictionVerdict；兼容旧数据：predictive 结论）
+        if prediction_ids:
+            pv_r = await session.exec(
+                select(PredictionVerdict).where(
+                    PredictionVerdict.prediction_id.in_(prediction_ids)
+                )
+            )
+            pred_verdicts_v2 = list(pv_r.all())
+        else:
+            pred_verdicts_v2 = []
+
+        pred_decided_v2 = [v for v in pred_verdicts_v2 if v.verdict not in _UNDECIDED]
+
+        # Also include old-style predictive conclusion verdicts for backwards compatibility
+        pred_decided_old = [
             v for v in all_verdicts
             if v.conclusion_id in predictive_ids and v.verdict not in _UNDECIDED
         ]
+
+        pred_decided = pred_decided_v2 + pred_decided_old
         if pred_decided:
             pred_confirmed = sum(1 for v in pred_decided if v.verdict == VerdictResult.CONFIRMED)
             prediction_accuracy = (pred_confirmed / len(pred_decided), len(pred_decided))
@@ -285,3 +310,6 @@ class AuthorStatsUpdater:
             f"facts={fact_str} | conc={conc_str} | logic={logic_str} | "
             f"posts={len(quality_assessments)}"
         )
+
+        # Step 9b：更新作者立场分布档案
+        await AuthorStanceUpdater().update(author, session)

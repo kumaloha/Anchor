@@ -121,18 +121,48 @@ _PROMPT_NO_SEARCH = """\
 class AuthorProfiler:
     """分析作者角色档案（Layer3 Step 0）。"""
 
-    async def profile(self, author: Author, session: AsyncSession) -> None:
-        """查询并写入作者档案。若已查询过则跳过。"""
+    async def profile(
+        self, author: Author, session: AsyncSession, force: bool = False
+    ) -> None:
+        """查询并写入作者档案。
 
-        if author.profile_fetched:
-            logger.debug(f"[AuthorProfiler] author id={author.id} already profiled, skip")
-            return
+        Args:
+            force: True 时强制重新联网查询，忽略 profile_fetched 标志
+                   （用于修正之前未联网时的错误档案）
+        """
 
-        logger.info(f"[AuthorProfiler] profiling author: {author.name} ({author.platform})")
+        if not force and author.profile_fetched:
+            # 若已查询过且可信度明确（tier 1-4），直接跳过
+            if author.credibility_tier and author.credibility_tier < 5:
+                logger.debug(
+                    f"[AuthorProfiler] author id={author.id} already profiled "
+                    f"(tier={author.credibility_tier}), skip"
+                )
+                return
+            # tier=5（未知）且 Tavily 可用时：重新联网查询
+            from anchor.config import settings as _settings
+            if not _settings.tavily_api_key:
+                logger.debug(
+                    f"[AuthorProfiler] author id={author.id} tier=5 but no Tavily, skip"
+                )
+                return
+            logger.info(
+                f"[AuthorProfiler] author id={author.id} tier=5, retrying with Tavily web search"
+            )
+        else:
+            logger.info(f"[AuthorProfiler] profiling author: {author.name} ({author.platform})")
+
+        # ── 搜索查询词构建 ────────────────────────────────────────────────────
+        # 中文名（含非 ASCII 字符）：使用中文关键词，效果显著优于英文
+        is_cjk_name = any(ord(c) > 0x2E7F for c in (author.name or ""))
+        if is_cjk_name:
+            search_query = f"{author.name} 背景 职业 工作经历 个人简介 投资"
+        else:
+            search_query = f"{author.name} background career role expertise biography investor"
 
         # ── 联网搜索（可选）──────────────────────────────────────────────────
         search_results = await web_search(
-            query=f"{author.name} {author.platform} background role expertise biography",
+            query=search_query,
             max_results=5,
         )
 

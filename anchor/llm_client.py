@@ -35,11 +35,16 @@ async def chat_completion(
     system: str,
     user: str,
     max_tokens: int = 4096,
+    model: str | None = None,
 ) -> Optional[LLMResponse]:
-    """调用 LLM，返回文本响应。失败返回 None。"""
+    """调用 LLM，返回文本响应。失败返回 None。
+
+    Args:
+        model: 覆盖默认模型（用于多模型方案设计场景）。None 则使用 settings 配置的主模型。
+    """
     if _is_openai_mode():
-        return await _openai_completion(system, user, max_tokens)
-    return await _anthropic_completion(system, user, max_tokens)
+        return await _openai_completion(system, user, max_tokens, model=model)
+    return await _anthropic_completion(system, user, max_tokens, model=model)
 
 
 async def transcribe_audio(
@@ -128,7 +133,7 @@ def _get_anthropic_vision_model() -> str:
 
 
 async def _openai_completion(
-    system: str, user: str, max_tokens: int
+    system: str, user: str, max_tokens: int, model: str | None = None
 ) -> Optional[LLMResponse]:
     from openai import AsyncOpenAI, APIError
 
@@ -138,7 +143,7 @@ async def _openai_completion(
     )
     try:
         resp = await client.chat.completions.create(
-            model=_get_openai_model(),
+            model=model or _get_openai_model(),
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -163,7 +168,7 @@ async def _openai_completion(
 
 
 async def _anthropic_completion(
-    system: str, user: str, max_tokens: int
+    system: str, user: str, max_tokens: int, model: str | None = None
 ) -> Optional[LLMResponse]:
     import anthropic
 
@@ -176,7 +181,7 @@ async def _anthropic_completion(
     client = anthropic.AsyncAnthropic(api_key=api_key)
     try:
         resp = await client.messages.create(
-            model=_get_anthropic_model(),
+            model=model or _get_anthropic_model(),
             max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": user}],

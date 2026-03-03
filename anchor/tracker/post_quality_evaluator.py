@@ -39,7 +39,7 @@ from anchor.models import (
     RawPost,
 )
 
-_MAX_TOKENS = 512
+_MAX_TOKENS = 768
 
 # ---------------------------------------------------------------------------
 # 系统提示
@@ -47,7 +47,7 @@ _MAX_TOKENS = 512
 
 _SYSTEM = """\
 你是一名内容质量分析专家，专注于金融/经济评论领域。
-你的任务是评估一篇内容的信息有效性——实质性专业内容与噪声内容的比例。
+你的任务是评估一篇内容的信息有效性——实质性专业内容与噪声内容的比例——并判断作者的表达立场。
 
 噪声类型定义：
   emotional_rhetoric — 情绪化表达，渲染恐惧/愤怒/兴奋但无实质信息（如"这是灾难！"）
@@ -55,6 +55,19 @@ _SYSTEM = """\
   filler             — 反复重申相同观点、套话、无新信息的废话（如绕来绕去表达同一个意思）
 
 注意：正常的论证展开、举例说明、引用数据都是实质性内容，不算噪声。
+
+## 作者立场分析（stance）
+
+同时判断作者在此篇内容中的表达立场（从以下选一个）：
+- 看涨/多头  — 对某资产/经济前景持乐观或买入立场
+- 看跌/空头  — 对某资产/经济前景持悲观或卖出立场
+- 中立/客观  — 以陈述分析为主，不明显倾向任何方向
+- 警告/防御  — 主要表达风险提示、防御性建议
+- 批判/质疑  — 对某政策/机构/观点持批判或质疑态度
+- 政策倡导  — 主要推动某政策改变或社会议题
+- 教育/分析  — 以知识传递和分析为主，无明显观点倾向
+- 其他      — 无法归入以上任一类别
+
 输出必须是合法 JSON，不加任何其他文字。\
 """
 
@@ -65,7 +78,7 @@ _PROMPT = """\
 
 ## 评估任务
 
-请分析上述内容的信息有效性。
+请分析上述内容的信息有效性，并判断作者立场。
 
 严格输出 JSON：
 
@@ -74,7 +87,9 @@ _PROMPT = """\
   "effectiveness_score": <0.0-1.0，实质内容占比，1.0=全是实质内容，0.0=全是噪声>,
   "noise_ratio": <0.0-1.0，噪声占比>,
   "noise_types": [<存在的噪声类型，从 emotional_rhetoric/entertainment/filler 中选，无则为空数组>],
-  "effectiveness_note": "<1句话说明，≤60字，指出主要问题或亮点>"
+  "effectiveness_note": "<1句话说明，≤60字，指出主要问题或亮点>",
+  "stance_label": "<从以下选一个：看涨/多头 | 看跌/空头 | 中立/客观 | 警告/防御 | 批判/质疑 | 政策倡导 | 教育/分析 | 其他>",
+  "stance_note": "<1句话说明作者立场，≤80字>"
 }}
 ```\
 """
@@ -122,12 +137,14 @@ class PostQualityEvaluator:
             similar_author_count,
         ) = await self._assess_uniqueness(raw_post, author, session)
 
-        # ── 有效性分析 ────────────────────────────────────────────────────────
+        # ── 有效性分析（含立场） ──────────────────────────────────────────────
         (
             effectiveness_score,
             effectiveness_note,
             noise_ratio,
             noise_types,
+            stance_label,
+            stance_note,
         ) = await self._assess_effectiveness(raw_post)
 
         # ── 写入数据库 ────────────────────────────────────────────────────────
@@ -145,6 +162,8 @@ class PostQualityEvaluator:
             noise_types=(
                 json.dumps(noise_types, ensure_ascii=False) if noise_types else None
             ),
+            stance_label=stance_label,
+            stance_note=stance_note,
         )
         session.add(assessment)
         await session.flush()
@@ -152,7 +171,8 @@ class PostQualityEvaluator:
         logger.info(
             f"[PostQualityEvaluator] raw_post id={raw_post.id} | "
             f"uniqueness={uniqueness_score:.2f} first_mover={is_first_mover} | "
-            f"effectiveness={effectiveness_score:.2f} noise={noise_ratio:.2f}"
+            f"effectiveness={effectiveness_score:.2f} noise={noise_ratio:.2f} | "
+            f"stance={stance_label}"
         )
 
     # ── 独特性分析 ─────────────────────────────────────────────────────────────
@@ -286,13 +306,14 @@ class PostQualityEvaluator:
     async def _assess_effectiveness(
         self,
         raw_post: RawPost,
-    ) -> tuple[float, str | None, float, list[str]]:
+    ) -> tuple[float, str | None, float, list[str], str | None, str | None]:
         """
-        返回 (effectiveness_score, effectiveness_note, noise_ratio, noise_types)
+        返回 (effectiveness_score, effectiveness_note, noise_ratio, noise_types,
+               stance_label, stance_note)
         """
         content = raw_post.enriched_content or raw_post.content
         if not content or len(content.strip()) < 50:
-            return 0.5, "内容过短，无法有效评估", 0.5, []
+            return 0.5, "内容过短，无法有效评估", 0.5, [], None, None
 
         # 截断超长内容
         if len(content) > 3000:
@@ -309,14 +330,14 @@ class PostQualityEvaluator:
             logger.warning(
                 f"[PostQualityEvaluator] LLM call failed for raw_post id={raw_post.id}"
             )
-            return 0.5, None, 0.5, []
+            return 0.5, None, 0.5, [], None, None
 
         parsed = _parse_json(resp.content)
         if parsed is None:
             logger.warning(
                 f"[PostQualityEvaluator] JSON parse failed for raw_post id={raw_post.id}"
             )
-            return 0.5, None, 0.5, []
+            return 0.5, None, 0.5, [], None, None
 
         effectiveness_score = _clamp(float(parsed.get("effectiveness_score") or 0.5))
         noise_ratio = _clamp(float(parsed.get("noise_ratio") or 0.5))
@@ -326,8 +347,10 @@ class PostQualityEvaluator:
             noise_types = [noise_types]
 
         effectiveness_note = parsed.get("effectiveness_note") or None
+        stance_label = parsed.get("stance_label") or None
+        stance_note = parsed.get("stance_note") or None
 
-        return effectiveness_score, effectiveness_note, noise_ratio, noise_types
+        return effectiveness_score, effectiveness_note, noise_ratio, noise_types, stance_label, stance_note
 
 
 # ---------------------------------------------------------------------------

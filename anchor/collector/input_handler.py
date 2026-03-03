@@ -156,7 +156,15 @@ async def process_url(url: str, session: AsyncSession) -> InputResult:
         raw_posts_data = await fetcher.fetch_profile(parsed.platform_id, since=since)
 
     # 获取或创建 Author
-    author = await _get_or_create_author(session, parsed, raw_posts_data)
+    author, is_new_author = await _get_or_create_author(session, parsed, raw_posts_data)
+
+    # Step A：若新创建 Author，尝试跨平台实体识别
+    if is_new_author:
+        try:
+            from anchor.tracker.author_group_matcher import AuthorGroupMatcher
+            await AuthorGroupMatcher().match(author, session)
+        except Exception as exc:
+            logger.warning(f"AuthorGroupMatcher failed (non-blocking): {exc}")
 
     # 注册 MonitoredSource
     source = MonitoredSource(
@@ -173,6 +181,15 @@ async def process_url(url: str, session: AsyncSession) -> InputResult:
 
     # 写入 raw_posts（去重）
     saved_posts = await _save_raw_posts(session, raw_posts_data, source.id)
+
+    # Step B：跨平台内容去重检查
+    if saved_posts:
+        try:
+            from anchor.collector.content_duplicate_checker import ContentDuplicateChecker
+            await ContentDuplicateChecker().check(author.id, saved_posts, session)
+        except Exception as exc:
+            logger.warning(f"ContentDuplicateChecker failed (non-blocking): {exc}")
+
     await session.commit()
 
     logger.info(
@@ -209,6 +226,15 @@ async def poll_monitored_source(
         )
 
     saved = await _save_raw_posts(session, raw_posts_data, source.id)
+
+    # Step B：跨平台内容去重检查（使用监控源的 author_id）
+    if saved and source.author_id:
+        try:
+            from anchor.collector.content_duplicate_checker import ContentDuplicateChecker
+            await ContentDuplicateChecker().check(source.author_id, saved, session)
+        except Exception as exc:
+            logger.warning(f"ContentDuplicateChecker failed (non-blocking): {exc}")
+
     source.last_fetched_at = _utcnow()
     session.add(source)
     await session.commit()
@@ -238,8 +264,12 @@ async def _get_or_create_author(
     session: AsyncSession,
     parsed: ParsedURL,
     posts: list[RawPostData],
-) -> Author:
-    """从已抓取的帖子中提取作者信息，写入或复用 authors 表。"""
+) -> tuple[Author, bool]:
+    """从已抓取的帖子中提取作者信息，写入或复用 authors 表。
+
+    Returns:
+        (author, is_new) — is_new=True 表示本次新创建了该 Author 记录
+    """
     author_name = posts[0].author_name if posts else parsed.platform_id
     author_platform_id = posts[0].author_id if posts else parsed.platform_id
 
@@ -251,7 +281,7 @@ async def _get_or_create_author(
     )
     author = existing.first()
     if author:
-        return author
+        return author, False
 
     author = Author(
         name=author_name,
@@ -261,7 +291,7 @@ async def _get_or_create_author(
     )
     session.add(author)
     await session.flush()
-    return author
+    return author, True
 
 
 async def _save_raw_posts(

@@ -1,19 +1,20 @@
 """
 Anchor 核心数据模型
 ==================
-四类基础模型：
-  Fact（事实）— Layer2 提取，Layer3 验证
-  Conclusion（结论）— 作者的判断（含回顾型和预测型）
-  Solution（解决方案）— 作者从结论推导出的行动建议
-  Logic（逻辑）— 推理链（inference: 事实→结论，derivation: 结论→解决方案）
+四类核心实体（v3）：
+  Fact（事实依据）— Layer2 提取，Layer4 现实对齐
+  Conclusion（结论）— 回顾型 + 预测型（含 is_core_conclusion）
+  Condition（条件）— 统一假设条件 + 隐含条件
+  Solution（解决方案）— 作者建议的行动方案（不验证裁定）
+  Logic（逻辑）— 推理链（inference/derivation）
 
 模型定义顺序（避免前向引用）：
-  枚举 → Topic / Author / MonitoredSource
-  → Fact → VerificationReference
-  → Conclusion / Solution
-  → Logic → RawPost
-  → FactEvaluation → ConclusionVerdict / SolutionAssessment
-  → LogicRelation → PostQualityAssessment → AuthorStats
+  枚举 → AuthorGroup / Topic / Author / MonitoredSource
+  → Assumption → Fact → VerificationReference
+  → Conclusion / Prediction / Solution
+  → Condition → Logic → RawPost
+  → FactEvaluation → ConclusionVerdict / PredictionVerdict / SolutionAssessment
+  → ImplicitCondition → LogicRelation → PostQualityAssessment → AuthorStanceProfile → AuthorStats
 """
 
 from datetime import datetime, timezone
@@ -44,6 +45,14 @@ class ConclusionStatus(str, Enum):
     CONFIRMED = "confirmed"
     REFUTED = "refuted"
     UNVERIFIABLE = "unverifiable"
+
+
+class PredictionStatus(str, Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    REFUTED = "refuted"
+    UNVERIFIABLE = "unverifiable"
+    AWAITING = "awaiting"
 
 
 class SolutionStatus(str, Enum):
@@ -86,6 +95,21 @@ class VerdictResult(str, Enum):
 # ===========================================================================
 
 
+class AuthorGroup(SQLModel, table=True):
+    """跨平台作者实体 — 将不同平台的同一真实人物关联起来
+
+    由 Layer1 Step A（AuthorGroupMatcher）在创建新 Author 时自动识别并关联。
+    """
+
+    __tablename__ = "author_groups"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    canonical_name: str                           # 规范化姓名（如"Ray Dalio"）
+    canonical_role: Optional[str] = None          # 规范化职业角色
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
 class Topic(SQLModel, table=True):
     """话题 — 观点聚合的最小主题单元"""
 
@@ -122,6 +146,9 @@ class Author(SQLModel, table=True):
     profile_fetched: bool = False                   # 是否已执行过角色查询
     profile_fetched_at: Optional[datetime] = None   # 最近一次角色查询时间
 
+    # Layer1 Step A 填写：跨平台实体关联（指向 AuthorGroup）
+    author_group_id: Optional[int] = Field(default=None, foreign_key="author_groups.id", index=True)
+
     conclusions: List["Conclusion"] = Relationship(back_populates="author")
     solutions: List["Solution"] = Relationship(back_populates="author")
     monitored_sources: List["MonitoredSource"] = Relationship(back_populates="author")
@@ -145,6 +172,43 @@ class MonitoredSource(SQLModel, table=True):
     fetch_interval_minutes: int = 60
     last_fetched_at: Optional[datetime] = None
     history_fetched: bool = False
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+# ===========================================================================
+# 模型零：假设条件（Assumption）
+# ===========================================================================
+
+
+class Assumption(SQLModel, table=True):
+    """假设条件
+
+    作者明确陈述的"如果X则..."前提条件。
+    Layer2 同步提取（区别于 ImplicitCondition 的未说出前提）。
+    """
+
+    __tablename__ = "assumptions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id")
+
+    condition_text: str                          # ≤60字
+    canonical_condition: Optional[str] = None
+
+    verifiable_statement: Optional[str] = None   # 单句可验证陈述
+    temporal_type: str = "predictive"            # retrospective | predictive
+    temporal_note: Optional[str] = None
+
+    is_verifiable: bool = False
+
+    # 现实对齐（inline）—— Layer3 RealityAligner 填写
+    alignment_result: Optional[str] = None       # true|false|uncertain|unavailable
+    alignment_evidence: Optional[str] = None
+    alignment_tier: Optional[int] = None         # 1|2|3
+    alignment_confidence: Optional[str] = None
+    alignment_verified_at: Optional[datetime] = None
 
     created_at: datetime = Field(default_factory=_utcnow)
 
@@ -178,6 +242,11 @@ class Fact(SQLModel, table=True):
     # 概念归一化：由 LLM 生成的标准化表达，用于跨帖子概念去重和匹配
     canonical_claim: Optional[str] = None
 
+    # Layer2 生成的单句可验证陈述（供 Layer3 RealityAligner 使用）
+    verifiable_statement: Optional[str] = None
+    temporal_type: str = "retrospective"             # retrospective | predictive
+    temporal_note: Optional[str] = None              # 如 "2025年1月"
+
     # 转化为可客观核实的具体表达
     verifiable_expression: Optional[str] = None
     is_verifiable: bool = False
@@ -200,6 +269,15 @@ class Fact(SQLModel, table=True):
     verified_source_org: Optional[str] = None       # 机构名称，如"国家统计局"
     verified_source_url: Optional[str] = None       # 核查数据的具体 URL
     verified_source_data: Optional[str] = None      # 核查数据的摘要/原文片段
+
+    # 现实对齐（inline）—— Layer3 RealityAligner 填写
+    alignment_result: Optional[str] = None          # true|false|uncertain|unavailable
+    alignment_evidence: Optional[str] = None
+    alignment_tier: Optional[int] = None            # 1|2|3
+    alignment_confidence: Optional[str] = None
+    alignment_verified_at: Optional[datetime] = None
+    # 宽泛描述判断：none|approximate_ok（不影响核心结论）|approximate_critical（影响核心结论）
+    alignment_vagueness: Optional[str] = None
 
     # 来源帖子（可选，用于溯源）
     raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id")
@@ -262,7 +340,12 @@ class Conclusion(SQLModel, table=True):
     claim: str                          # 核心结论陈述（≤80字）
     canonical_claim: Optional[str] = None  # 概念归一化标准形式
 
-    # 结论类型：回顾型 vs 预测型
+    # Layer2 生成的单句可验证陈述
+    verifiable_statement: Optional[str] = None
+    temporal_type: str = "retrospective"         # retrospective（固定）
+    temporal_note: Optional[str] = None
+
+    # 结论类型：回顾型 vs 预测型（保留向后兼容）
     conclusion_type: str = "retrospective"   # retrospective | predictive
 
     # 结论的有效时效
@@ -272,12 +355,34 @@ class Conclusion(SQLModel, table=True):
 
     status: ConclusionStatus = ConclusionStatus.PENDING
 
+    # Layer2 提取：作者对该结论的自信程度
+    author_confidence: Optional[str] = None       # certain|likely|uncertain|speculative
+    author_confidence_note: Optional[str] = None  # 原文中的不确定性表达（如"我认为可能"）
+
     # Layer3 填写：监控配置（仅 predictive 类型使用）
     monitoring_source_org: Optional[str] = None     # 监控机构，如"中国国家统计局"
     monitoring_source_url: Optional[str] = None     # 监控数据 URL
     monitoring_period_note: Optional[str] = None    # 人读的监控时段说明
     monitoring_start: Optional[datetime] = None     # 监控起点
     monitoring_end: Optional[datetime] = None       # 监控终点
+
+    # Layer3 Step4a：条件型预测分析（仅 predictive 类型）
+    # 对"如果X则Y"结构的预测，分析假设条件X的概率后决定如何监控
+    conditional_assumption: Optional[str] = None  # 假设条件文本（"如果X"中的X）
+    assumption_probability: Optional[str] = None  # high|medium|low|negligible
+    # not_applicable=无条件 | abandoned=极低概率放弃验证 | waiting=等待条件触发 | triggered=条件已发生
+    conditional_monitoring_status: str = "not_applicable"
+
+    # 现实对齐（inline）—— Layer3 RealityAligner 填写
+    alignment_result: Optional[str] = None          # true|false|uncertain|unavailable
+    alignment_evidence: Optional[str] = None
+    alignment_tier: Optional[int] = None            # 1|2|3
+    alignment_confidence: Optional[str] = None
+    alignment_verified_at: Optional[datetime] = None
+
+    # Layer3 逻辑推理：DAG 计算结果
+    is_core_conclusion: bool = False    # 没有其他结论以此为前提 → 核心结论
+    is_in_cycle: bool = False           # DAG 中存在循环 → 标记为无效
 
     source_url: str
     source_platform: str
@@ -328,6 +433,11 @@ class Solution(SQLModel, table=True):
     monitoring_start: Optional[datetime] = None
     monitoring_end: Optional[datetime] = None
 
+    # Layer3 Step4b：发布时刻的标的基准价格/数值
+    baseline_value: Optional[str] = None         # 发布时基准价格/数值（如"2680 USD/oz"）
+    baseline_metric: Optional[str] = None        # 基准指标说明（如"黄金现货价 USD/oz"）
+    baseline_recorded_at: Optional[datetime] = None  # 基准价格记录时间
+
     status: SolutionStatus = SolutionStatus.PENDING
 
     source_url: Optional[str] = None
@@ -341,6 +451,110 @@ class Solution(SQLModel, table=True):
 
 
 # ===========================================================================
+# 模型三点五：预测（Prediction）
+# ===========================================================================
+
+
+class Prediction(SQLModel, table=True):
+    """预测
+
+    作者对未来事件或趋势的判断（完全独立于 Conclusion）。
+    Layer2 从帖子中提取，Layer3 配置监控并最终验证。
+    """
+
+    __tablename__ = "predictions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    topic_id: Optional[int] = Field(default=None, foreign_key="topics.id")
+    author_id: int = Field(foreign_key="authors.id")
+
+    claim: str                                   # ≤80字原文
+    canonical_claim: Optional[str] = None
+
+    verifiable_statement: str = ""               # Layer2 生成的单句可核实表达
+    temporal_type: str = "predictive"            # 固定 predictive
+    temporal_note: Optional[str] = None          # 如 "2026-2030年"
+
+    author_confidence: Optional[str] = None      # certain|likely|uncertain|speculative
+    author_confidence_note: Optional[str] = None
+
+    # 监控字段（从 Conclusion 迁移）
+    monitoring_source_org: Optional[str] = None
+    monitoring_source_url: Optional[str] = None
+    monitoring_period_note: Optional[str] = None
+    monitoring_start: Optional[datetime] = None
+    monitoring_end: Optional[datetime] = None
+
+    # 条件型预测
+    conditional_assumption: Optional[str] = None
+    assumption_probability: Optional[str] = None
+    conditional_monitoring_status: str = "not_applicable"
+
+    # 现实对齐（inline）—— Layer3 RealityAligner 填写
+    alignment_result: Optional[str] = None       # true|false|uncertain|unavailable
+    alignment_evidence: Optional[str] = None
+    alignment_tier: Optional[int] = None         # 1|2|3
+    alignment_confidence: Optional[str] = None
+    alignment_verified_at: Optional[datetime] = None
+
+    status: PredictionStatus = PredictionStatus.PENDING
+
+    source_url: str = ""
+    source_platform: str = ""
+    posted_at: Optional[datetime] = None
+    collected_at: datetime = Field(default_factory=_utcnow)
+    raw_extraction: Optional[str] = None
+
+    verdicts: List["PredictionVerdict"] = Relationship(back_populates="prediction")
+
+
+# ===========================================================================
+# 模型五：条件（Condition）— 统一假设条件 + 隐含条件
+# ===========================================================================
+
+
+class Condition(SQLModel, table=True):
+    """条件（v3 统一模型）
+
+    将原来的 Assumption（显式假设条件）和 ImplicitCondition（隐含条件）合并为单一模型。
+
+    condition_type:
+      assumption — 作者明确陈述的"如果X则Y"条件
+      implicit   — 未说出的暗含前提（推理时依赖但未明说）
+
+    对齐验证（alignment_result）：
+      assumption → 评估假设条件发生概率（high/medium/low/negligible）
+      implicit   → 评估是否为普遍共识（is_consensus=True 则直接标为 true）
+    """
+
+    __tablename__ = "conditions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    condition_type: str = "assumption"   # assumption | implicit
+    condition_text: str                  # 条件陈述（≤120字）
+    canonical_condition: Optional[str] = None
+
+    # Layer2 生成
+    verifiable_statement: Optional[str] = None
+    temporal_note: Optional[str] = None
+
+    # 隐含条件专用：是否为普遍共识
+    is_consensus: bool = False
+    is_verifiable: bool = False
+
+    # 现实对齐（inline）—— Layer4 RealityAligner 填写
+    alignment_result: Optional[str] = None   # true|false|uncertain|unavailable
+    alignment_evidence: Optional[str] = None
+    alignment_tier: Optional[int] = None
+    alignment_confidence: Optional[str] = None
+    alignment_verified_at: Optional[datetime] = None
+
+    raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id")
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+# ===========================================================================
 # 模型四：逻辑（Logic）
 # ===========================================================================
 
@@ -349,11 +563,16 @@ class Logic(SQLModel, table=True):
     """逻辑
 
     显式建立推理链，分两种类型：
-      inference   — 事实→结论的论证关系（原有）
-      derivation  — 结论→解决方案的推导关系（新增）
+      inference   — 多种前提→结论的论证关系
+                    前提可以是：事实 / 假设性事实 / 隐含条件 / 其他结论
+      derivation  — 结论→解决方案的推导关系
 
     inference 类型字段：
-      conclusion_id + supporting_fact_ids + assumption_fact_ids
+      conclusion_id
+      supporting_fact_ids       — 支撑事实（JSON ID 数组）
+      assumption_fact_ids       — 假设性事实（待满足的假设前提，JSON ID 数组）
+      supporting_conclusion_ids — 作为前提的其他结论（JSON ID 数组，Layer2 填写）
+      implicit_condition_ids    — 隐含条件（JSON ID 数组，Layer3 Step1b 填写）
 
     derivation 类型字段：
       solution_id + source_conclusion_ids（JSON 数组）
@@ -373,13 +592,37 @@ class Logic(SQLModel, table=True):
     solution_id: Optional[int] = Field(default=None, foreign_key="solutions.id")
 
     # JSON 数组，存储 Fact 的 ID 列表（inference 类型用）
-    supporting_fact_ids: str = Field(default="[]")   # 支撑事实
-    assumption_fact_ids: str = Field(default="[]")   # 假设条件（待满足）
+    supporting_fact_ids: str = Field(default="[]")        # 事实：支撑该结论的已知事实
+    assumption_fact_ids: str = Field(default="[]")        # 假设性事实：假设条件（待满足）
+
+    # JSON 数组，存储 Conclusion 的 ID 列表（inference 类型：作为前提的其他结论）
+    supporting_conclusion_ids: str = Field(default="[]")  # Layer2 填写
+
+    # JSON 数组，存储 ImplicitCondition 的 ID 列表（inference 类型，Layer3 Step1b 填写）
+    implicit_condition_ids: str = Field(default="[]")
 
     # JSON 数组，存储 Conclusion 的 ID 列表（derivation 类型用）
     source_conclusion_ids: Optional[str] = None      # 推导所基于的结论 IDs
 
-    # Layer3 填写：逻辑完备性评估（Layer2 不再填写）
+    # 新字段 (v2)：预测型逻辑
+    prediction_id: Optional[int] = Field(default=None, foreign_key="predictions.id")
+    source_prediction_ids: Optional[str] = None      # JSON，derivation 引用 Prediction IDs
+    assumption_ids: Optional[str] = None             # JSON，Assumption 表 ID 数组
+    layer2_implicit_condition_ids: Optional[str] = None  # JSON，Layer2 生成的 IC ID 数组
+
+    # v3：统一条件 ID 数组（Condition 表）
+    condition_ids: Optional[str] = None  # JSON，Condition 表 ID 数组
+
+    # v2：自然语言摘要（程序生成）
+    chain_summary: Optional[str] = None              # 自然语言逻辑链摘要
+    chain_type: Optional[str] = None                 # inference|prediction|recommendation
+
+    # Layer3 Step1 填写：逻辑合法性验证
+    logic_validity: Optional[str] = None             # valid|partial|invalid
+    logic_issues: Optional[str] = None               # JSON 问题列表
+    logic_verified_at: Optional[datetime] = None
+
+    # Layer3 填写：逻辑完备性评估（旧字段，向后兼容）
     logic_completeness: Optional[LogicCompleteness] = None
     logic_note: Optional[str] = None
 
@@ -426,6 +669,10 @@ class RawPost(SQLModel, table=True):
     is_processed: bool = False
     processed_at: Optional[datetime] = None
 
+    # Layer1 Step B 填写：跨平台内容去重
+    is_duplicate: bool = False                        # 是否被判定为跨平台重复内容
+    original_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id")  # 原始帖子 ID
+
     monitored_source_id: Optional[int] = Field(
         default=None, foreign_key="monitored_sources.id"
     )
@@ -449,6 +696,9 @@ class FactEvaluation(SQLModel, table=True):
     evidence_tier: Optional[int] = None    # 证据分级：1=权威机构/2=金融市场/3=可信第三方
     data_period: Optional[str] = None      # 所依据数据的时间段
     evaluator_notes: Optional[str] = None  # 评估备注
+
+    # Layer3 Step1 填写：多模型投票选出的验证方案（JSON）
+    verification_plan_json: Optional[str] = None
 
     evaluated_at: datetime = Field(default_factory=_utcnow)
 
@@ -475,6 +725,26 @@ class ConclusionVerdict(SQLModel, table=True):
     conclusion: Optional[Conclusion] = Relationship(back_populates="verdicts")
 
 
+class PredictionVerdict(SQLModel, table=True):
+    """预测的最终裁定（镜像 ConclusionVerdict）"""
+
+    __tablename__ = "prediction_verdicts"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    prediction_id: int = Field(foreign_key="predictions.id", index=True)
+
+    verdict: VerdictResult
+    logic_trace: Optional[str] = None  # 推导过程的 JSON 记录
+
+    # Layer3 RoleEvaluator 填写：作者角色匹配度
+    role_fit: Optional[str] = None
+    role_fit_note: Optional[str] = None
+
+    derived_at: datetime = Field(default_factory=_utcnow)
+
+    prediction: Optional[Prediction] = Relationship(back_populates="verdicts")
+
+
 class SolutionAssessment(SQLModel, table=True):
     """解决方案的评估记录"""
 
@@ -494,6 +764,56 @@ class SolutionAssessment(SQLModel, table=True):
     role_fit_note: Optional[str] = None     # 角色匹配分析（1句话）
 
     solution: Optional[Solution] = Relationship(back_populates="assessments")
+
+
+class ImplicitCondition(SQLModel, table=True):
+    """隐含条件
+
+    从 Fact 或 Conclusion 中识别出的未明说前提假设。
+    通过多次 LLM 投票判断该条件是否成立（consensus/true/false/uncertain）。
+
+    由 Layer3 Step 1b（ImplicitConditionExtractor）填写。
+    """
+
+    __tablename__ = "implicit_conditions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    # 关联到 Fact 或 Conclusion 或 Prediction（之一）
+    fact_id: Optional[int] = Field(default=None, foreign_key="facts.id", index=True)
+    conclusion_id: Optional[int] = Field(default=None, foreign_key="conclusions.id", index=True)
+    prediction_id: Optional[int] = Field(default=None, foreign_key="predictions.id", index=True)
+
+    condition_text: str            # 隐含条件陈述（≤80字）
+
+    # v2 新增：可验证陈述与时态
+    verifiable_statement: Optional[str] = None
+    temporal_type: Optional[str] = None
+    temporal_note: Optional[str] = None
+
+    # 判定结果：pending | consensus（普遍共识）| not_consensus（非共识/有争议）
+    verification_result: str = "pending"
+    verification_note: Optional[str] = None   # 判断依据说明（≤100字）
+
+    # LLM 3次投票统计（投"是共识"/"非共识"的票数）
+    vote_consensus: int = 0
+    vote_not_consensus: int = 0
+
+    # Phase C — 近年共识趋势
+    # strengthening（增强）| weakening（松动）| stable（稳定）| unknown（不确定）
+    consensus_trend: Optional[str] = None
+    consensus_trend_note: Optional[str] = None  # 趋势依据（≤100字）
+
+    # 现实对齐（inline）—— Layer3 RealityAligner 填写
+    alignment_result: Optional[str] = None
+    alignment_evidence: Optional[str] = None
+    alignment_tier: Optional[int] = None
+    alignment_confidence: Optional[str] = None
+    alignment_verified_at: Optional[datetime] = None
+
+    is_consensus: bool = False
+
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class LogicRelation(SQLModel, table=True):
@@ -557,7 +877,36 @@ class PostQualityAssessment(SQLModel, table=True):
     # "emotional_rhetoric"（情绪主导）、"entertainment"（娱乐性插话）、"filler"（废话）
     noise_types: Optional[str] = None           # JSON array
 
+    # ── 文章立场分析（Layer3 Step8 填写）──────────────────────────────────────
+    # 看涨/多头 | 看跌/空头 | 中立/客观 | 警告/防御 | 批判/质疑 | 政策倡导 | 教育/分析 | 其他
+    stance_label: Optional[str] = None
+    stance_note: Optional[str] = None           # 立场说明（≤80字）
+
     assessed_at: datetime = Field(default_factory=_utcnow)
+
+
+class AuthorStanceProfile(SQLModel, table=True):
+    """作者立场分布档案
+
+    汇总该作者所有已分析内容的立场分布（stance_label），形成历史立场档案。
+    由 Layer3 Step 9b（AuthorStanceUpdater）在每次新内容处理后更新。
+
+    立场类别（与 PostQualityAssessment.stance_label 对齐）：
+      看涨/多头 | 看跌/空头 | 中立/客观 | 警告/防御 | 批判/质疑 | 政策倡导 | 教育/分析 | 其他
+    """
+
+    __tablename__ = "author_stance_profiles"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    author_id: int = Field(foreign_key="authors.id", unique=True, index=True)
+
+    # JSON dict: {"看涨/多头": 5, "看跌/空头": 2, "中立/客观": 3, ...}
+    stance_distribution: Optional[str] = None
+    dominant_stance: Optional[str] = None          # 出现次数最多的立场标签
+    dominant_stance_ratio: Optional[float] = None  # 主导立场占比 (0.0-1.0)
+    total_analyzed: int = 0                        # 已纳入统计的帖子数（有 stance_label 的）
+
+    last_updated: datetime = Field(default_factory=_utcnow)
 
 
 class AuthorStats(SQLModel, table=True):

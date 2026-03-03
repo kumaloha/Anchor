@@ -52,6 +52,22 @@ class Settings(BaseSettings):
     # YouTube 最大转录时长（秒），超出则截断；0 = 不限制；默认 30 分钟
     youtube_max_duration: int = 1800
 
+    # ── 多模型交叉验证（Layer3 验证方案设计用）──────────────────────────────────
+    # 逗号分隔的模型 ID 列表，同一 provider 下不同模型（与 llm_provider 相同）
+    # 例（Anthropic）：claude-opus-4-6,claude-sonnet-4-6,claude-haiku-4-5-20251001
+    # 例（OpenAI）：gpt-4o,gpt-4o-mini,o3-mini
+    # 不填则使用主 llm_model 独立调用 3 次（依赖模型随机性获取多样方案）
+    verification_plan_models: str = ""
+
+    @property
+    def verification_plan_model_list(self) -> list[str]:
+        if self.verification_plan_models.strip():
+            return [m.strip() for m in self.verification_plan_models.split(",") if m.strip()]
+        main = self.llm_model or (
+            "claude-sonnet-4-6" if self.llm_provider == "anthropic" else "gpt-4o-mini"
+        )
+        return [main, main, main]
+
     # ── Web Search（Layer3 联网核查用）────────────────────────────────────────
     # Tavily Search API Key（免费注册：https://app.tavily.com）
     # 不填则 Layer3 事实核查仅使用 LLM 训练知识（无联网能力）

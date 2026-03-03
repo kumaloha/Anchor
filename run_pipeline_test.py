@@ -1,20 +1,8 @@
 """
-全链路端到端测试脚本
-====================
-四类模型完整输出：
-  Layer 1 — 原始内容 + 元数据
-  Layer 2 — Fact / Conclusion / Solution / Logic 所有属性
-  Layer 3 — 九步流水线：
-    Step 0:   作者档案分析
-    Step 1:   事实核查（含 evidence_tier 分级）
-    Step 2+3: 逻辑评估（完备性 + 一句话总结）
-    Step 4a:  预测型结论监控配置
-    Step 4b:  解决方案模拟 + 监控配置
-    Step 5:   逻辑关系映射
-    Step 6:   裁定推导（Conclusion 两类型 + Solution）
-    Step 7:   角色匹配评估
-    Step 8:   内容质量评估（独特性 + 有效性）
-    Step 9:   作者综合统计更新
+全链路端到端测试脚本（v2 — 六实体架构）
+========================================
+输出：Fact / Conclusion / Prediction / Assumption / ImplicitCondition /
+      Solution / Logic / Verdict / Quality / Stats 的所有字段。
 """
 
 import asyncio
@@ -45,7 +33,7 @@ def _sep(title=""):
 
 def _row(label, value, indent=4):
     pad = " " * indent
-    label_str = f"{pad}{label:<28}"
+    label_str = f"{pad}{label:<30}"
     if value is None:
         print(f"{label_str}{_dim('—')}")
     else:
@@ -60,6 +48,29 @@ def _block(title, text, indent=4):
     else:
         print(f"{pad}  {_dim('—')}")
 
+def _sub(title, indent=4):
+    pad = " " * indent
+    print(f"\n{pad}{C_CYAN}{title}{C_RESET}")
+
+def _verdict_color(v):
+    s = str(v)
+    if "confirmed" in s or "validated" in s:
+        return _ok(s)
+    elif "refuted" in s or "false" in s:
+        return _warn(s)
+    elif "true" in s:
+        return _ok(s)
+    elif "uncertain" in s or "partial" in s:
+        return _warn(s)
+    else:
+        return _dim(s)
+
+def _align_color(v):
+    if v == "true":     return _ok(v)
+    if v == "false":    return _warn(v)
+    if v == "uncertain": return _warn(v)
+    return _dim(str(v) if v else "—")
+
 
 async def run():
     # ── 清理旧数据库 ──────────────────────────────────────────────────────
@@ -73,18 +84,18 @@ async def run():
     from anchor.classifier.extractor import Extractor
     from anchor.tracker.author_profiler import AuthorProfiler
     from anchor.tracker.author_stats_updater import AuthorStatsUpdater
-    from anchor.tracker.condition_verifier import ConditionVerifier
-    from anchor.tracker.logic_evaluator import LogicEvaluator
-    from anchor.tracker.logic_relation_mapper import LogicRelationMapper
-    from anchor.tracker.conclusion_monitor import ConclusionMonitor
+    from anchor.tracker.logic_verifier import LogicVerifier
+    from anchor.tracker.reality_aligner import RealityAligner
+    from anchor.tracker.prediction_monitor import PredictionMonitor
     from anchor.tracker.post_quality_evaluator import PostQualityEvaluator
     from anchor.tracker.role_evaluator import RoleEvaluator
     from anchor.tracker.solution_simulator import SolutionSimulator
     from anchor.tracker.verdict_deriver import VerdictDeriver
     from anchor.models import (
-        Author, AuthorStats, Conclusion, ConclusionVerdict, Fact, FactEvaluation,
-        Logic, LogicRelation, MonitoredSource, PostQualityAssessment, RawPost,
-        Solution, SolutionAssessment, Topic, VerificationReference,
+        Assumption, Author, AuthorStats, Conclusion, ConclusionVerdict,
+        Fact, ImplicitCondition, Logic, MonitoredSource, PostQualityAssessment,
+        Prediction, PredictionVerdict, RawPost, Solution, SolutionAssessment,
+        Topic, VerificationReference,
     )
     from sqlmodel import select
 
@@ -144,7 +155,6 @@ async def run():
     print()
     _block("【原始内容（完整版）】", rp_row.content)
 
-    # 媒体信息
     if rp_row.media_json:
         try:
             media_items = json.loads(rp_row.media_json)
@@ -159,9 +169,9 @@ async def run():
                 print(f"      [{idx}] {mtype}: {murl[:100]}")
 
     # ══════════════════════════════════════════════════════════════════════
-    # LAYER 2 — 观点提取
+    # LAYER 2 — 观点提取（v2 六实体）
     # ══════════════════════════════════════════════════════════════════════
-    _sep("LAYER 2 — 观点提取")
+    _sep("LAYER 2 — 观点提取（v2 六实体）")
 
     async with AsyncSessionLocal() as session:
         rp = await session.get(RawPost, rp_row.id)
@@ -179,88 +189,101 @@ async def run():
             print(_warn(f"  ⚠ extraction_notes : {extraction.extraction_notes}"))
 
     async with AsyncSessionLocal() as session:
-        rp_check = await session.get(RawPost, rp_row.id)
-        facts   = list((await session.exec(select(Fact))).all())
-        concls  = list((await session.exec(select(Conclusion))).all())
-        sols    = list((await session.exec(select(Solution))).all())
-        logics  = list((await session.exec(select(Logic))).all())
+        rp_check   = await session.get(RawPost, rp_row.id)
+        facts      = list((await session.exec(select(Fact))).all())
+        concls     = list((await session.exec(select(Conclusion))).all())
+        preds      = list((await session.exec(select(Prediction))).all())
+        assumps    = list((await session.exec(select(Assumption))).all())
+        sols       = list((await session.exec(select(Solution))).all())
+        logics     = list((await session.exec(select(Logic))).all())
+        ics_layer2 = list((await session.exec(
+            select(ImplicitCondition).where(ImplicitCondition.fact_id.in_([f.id for f in facts]))
+        )).all()) if facts else []
 
-    retro_count = sum(1 for c in concls if c.conclusion_type == "retrospective")
-    pred_count  = sum(1 for c in concls if c.conclusion_type == "predictive")
     inf_count   = sum(1 for l in logics if l.logic_type == "inference")
+    pred_count  = sum(1 for l in logics if l.logic_type == "prediction")
     deriv_count = sum(1 for l in logics if l.logic_type == "derivation")
 
     print(_ok(f"\n  ✓ RawPost.is_processed={rp_check.is_processed}  "
               f"processed_at={rp_check.processed_at}"))
-    print(f"\n  Fact={len(facts)}  "
-          f"Conclusion={len(concls)}（回顾={retro_count} 预测={pred_count}）  "
-          f"Solution={len(sols)}  "
-          f"Logic={len(logics)}（inference={inf_count} derivation={deriv_count}）")
+    print(f"\n  Fact={len(facts)}  Conclusion={len(concls)}  Prediction={len(preds)}  "
+          f"Assumption={len(assumps)}  ImplicitCondition={len(ics_layer2)}  Solution={len(sols)}  "
+          f"Logic={len(logics)}（inf={inf_count} pred={pred_count} deriv={deriv_count}）")
 
     # ── Facts ─────────────────────────────────────────────────────────────
-    print()
+    _sub("【Facts】", indent=2)
     for f in facts:
-        status_color = _ok if str(f.status) == "verified_true" else (
-            _warn if str(f.status) == "pending" else _dim
-        )
-        print(f"  {C_CYAN}[Fact id={f.id}  status={status_color(f.status)}]{C_RESET}")
+        print(f"\n  {C_CYAN}[Fact id={f.id}]{C_RESET}")
         _row("claim",                  f.claim)
+        _row("verifiable_statement",   f.verifiable_statement)
+        _row("temporal_type",          f.temporal_type)
+        _row("temporal_note",          f.temporal_note)
         _row("canonical_claim",        f.canonical_claim)
         _row("verifiable_expression",  f.verifiable_expression)
         _row("is_verifiable",          f.is_verifiable)
-        _row("validity_start_note",    f.validity_start_note)
-        _row("validity_end_note",      f.validity_end_note)
-
-        async with AsyncSessionLocal() as session:
-            refs = list((await session.exec(
-                select(VerificationReference).where(VerificationReference.fact_id == f.id)
-            )).all())
-        if refs:
-            print(f"    {C_CYAN}引用来源 ({len(refs)} 条):{C_RESET}")
-            for r in refs:
-                print(f"      [{r.organization}] {r.data_description}")
-                if r.url:
-                    print(f"        url: {r.url}")
-        print()
 
     # ── Conclusions ────────────────────────────────────────────────────────
+    _sub("【Conclusions (回顾型)】", indent=2)
     for c in concls:
-        type_label = _ok("[回顾型]") if c.conclusion_type == "retrospective" else _warn("[预测型]")
-        print(f"  {C_CYAN}[Conclusion id={c.id}]{C_RESET} {type_label}")
-        _row("claim",              c.claim)
-        _row("canonical_claim",    c.canonical_claim)
-        _row("conclusion_type",    c.conclusion_type)
-        _row("time_horizon_note",  c.time_horizon_note)
-        if c.conclusion_type == "predictive":
-            _row("valid_until",    c.valid_until)
-        _row("status",             c.status)
-        print()
+        print(f"\n  {C_CYAN}[Conclusion id={c.id}]{C_RESET}")
+        _row("claim",                c.claim)
+        _row("verifiable_statement", c.verifiable_statement)
+        _row("temporal_type",        c.temporal_type)
+        _row("author_confidence",    c.author_confidence)
+
+    # ── Predictions ────────────────────────────────────────────────────────
+    _sub("【Predictions (预测型)】", indent=2)
+    if not preds:
+        print(f"  {_dim('（无预测）')}")
+    for p in preds:
+        print(f"\n  {C_CYAN}[Prediction id={p.id}]{C_RESET}")
+        _row("claim",                p.claim)
+        _row("verifiable_statement", p.verifiable_statement)
+        _row("temporal_note",        p.temporal_note)
+        _row("author_confidence",    p.author_confidence)
+
+    # ── Assumptions ────────────────────────────────────────────────────────
+    _sub("【Assumptions (假设条件)】", indent=2)
+    if not assumps:
+        print(f"  {_dim('（无假设条件）')}")
+    for a in assumps:
+        print(f"\n  {C_CYAN}[Assumption id={a.id}]{C_RESET}")
+        _row("condition_text",       a.condition_text)
+        _row("verifiable_statement", a.verifiable_statement)
+        _row("temporal_type",        a.temporal_type)
+        _row("is_verifiable",        a.is_verifiable)
+
+    # ── ImplicitConditions (Layer2) ────────────────────────────────────────
+    _sub("【ImplicitConditions (Layer2提取)】", indent=2)
+    if not ics_layer2:
+        print(f"  {_dim('（无隐含条件）')}")
+    for ic in ics_layer2:
+        parent = f"Fact#{ic.fact_id}" if ic.fact_id else f"Conclusion#{ic.conclusion_id}"
+        print(f"\n  {C_CYAN}[ImplicitCondition id={ic.id}  {parent}]{C_RESET}")
+        _row("condition_text",       ic.condition_text)
+        _row("verifiable_statement", ic.verifiable_statement)
+        _row("is_consensus",         ic.is_consensus)
 
     # ── Solutions ──────────────────────────────────────────────────────────
+    _sub("【Solutions】", indent=2)
     for s in sols:
-        print(f"  {C_CYAN}[Solution id={s.id}]{C_RESET}")
-        _row("claim",              s.claim)
-        _row("action_type",        s.action_type)
-        _row("action_target",      s.action_target)
-        _row("action_rationale",   s.action_rationale)
-        _row("status",             s.status)
-        print()
+        print(f"\n  {C_CYAN}[Solution id={s.id}]{C_RESET}")
+        _row("claim",           s.claim)
+        _row("action_type",     s.action_type)
+        _row("action_target",   s.action_target)
 
-    # ── Logics ─────────────────────────────────────────────────────────────
+    # ── Logics (含 chain_summary) ──────────────────────────────────────────
+    _sub("【Logics (含 chain_summary)】", indent=2)
     for l in logics:
         if l.logic_type == "inference":
             target = f"Conclusion#{l.conclusion_id}"
-            supporting = json.loads(l.supporting_fact_ids or "[]")
-            assumptions = json.loads(l.assumption_fact_ids or "[]")
-            print(f"  {C_CYAN}[Logic id={l.id}  inference → {target}]{C_RESET}")
-            _row("supporting_facts",   f"Fact IDs {supporting}")
-            _row("assumption_facts",   f"Fact IDs {assumptions}")
+        elif l.logic_type == "prediction":
+            target = f"Prediction#{l.prediction_id}"
         else:
-            source_concs = json.loads(l.source_conclusion_ids or "[]")
-            print(f"  {C_CYAN}[Logic id={l.id}  derivation → Solution#{l.solution_id}]{C_RESET}")
-            _row("source_conclusions", f"Conclusion IDs {source_concs}")
-        _row("logic_completeness", _dim("（Layer3 填写）"))
-        print()
+            target = f"Solution#{l.solution_id}"
+        print(f"\n  {C_CYAN}[Logic id={l.id}  {l.logic_type} → {target}]{C_RESET}")
+        _row("chain_type",      l.chain_type)
+        _block("chain_summary", l.chain_summary)
 
     # ══════════════════════════════════════════════════════════════════════
     # LAYER 3 — Step 0: 作者档案分析
@@ -274,134 +297,133 @@ async def run():
 
     async with AsyncSessionLocal() as session:
         a = await session.get(Author, auth.id)
-        print(f"\n  {C_CYAN}[Author id={a.id}  name={a.name}  platform={a.platform}]{C_RESET}")
-        _row("description",    a.description)
-        _row("profile_url",    a.profile_url)
-
         await author_profiler.profile(a, session)
-
-        _row("role",            a.role, indent=4)
-        _row("expertise_areas", a.expertise_areas, indent=4)
-        _row("known_biases",    a.known_biases, indent=4)
         tier = a.credibility_tier
         tier_labels = {1: "顶级权威", 2: "行业专家", 3: "知名评论员", 4: "普通媒体/KOL", 5: "未知"}
         tier_str = f"Tier{tier} ({tier_labels.get(tier, '?')})" if tier else "—"
         tier_color = _ok(tier_str) if tier and tier <= 2 else (_warn(tier_str) if tier == 3 else _dim(tier_str))
-        _row("credibility_tier", tier_color, indent=4)
-        _row("profile_note",    a.profile_note, indent=4)
-
+        print(f"\n  {C_CYAN}[Author id={a.id}  name={a.name}]{C_RESET}")
+        _row("role",            a.role)
+        _row("expertise_areas", a.expertise_areas)
+        _row("credibility_tier", tier_color)
+        _row("profile_note",    a.profile_note)
         await session.commit()
 
     # ══════════════════════════════════════════════════════════════════════
-    # LAYER 3 — 六步流水线
+    # LAYER 3 — Step 1: 逻辑链验证（LogicVerifier）
     # ══════════════════════════════════════════════════════════════════════
-    _sep("LAYER 3 — Step 1: 事实核查（含 evidence_tier）")
+    _sep("LAYER 3 — Step 1: 逻辑链验证（LogicVerifier）")
 
-    verifier = ConditionVerifier()
-    from anchor.config import settings as _settings
-    _web_mode = "✓ 联网模式（Tavily）" if _settings.tavily_api_key else "✗ 仅训练知识（未配置 TAVILY_API_KEY）"
-    print(f"  核查模式: {_web_mode}")
-    print(f"  待核查事实总数: {len(facts)}")
-
-    async with AsyncSessionLocal() as session:
-        for fact in facts:
-            f = await session.get(Fact, fact.id)
-            print(f"\n  {C_CYAN}[Fact id={f.id}]{C_RESET}")
-            _row("claim",                 f.claim)
-            _row("canonical_claim",       f.canonical_claim)
-            _row("is_verifiable",         f.is_verifiable)
-
-            if f.is_verifiable:
-                fe = await verifier.verify(f, session)
-                if fe:
-                    r_color = (_ok if str(fe.result) == "true"
-                               else (_warn if str(fe.result) in ("false",) else
-                                     (_warn if str(fe.result) == "uncertain" else _dim)))
-                    # evidence_tier 颜色
-                    tier_str = f"Tier{fe.evidence_tier}" if fe.evidence_tier else "—"
-                    tier_color = (_ok(tier_str) if fe.evidence_tier == 1
-                                  else (_warn(tier_str) if fe.evidence_tier == 2
-                                        else _dim(tier_str)))
-                    print(f"\n    {C_CYAN}核查结果:{C_RESET}")
-                    _row("result",          r_color(fe.result), indent=6)
-                    _row("evidence_tier",   tier_color, indent=6)
-                    _row("evidence_text",   fe.evidence_text, indent=6)
-                    _row("evaluator_notes", fe.evaluator_notes, indent=6)
-                    # 展示 authoritative_links（从 fact.verified_source_data 解析）
-                    links = []
-                    if f.verified_source_data:
-                        try:
-                            links = json.loads(f.verified_source_data)
-                        except Exception:
-                            pass
-                    if links:
-                        print(f"      {C_CYAN}权威来源链接:{C_RESET}")
-                        for lk in links:
-                            print(f"        [{lk.get('org', '—')}]")
-                            print(f"          url : {lk.get('url', '—')}")
-                            if lk.get('description'):
-                                print(f"          desc: {lk['description']}")
-                    else:
-                        _row("authoritative_links", None, indent=6)
-                else:
-                    print(f"    {_warn('核查调用失败')}")
-            else:
-                print(f"\n    {_dim('→ is_verifiable=False，跳过核查')}")
-
-        await session.commit()
-
-    # ── Step 2+3: 逻辑评估 ────────────────────────────────────────────────
-    _sep("LAYER 3 — Step 2+3: 逻辑评估")
-
-    logic_evaluator = LogicEvaluator()
-    print(f"  待评估逻辑总数: {len(logics)}")
+    logic_verifier = LogicVerifier()
+    print(f"  待验证逻辑总数: {len(logics)}")
 
     async with AsyncSessionLocal() as session:
         for logic in logics:
             l = await session.get(Logic, logic.id)
-            if l.logic_type == "inference":
-                target = f"Conclusion#{l.conclusion_id}"
-            else:
-                target = f"Solution#{l.solution_id}"
-            print(f"\n  {C_CYAN}[Logic id={l.id}  {l.logic_type} → {target}]{C_RESET}")
+            print(f"\n  {C_CYAN}{'═'*58}{C_RESET}")
+            print(f"  {C_CYAN}[Logic id={l.id}  {l.logic_type}]{C_RESET}")
+            _block("chain_summary", l.chain_summary)
+            await logic_verifier.verify(l, session)
+            lv = l.logic_validity or "—"
+            lv_color = (_ok(lv) if lv == "valid" else
+                        (_warn(lv) if lv == "partial" else
+                         (_warn(lv) if lv == "invalid" else _dim(lv))))
+            _row("logic_validity", lv_color, indent=4)
+            if l.logic_issues:
+                try:
+                    issues = json.loads(l.logic_issues)
+                    if issues:
+                        print(f"    {C_CYAN}逻辑问题:{C_RESET}")
+                        for issue in issues:
+                            print(f"      • {issue}")
+                except Exception:
+                    _row("logic_issues", l.logic_issues, indent=4)
+        await session.commit()
 
-            await logic_evaluator.evaluate(l, session)
+    # ══════════════════════════════════════════════════════════════════════
+    # LAYER 3 — Step 2: 现实对齐（RealityAligner）
+    # ══════════════════════════════════════════════════════════════════════
+    _sep("LAYER 3 — Step 2: 现实对齐（RealityAligner）")
 
-            lc_color = _ok if str(l.logic_completeness) in ("complete", "LogicCompleteness.COMPLETE") else _warn
-            _row("logic_completeness",    lc_color(l.logic_completeness) if l.logic_completeness else _dim("—"), indent=4)
-            _row("logic_note",            l.logic_note, indent=4)
-            _row("one_sentence_summary",  l.one_sentence_summary, indent=4)
+    aligner = RealityAligner()
+    from anchor.config import settings as _settings
+    _web_mode = "✓ 联网模式（Tavily）" if _settings.tavily_api_key else "✗ 仅训练知识"
+    print(f"  核查模式: {_web_mode}")
+    print(f"  待对齐：{len(facts)} 事实，{len(concls)} 结论，{len(assumps)} 假设，{len(ics_layer2)} 隐含条件")
+
+    async with AsyncSessionLocal() as session:
+        # Facts
+        for fact in facts:
+            f = await session.get(Fact, fact.id)
+            await aligner.align_fact(f, session)
+            print(f"\n  {C_CYAN}[Fact id={f.id}]{C_RESET}  claim={f.claim[:50]}")
+            _row("alignment_result",   _align_color(f.alignment_result), indent=4)
+            _row("alignment_tier",     f"Tier{f.alignment_tier}" if f.alignment_tier else "—", indent=4)
+            _block("alignment_evidence", f.alignment_evidence, indent=4)
+
+        # Conclusions
+        for conc in concls:
+            c = await session.get(Conclusion, conc.id)
+            await aligner.align_conclusion(c, session)
+            print(f"\n  {C_CYAN}[Conclusion id={c.id}]{C_RESET}  claim={c.claim[:50]}")
+            _row("alignment_result",   _align_color(c.alignment_result), indent=4)
+
+        # Assumptions
+        for assump in assumps:
+            a_obj = await session.get(Assumption, assump.id)
+            await aligner.align_assumption(a_obj, session)
+            print(f"\n  {C_CYAN}[Assumption id={a_obj.id}]{C_RESET}  {a_obj.condition_text[:50]}")
+            _row("alignment_result",   _align_color(a_obj.alignment_result), indent=4)
+
+        # ImplicitConditions
+        for ic in ics_layer2:
+            ic_obj = await session.get(ImplicitCondition, ic.id)
+            await aligner.align_implicit_condition(ic_obj, session)
+            print(f"\n  {C_CYAN}[IC id={ic_obj.id}]{C_RESET}  {ic_obj.condition_text[:50]}")
+            _row("alignment_result",   _align_color(ic_obj.alignment_result), indent=4)
 
         await session.commit()
 
-    # ── Step 4a: 预测型结论监控配置 ───────────────────────────────────────
-    _sep("LAYER 3 — Step 4a: 预测型结论监控配置")
+    # ══════════════════════════════════════════════════════════════════════
+    # LAYER 3 — Step 3: 预测监控配置（PredictionMonitor）
+    # ══════════════════════════════════════════════════════════════════════
+    _sep("LAYER 3 — Step 3: 预测监控配置（PredictionMonitor）")
 
-    conclusion_monitor = ConclusionMonitor()
-    pred_concls = [c for c in concls if c.conclusion_type == "predictive"]
-    print(f"  预测型结论总数: {len(pred_concls)}")
+    pred_monitor = PredictionMonitor()
+    print(f"  预测总数: {len(preds)}")
 
-    if not pred_concls:
-        print(f"  {_dim('（本次内容无预测型结论）')}")
+    if not preds:
+        print(f"  {_dim('（本次内容无预测）')}")
     else:
         async with AsyncSessionLocal() as session:
-            for conc in pred_concls:
-                c = await session.get(Conclusion, conc.id)
-                print(f"\n  {C_CYAN}[Conclusion id={c.id}  predictive]{C_RESET}")
-                _row("claim",              c.claim)
+            for pred in preds:
+                p = await session.get(Prediction, pred.id)
+                print(f"\n  {C_CYAN}[Prediction id={p.id}]{C_RESET}")
+                _row("claim",              p.claim)
+                _row("temporal_note",      p.temporal_note)
 
-                await conclusion_monitor.setup(c, session)
+                await pred_monitor.setup(p, session)
 
-                _row("monitoring_source_org",  c.monitoring_source_org, indent=4)
-                _row("monitoring_source_url",  c.monitoring_source_url, indent=4)
-                _row("monitoring_period_note", c.monitoring_period_note, indent=4)
-                _row("monitoring_start",       c.monitoring_start, indent=4)
-                _row("monitoring_end",         c.monitoring_end, indent=4)
+                cond_status = p.conditional_monitoring_status or "not_applicable"
+                cond_color = (_dim if cond_status == "not_applicable" else
+                              (_warn if cond_status in ("abandoned", "waiting") else _ok))
+                _row("conditional_status",      cond_color(cond_status), indent=4)
+                if cond_status not in ("not_applicable",):
+                    prob = p.assumption_probability or "—"
+                    prob_color = _ok if prob == "high" else (_warn if prob == "medium" else _dim)
+                    _row("conditional_assumption",  p.conditional_assumption,  indent=4)
+                    _row("assumption_probability",  prob_color(prob),          indent=4)
+                _row("monitoring_source_org",   p.monitoring_source_org,   indent=4)
+                _row("monitoring_period_note",  p.monitoring_period_note,  indent=4)
+                _row("monitoring_start",        p.monitoring_start,        indent=4)
+                _row("monitoring_end",          p.monitoring_end,          indent=4)
 
             await session.commit()
 
-    # ── Step 4b: 解决方案模拟 + 监控配置 ─────────────────────────────────
-    _sep("LAYER 3 — Step 4b: 解决方案模拟")
+    # ══════════════════════════════════════════════════════════════════════
+    # LAYER 3 — Step 4: 解决方案模拟 + 监控配置
+    # ══════════════════════════════════════════════════════════════════════
+    _sep("LAYER 3 — Step 4: 解决方案模拟")
 
     solution_simulator = SolutionSimulator()
     print(f"  待模拟解决方案总数: {len(sols)}")
@@ -412,45 +434,30 @@ async def run():
         async with AsyncSessionLocal() as session:
             for sol in sols:
                 s = await session.get(Solution, sol.id)
-                print(f"\n  {C_CYAN}[Solution id={s.id}]{C_RESET}")
-                _row("claim",          s.claim)
-                _row("action_type",    s.action_type)
-                _row("action_target",  s.action_target)
+                print(f"\n  {C_CYAN}{'═'*58}{C_RESET}")
+                print(f"  {C_CYAN}[Solution id={s.id}]{C_RESET}")
+                _row("claim",           s.claim)
+                _row("action_type",     s.action_type)
+                _row("action_target",   s.action_target)
 
                 await solution_simulator.simulate(s, session)
 
-                _row("simulated_action_note",  s.simulated_action_note, indent=4)
-                _row("monitoring_source_org",  s.monitoring_source_org, indent=4)
-                _row("monitoring_source_url",  s.monitoring_source_url, indent=4)
-                _row("monitoring_period_note", s.monitoring_period_note, indent=4)
-                _row("monitoring_start",       s.monitoring_start, indent=4)
-                _row("monitoring_end",         s.monitoring_end, indent=4)
+                _sub("模拟执行结果:", indent=4)
+                _block("simulated_action_note", s.simulated_action_note, indent=6)
+                _row("monitoring_period_note",  s.monitoring_period_note, indent=6)
+                _row("monitoring_start",        s.monitoring_start,       indent=6)
+                _row("monitoring_end",          s.monitoring_end,         indent=6)
+                if s.baseline_value:
+                    _sub("基准价格（发布时刻）:", indent=4)
+                    _row("baseline_metric",      s.baseline_metric,      indent=6)
+                    _row("baseline_value",       _ok(s.baseline_value),  indent=6)
 
             await session.commit()
 
-    # ── Step 5: 逻辑关系映射 ───────────────────────────────────────────────
-    _sep("LAYER 3 — Step 5: 逻辑关系映射")
-
-    relation_mapper = LogicRelationMapper()
-    print(f"  分析 {len(logics)} 条逻辑之间的支撑关系…")
-
-    async with AsyncSessionLocal() as session:
-        fresh_logics = list((await session.exec(select(Logic))).all())
-        relations = await relation_mapper.map(fresh_logics, session)
-        await session.commit()
-
-    if not relations:
-        print(f"  {_dim('未发现逻辑间支撑关系')}")
-    else:
-        for rel in relations:
-            rtype = rel.relation_type
-            rcolor = _ok if rtype == "supports" else (_warn if rtype == "contextualizes" else _dim)
-            arrow = f"L{rel.from_logic_id} --{rcolor(rtype)}--> L{rel.to_logic_id}"
-            print(f"\n  {C_CYAN}{arrow}{C_RESET}")
-            _row("note", rel.note, indent=4)
-
-    # ── Step 6: 裁定推导 ───────────────────────────────────────────────────
-    _sep("LAYER 3 — Step 6: 裁定推导")
+    # ══════════════════════════════════════════════════════════════════════
+    # LAYER 3 — Step 5: 裁定推导（VerdictDeriver）
+    # ══════════════════════════════════════════════════════════════════════
+    _sep("LAYER 3 — Step 5: 裁定推导")
 
     deriver = VerdictDeriver()
 
@@ -460,116 +467,116 @@ async def run():
             c = await session.get(Conclusion, conc.id)
             cv = await deriver.derive_conclusion(c, session)
             if cv:
-                v_color = _ok if str(cv.verdict) == "confirmed" else _warn
-                type_label = "[回顾型]" if c.conclusion_type == "retrospective" else "[预测型]"
-                print(f"\n  {C_CYAN}[ConclusionVerdict id={cv.id}  {type_label} → Conclusion#{conc.id}]{C_RESET}")
-                _row("verdict", v_color(cv.verdict))
+                print(f"\n  {C_CYAN}[ConclusionVerdict id={cv.id} → Conclusion#{conc.id}]{C_RESET}")
+                _row("verdict",    _verdict_color(cv.verdict))
+                _block("claim",    c.claim)
                 if cv.logic_trace:
-                    trace = json.loads(cv.logic_trace)
-                    _row("supporting_facts", trace.get("supporting_facts"))
-                    _row("assumption_facts", trace.get("assumption_facts"))
+                    try:
+                        trace = json.loads(cv.logic_trace)
+                        sup_align = trace.get("supporting_alignments", {})
+                        if sup_align:
+                            print(f"    {C_CYAN}支撑事实对齐:{C_RESET}")
+                            for fid, ar in sup_align.items():
+                                print(f"      Fact#{fid} → {_align_color(ar)}")
+                        _row("logic_validity", trace.get("logic_validity"), indent=4)
+                    except Exception:
+                        pass
             else:
-                type_label = "[回顾型]" if conc.conclusion_type == "retrospective" else "[预测型]"
-                print(f"\n  {C_CYAN}[Conclusion#{conc.id} {type_label}]{C_RESET} "
-                      f"{_dim('→ pending（监控期未到或无逻辑）')}")
+                print(f"\n  {C_CYAN}[Conclusion#{conc.id}]{C_RESET} {_dim('→ pending')}")
+
+        # Prediction 裁定
+        for pred in preds:
+            p = await session.get(Prediction, pred.id)
+            pv = await deriver.derive_prediction(p, session)
+            if pv:
+                print(f"\n  {C_CYAN}[PredictionVerdict id={pv.id} → Prediction#{pred.id}]{C_RESET}")
+                _row("verdict",   _verdict_color(pv.verdict))
+                _block("claim",   p.claim)
+            else:
+                print(f"\n  {C_CYAN}[Prediction#{pred.id}]{C_RESET} {_dim('→ pending（监控期未到）')}")
 
         # Solution 裁定
         for sol in sols:
             s = await session.get(Solution, sol.id)
             sa = await deriver.derive_solution(s, session)
             if sa:
-                v_color = _ok if str(sa.verdict) == "validated" else _warn
-                print(f"\n  {C_CYAN}[SolutionAssessment id={sa.id}  → Solution#{sol.id}]{C_RESET}")
-                _row("verdict", v_color(sa.verdict))
-                _row("evidence_text", sa.evidence_text)
+                print(f"\n  {C_CYAN}[SolutionAssessment id={sa.id} → Solution#{sol.id}]{C_RESET}")
+                _row("verdict",        _verdict_color(sa.verdict))
+                _block("solution_claim", s.claim)
+                _block("evidence_text",  sa.evidence_text)
             else:
-                print(f"\n  {C_CYAN}[Solution#{sol.id}]{C_RESET} "
-                      f"{_dim('→ pending（监控期未到）')}")
+                print(f"\n  {C_CYAN}[Solution#{sol.id}]{C_RESET} {_dim('→ pending')}")
 
         await session.commit()
 
-    # ── Step 7: 角色匹配评估 ───────────────────────────────────────────────
-    _sep("LAYER 3 — Step 7: 角色匹配评估")
+    # ══════════════════════════════════════════════════════════════════════
+    # LAYER 3 — Step 6: 角色匹配评估
+    # ══════════════════════════════════════════════════════════════════════
+    _sep("LAYER 3 — Step 6: 角色匹配评估")
 
     role_evaluator = RoleEvaluator()
 
     async with AsyncSessionLocal() as session:
-        # 加载作者（带档案）
         a = await session.get(Author, auth.id)
-        role_label = a.role or "未知角色"
-        tier = a.credibility_tier or 5
-        print(f"\n  作者: {a.name}  |  角色: {role_label}  |  可信度 Tier{tier}")
+        all_verdicts    = list((await session.exec(select(ConclusionVerdict))).all())
+        all_assessments = list((await session.exec(select(SolutionAssessment))).all())
 
-        # Conclusion 角色匹配
-        all_verdicts = list((await session.exec(select(ConclusionVerdict))).all())
         for verdict in all_verdicts:
             c = await session.get(Conclusion, verdict.conclusion_id)
             if c is None:
                 continue
-
             await role_evaluator.evaluate_conclusion_verdict(verdict, c, a, session)
-
             fit = verdict.role_fit or "—"
             fit_color = _ok if fit == "appropriate" else (_warn if fit == "questionable" else _dim)
-            type_label = "[回顾型]" if c.conclusion_type == "retrospective" else "[预测型]"
-            print(f"\n  {C_CYAN}[ConclusionVerdict id={verdict.id}  {type_label} → Conclusion#{c.id}]{C_RESET}")
-            _row("claim",        c.claim[:80] + ("…" if len(c.claim) > 80 else ""), indent=4)
-            _row("verdict",      str(verdict.verdict), indent=4)
-            _row("role_fit",     fit_color(fit), indent=4)
-            _row("role_fit_note", verdict.role_fit_note, indent=4)
+            print(f"\n  {C_CYAN}[ConclusionVerdict id={verdict.id} → Conclusion#{c.id}]{C_RESET}")
+            _row("role_fit",      fit_color(fit))
+            _row("role_fit_note", verdict.role_fit_note)
 
-        # Solution 角色匹配
-        all_assessments = list((await session.exec(select(SolutionAssessment))).all())
         for assessment in all_assessments:
             s = await session.get(Solution, assessment.solution_id)
             if s is None:
                 continue
-
             await role_evaluator.evaluate_solution_assessment(assessment, s, a, session)
-
             fit = assessment.role_fit or "—"
             fit_color = _ok if fit == "appropriate" else (_warn if fit == "questionable" else _dim)
-            print(f"\n  {C_CYAN}[SolutionAssessment id={assessment.id}  → Solution#{s.id}]{C_RESET}")
-            _row("claim",        s.claim[:80] + ("…" if len(s.claim) > 80 else ""), indent=4)
-            _row("verdict",      str(assessment.verdict), indent=4)
-            _row("role_fit",     fit_color(fit), indent=4)
-            _row("role_fit_note", assessment.role_fit_note, indent=4)
+            print(f"\n  {C_CYAN}[SolutionAssessment id={assessment.id} → Solution#{s.id}]{C_RESET}")
+            _row("role_fit",      fit_color(fit))
+            _row("role_fit_note", assessment.role_fit_note)
 
         if not all_verdicts and not all_assessments:
             print(f"  {_dim('（无已裁定的结论/解决方案，跳过角色评估）')}")
 
         await session.commit()
 
-    # ── Step 8: 内容质量评估 ───────────────────────────────────────────────
-    _sep("LAYER 3 — Step 8: 内容质量评估（独特性 + 有效性）")
+    # ══════════════════════════════════════════════════════════════════════
+    # LAYER 3 — Step 7: 内容质量评估
+    # ══════════════════════════════════════════════════════════════════════
+    _sep("LAYER 3 — Step 7: 内容质量评估（独特性 + 有效性）")
 
     post_quality_evaluator = PostQualityEvaluator()
 
     async with AsyncSessionLocal() as session:
         rp = await session.get(RawPost, rp_row.id)
-        a = await session.get(Author, auth.id)
+        a  = await session.get(Author, auth.id)
 
         print(f"\n  {C_CYAN}[RawPost id={rp.id}  author={a.name}]{C_RESET}")
-        _row("url", rp.url)
-
         await post_quality_evaluator.assess(rp, a, session)
 
         pqa_r = await session.exec(
-            select(PostQualityAssessment).where(
-                PostQualityAssessment.raw_post_id == rp.id
-            )
+            select(PostQualityAssessment).where(PostQualityAssessment.raw_post_id == rp.id)
         )
         pqa = pqa_r.first()
         if pqa:
             u_color = _ok if (pqa.uniqueness_score or 0) >= 0.7 else _warn
             e_color = _ok if (pqa.effectiveness_score or 0) >= 0.7 else _warn
-            print(f"\n  {C_CYAN}内容独特性:{C_RESET}")
-            _row("uniqueness_score",   u_color(f"{pqa.uniqueness_score:.2f}" if pqa.uniqueness_score is not None else "—"), indent=4)
-            _row("is_first_mover",     _ok("是") if pqa.is_first_mover else _dim("否"), indent=4)
-            _row("similar_claim_count",  pqa.similar_claim_count, indent=4)
-            _row("similar_author_count", pqa.similar_author_count, indent=4)
-            _row("uniqueness_note",    pqa.uniqueness_note, indent=4)
-            print(f"\n  {C_CYAN}内容有效性:{C_RESET}")
+
+            _sub("内容独特性:", indent=2)
+            _row("uniqueness_score",    u_color(f"{pqa.uniqueness_score:.2f}" if pqa.uniqueness_score is not None else "—"), indent=4)
+            _row("is_first_mover",      _ok("是") if pqa.is_first_mover else _dim("否"), indent=4)
+            _row("similar_claim_count", pqa.similar_claim_count,  indent=4)
+            _row("uniqueness_note",     pqa.uniqueness_note,      indent=4)
+
+            _sub("内容有效性:", indent=2)
             _row("effectiveness_score", e_color(f"{pqa.effectiveness_score:.2f}" if pqa.effectiveness_score is not None else "—"), indent=4)
             _row("noise_ratio",         f"{pqa.noise_ratio:.2f}" if pqa.noise_ratio is not None else "—", indent=4)
             if pqa.noise_types:
@@ -580,20 +587,20 @@ async def run():
                     _row("noise_types", pqa.noise_types, indent=4)
             else:
                 _row("noise_types", _dim("无"), indent=4)
-            _row("effectiveness_note", pqa.effectiveness_note, indent=4)
         else:
             print(f"  {_warn('质量评估失败或跳过')}")
 
         await session.commit()
 
-    # ── Step 9: 作者综合统计更新 ───────────────────────────────────────────
-    _sep("LAYER 3 — Step 9: 作者综合统计更新")
+    # ══════════════════════════════════════════════════════════════════════
+    # LAYER 3 — Step 8: 作者综合统计更新
+    # ══════════════════════════════════════════════════════════════════════
+    _sep("LAYER 3 — Step 8: 作者综合统计更新")
 
     author_stats_updater = AuthorStatsUpdater()
 
     async with AsyncSessionLocal() as session:
         a = await session.get(Author, auth.id)
-
         await author_stats_updater.update(a, session)
 
         stats_r = await session.exec(
@@ -603,7 +610,7 @@ async def run():
         if stats:
             def _fmt_rate(v, n):
                 if v is None:
-                    return _dim(f"N/A（样本=0）")
+                    return _dim("N/A（样本=0）")
                 color = _ok if v >= 0.7 else _warn
                 return color(f"{v:.1%}") + _dim(f"（样本={n}）")
 
@@ -614,53 +621,54 @@ async def run():
             )
 
             print(f"\n  {C_CYAN}[AuthorStats  author={a.name}]{C_RESET}")
-            _row("综合评分",    overall_str, indent=4)
-            _row("分析内容数",  stats.total_posts_analyzed, indent=4)
+            _row("综合评分",     overall_str, indent=4)
+            _row("分析内容数",   stats.total_posts_analyzed, indent=4)
             print()
-            _row("① 事实准确率",    _fmt_rate(stats.fact_accuracy_rate, stats.fact_accuracy_sample), indent=4)
-            _row("② 结论准确性",    _fmt_rate(stats.conclusion_accuracy_rate, stats.conclusion_accuracy_sample), indent=4)
-            _row("③ 预测准确性",    _fmt_rate(stats.prediction_accuracy_rate, stats.prediction_accuracy_sample), indent=4)
-            _row("④ 逻辑严谨性",    _fmt_rate(stats.logic_rigor_score, stats.logic_rigor_sample), indent=4)
-            _row("⑤ 建议可靠性",    _fmt_rate(stats.recommendation_reliability_rate, stats.recommendation_reliability_sample), indent=4)
-            _row("⑥ 内容独特性",    _fmt_rate(stats.content_uniqueness_score, stats.content_uniqueness_sample), indent=4)
-            _row("⑦ 内容有效性",    _fmt_rate(stats.content_effectiveness_score, stats.content_effectiveness_sample), indent=4)
+            _row("① 事实准确率",    _fmt_rate(stats.fact_accuracy_rate,              stats.fact_accuracy_sample),             indent=4)
+            _row("② 结论准确性",    _fmt_rate(stats.conclusion_accuracy_rate,         stats.conclusion_accuracy_sample),        indent=4)
+            _row("③ 预测准确性",    _fmt_rate(stats.prediction_accuracy_rate,         stats.prediction_accuracy_sample),        indent=4)
+            _row("④ 逻辑严谨性",    _fmt_rate(stats.logic_rigor_score,               stats.logic_rigor_sample),               indent=4)
+            _row("⑤ 建议可靠性",    _fmt_rate(stats.recommendation_reliability_rate,  stats.recommendation_reliability_sample), indent=4)
+            _row("⑥ 内容独特性",    _fmt_rate(stats.content_uniqueness_score,         stats.content_uniqueness_sample),         indent=4)
+            _row("⑦ 内容有效性",    _fmt_rate(stats.content_effectiveness_score,      stats.content_effectiveness_sample),      indent=4)
         else:
             print(f"  {_warn('统计更新失败')}")
 
         await session.commit()
 
     # ══════════════════════════════════════════════════════════════════════
-    # 数据库快照
+    # 最终数据库快照
     # ══════════════════════════════════════════════════════════════════════
     _sep("最终数据库快照")
     async with AsyncSessionLocal() as session:
         counts = {
-            "authors":               len(list((await session.exec(select(Author))).all())),
-            "monitored_sources":     len(list((await session.exec(select(MonitoredSource))).all())),
-            "raw_posts":             len(list((await session.exec(select(RawPost))).all())),
-            "topics":                len(list((await session.exec(select(Topic))).all())),
-            "facts":                 len(list((await session.exec(select(Fact))).all())),
-            "verification_refs":     len(list((await session.exec(select(VerificationReference))).all())),
-            "conclusions":           len(list((await session.exec(select(Conclusion))).all())),
-            "solutions":             len(list((await session.exec(select(Solution))).all())),
-            "logics":                len(list((await session.exec(select(Logic))).all())),
-            "fact_evaluations":      len(list((await session.exec(select(FactEvaluation))).all())),
-            "logic_relations":       len(list((await session.exec(select(LogicRelation))).all())),
-            "conclusion_verdicts":   len(list((await session.exec(select(ConclusionVerdict))).all())),
-            "solution_assessments":  len(list((await session.exec(select(SolutionAssessment))).all())),
+            "authors":                  len(list((await session.exec(select(Author))).all())),
+            "monitored_sources":        len(list((await session.exec(select(MonitoredSource))).all())),
+            "raw_posts":                len(list((await session.exec(select(RawPost))).all())),
+            "topics":                   len(list((await session.exec(select(Topic))).all())),
+            "facts":                    len(list((await session.exec(select(Fact))).all())),
+            "assumptions":              len(list((await session.exec(select(Assumption))).all())),
+            "implicit_conditions":      len(list((await session.exec(select(ImplicitCondition))).all())),
+            "conclusions":              len(list((await session.exec(select(Conclusion))).all())),
+            "predictions":              len(list((await session.exec(select(Prediction))).all())),
+            "solutions":                len(list((await session.exec(select(Solution))).all())),
+            "logics":                   len(list((await session.exec(select(Logic))).all())),
+            "conclusion_verdicts":      len(list((await session.exec(select(ConclusionVerdict))).all())),
+            "prediction_verdicts":      len(list((await session.exec(select(PredictionVerdict))).all())),
+            "solution_assessments":     len(list((await session.exec(select(SolutionAssessment))).all())),
             "post_quality_assessments": len(list((await session.exec(select(PostQualityAssessment))).all())),
-            "author_stats":          len(list((await session.exec(select(AuthorStats))).all())),
+            "author_stats":             len(list((await session.exec(select(AuthorStats))).all())),
         }
 
-    print(f"  {'表名':<30} {'行数':>5}")
-    print(f"  {'─' * 37}")
+    print(f"  {'表名':<32} {'行数':>5}")
+    print(f"  {'─' * 40}")
     for table, n in counts.items():
         ind = _ok("✓") if n > 0 else " "
-        print(f"  {ind} {table:<28} {n:>5}")
+        print(f"  {ind} {table:<30} {n:>5}")
 
     print()
     _sep()
-    print(_ok("  全链路测试完成！"))
+    print(_ok("  全链路测试完成！（v2 六实体架构）"))
     _sep()
 
 
