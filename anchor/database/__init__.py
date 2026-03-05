@@ -1,19 +1,5 @@
-"""anchor.database — 数据库模型统一导出"""
+"""anchor.database — 数据库模型统一导出（v4）"""
+# v4 重构后，旧的 EvaluationResult / FactEvaluation / ConclusionVerdict 已移除。
+# 此文件保留为空导出，避免旧引用抛出 ImportError。
 
-from anchor.models import (
-    # 枚举
-    EvaluationResult,
-    VerdictResult,
-    # Layer 3 表
-    FactEvaluation,
-    ConclusionVerdict,
-    SolutionAssessment,
-)
-
-__all__ = [
-    "EvaluationResult",
-    "VerdictResult",
-    "FactEvaluation",
-    "ConclusionVerdict",
-    "SolutionAssessment",
-]
+__all__: list = []

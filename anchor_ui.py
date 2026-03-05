@@ -19,6 +19,7 @@ from typing import AsyncGenerator
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -77,6 +78,17 @@ async def _init_db():
             ("logics", "logic_validity",             "TEXT"),
             ("logics", "logic_issues",               "TEXT"),
             ("logics", "logic_verified_at",          "TEXT"),
+            # v3 新字段
+            ("facts",       "alignment_vagueness",    "TEXT"),
+            ("conclusions", "is_core_conclusion",     "INTEGER DEFAULT 0"),
+            ("conclusions", "is_in_cycle",            "INTEGER DEFAULT 0"),
+            ("logics",      "condition_ids",          "TEXT"),
+            # v2.2 语义化判定标签
+            ("facts",        "fact_verdict",        "TEXT"),
+            ("facts",        "fact_source_tier",    "TEXT"),
+            ("conclusions",  "conclusion_verdict",  "TEXT"),
+            ("conclusions",  "prediction_verdict",  "TEXT"),
+            ("conditions",   "condition_verdict",   "TEXT"),
         ]
         for table, col, typedef in migrations:
             try:
@@ -94,6 +106,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")), name="static")
 
 # 存储任务队列 {task_id: asyncio.Queue}
 _tasks: dict[str, asyncio.Queue] = {}
@@ -181,17 +194,15 @@ async def _run_pipeline(url: str, q: asyncio.Queue):
         from anchor.tracker.author_stats_updater import AuthorStatsUpdater
         from anchor.tracker.logic_verifier import LogicVerifier
         from anchor.tracker.reality_aligner import RealityAligner
-        from anchor.tracker.prediction_monitor import PredictionMonitor
-        from anchor.tracker.logic_relation_mapper import LogicRelationMapper
         from anchor.tracker.post_quality_evaluator import PostQualityEvaluator
         from anchor.tracker.role_evaluator import RoleEvaluator
-        from anchor.tracker.solution_simulator import SolutionSimulator
+
         from anchor.tracker.verdict_deriver import VerdictDeriver
         from anchor.models import (
-            Assumption, Author, AuthorGroup, AuthorStats, AuthorStanceProfile,
-            Conclusion, ConclusionVerdict, Fact, FactEvaluation,
-            ImplicitCondition, Logic, LogicRelation, MonitoredSource, PostQualityAssessment,
-            Prediction, PredictionVerdict, RawPost, Solution, SolutionAssessment,
+            Author, AuthorGroup, AuthorStats, AuthorStanceProfile,
+            Condition, Conclusion, ConclusionVerdict, Fact, FactEvaluation,
+            Logic, MonitoredSource, PostQualityAssessment,
+            RawPost, Solution, SolutionAssessment,
             Topic, VerificationReference,
         )
         from sqlmodel import select
@@ -248,35 +259,31 @@ async def _run_pipeline(url: str, q: asyncio.Queue):
             facts = list((await session.exec(
                 select(Fact).where(Fact.raw_post_id == raw_post_id)
             )).all())
+            conditions = list((await session.exec(
+                select(Condition).where(Condition.raw_post_id == raw_post_id)
+            )).all())
             concls = list((await session.exec(
                 select(Conclusion).where(Conclusion.source_url == post_url)
-            )).all())
-            preds = list((await session.exec(
-                select(Prediction).where(Prediction.source_url == post_url)
-            )).all())
-            assumps = list((await session.exec(
-                select(Assumption).where(Assumption.raw_post_id == raw_post_id)
             )).all())
             sols = list((await session.exec(
                 select(Solution).where(Solution.source_url == post_url)
             )).all())
             conc_ids = [c.id for c in concls]
-            pred_ids = [p.id for p in preds]
             sol_ids = [s.id for s in sols]
             fact_ids = [f.id for f in facts]
+            cond_ids = [c.id for c in conditions]
             all_logics = list((await session.exec(select(Logic))).all())
             logics = [
                 l for l in all_logics
                 if (l.logic_type == "inference" and l.conclusion_id in conc_ids)
-                or (l.logic_type == "prediction" and l.prediction_id in pred_ids)
                 or (l.logic_type == "derivation" and l.solution_id in sol_ids)
             ]
 
         await _emit(q, {
             "type": "step_done", "num": 2,
             "detail": (
-                f"提取：{len(facts)} 事实，{len(concls)} 结论，"
-                f"{len(preds)} 预测，{len(assumps)} 假设，{len(sols)} 解决方案"
+                f"提取：{len(facts)} 事实，{len(conditions)} 条件，"
+                f"{len(concls)} 结论，{len(sols)} 解决方案"
             ),
         })
 
@@ -319,56 +326,35 @@ async def _run_pipeline(url: str, q: asyncio.Queue):
                 c = await session.get(Conclusion, conc.id)
                 if c:
                     await aligner.align_conclusion(c, session)
-            # Also align implicit conditions and assumptions
-            if fact_ids:
-                all_ics = list((await session.exec(
-                    select(ImplicitCondition).where(ImplicitCondition.fact_id.in_(fact_ids))
-                )).all())
-                for ic in all_ics:
-                    ic_obj = await session.get(ImplicitCondition, ic.id)
-                    if ic_obj:
-                        await aligner.align_implicit_condition(ic_obj, session)
-            for assump in assumps:
-                a_obj = await session.get(Assumption, assump.id)
-                if a_obj:
-                    await aligner.align_assumption(a_obj, session)
+            for cond in conditions:
+                cond_obj = await session.get(Condition, cond.id)
+                if cond_obj:
+                    await aligner.align_condition(cond_obj, session)
             await session.commit()
 
         await _emit(q, {"type": "step_done", "num": 5, "detail": "现实对齐完成"})
 
-        # ── Step 3：预测监控配置（PredictionMonitor）──────────────────────
-        await _emit(q, {"type": "step", "num": 6, "label": f"Step 3 — 预测监控配置（{len(preds)} 条）"})
+        # ── Step 3：预测型结论监控配置 ──────────────────────────────────
+        from anchor.tracker.conclusion_monitor import ConclusionMonitor
+        predictive_concls = [c for c in concls if c.conclusion_type == "predictive"]
+        await _emit(q, {"type": "step", "num": 6, "label": f"Step 3 — 预测型结论监控配置（{len(predictive_concls)} 条）"})
 
-        pred_monitor = PredictionMonitor()
-        if preds:
+        conc_monitor = ConclusionMonitor()
+        if predictive_concls:
             async with AsyncSessionLocal() as session:
-                for pred in preds:
-                    p = await session.get(Prediction, pred.id)
-                    if p:
-                        await pred_monitor.setup(p, session)
+                for pc in predictive_concls:
+                    c = await session.get(Conclusion, pc.id)
+                    if c:
+                        await conc_monitor.setup(c, session)
                 await session.commit()
 
         await _emit(q, {
             "type": "step_done", "num": 6,
-            "detail": f"配置 {len(preds)} 个预测监控",
+            "detail": f"配置 {len(predictive_concls)} 个预测型结论监控",
         })
 
-        # ── Step 4：解决方案模拟 ──────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 7, "label": "Step 4 — 解决方案模拟执行"})
-
-        solution_simulator = SolutionSimulator()
-        if sols:
-            async with AsyncSessionLocal() as session:
-                for sol in sols:
-                    s = await session.get(Solution, sol.id)
-                    if s:
-                        await solution_simulator.simulate(s, session)
-                await session.commit()
-
-        await _emit(q, {"type": "step_done", "num": 7, "detail": f"模拟 {len(sols)} 个解决方案"})
-
-        # ── Step 5：裁定推导（VerdictDeriver）────────────────────────────
-        await _emit(q, {"type": "step", "num": 8, "label": "Step 5 — 裁定推导"})
+        # ── Step 4：裁定推导（VerdictDeriver）────────────────────────────
+        await _emit(q, {"type": "step", "num": 7, "label": "Step 4 — 裁定推导"})
 
         deriver = VerdictDeriver()
         async with AsyncSessionLocal() as session:
@@ -376,20 +362,12 @@ async def _run_pipeline(url: str, q: asyncio.Queue):
                 c = await session.get(Conclusion, conc.id)
                 if c:
                     await deriver.derive_conclusion(c, session)
-            for pred in preds:
-                p = await session.get(Prediction, pred.id)
-                if p:
-                    await deriver.derive_prediction(p, session)
-            for sol in sols:
-                s = await session.get(Solution, sol.id)
-                if s:
-                    await deriver.derive_solution(s, session)
             await session.commit()
 
-        await _emit(q, {"type": "step_done", "num": 8, "detail": "裁定完成"})
+        await _emit(q, {"type": "step_done", "num": 7, "detail": "裁定完成"})
 
-        # ── Step 6：角色匹配评估 ──────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 9, "label": "Step 6 — 角色匹配评估"})
+        # ── Step 5：角色匹配评估 ──────────────────────────────────────────
+        await _emit(q, {"type": "step", "num": 8, "label": "Step 5 — 角色匹配评估"})
 
         role_evaluator = RoleEvaluator()
         async with AsyncSessionLocal() as session:
@@ -410,10 +388,10 @@ async def _run_pipeline(url: str, q: asyncio.Queue):
                     await role_evaluator.evaluate_solution_assessment(assessment, s, a, session)
             await session.commit()
 
-        await _emit(q, {"type": "step_done", "num": 9, "detail": "角色匹配评估完成"})
+        await _emit(q, {"type": "step_done", "num": 8, "detail": "角色匹配评估完成"})
 
-        # ── Step 7：内容质量评估 ──────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 10, "label": "Step 7 — 内容质量评估"})
+        # ── Step 6：内容质量评估 ──────────────────────────────────────────
+        await _emit(q, {"type": "step", "num": 9, "label": "Step 6 — 内容质量评估"})
 
         post_quality_evaluator = PostQualityEvaluator()
         async with AsyncSessionLocal() as session:
@@ -422,10 +400,10 @@ async def _run_pipeline(url: str, q: asyncio.Queue):
             await post_quality_evaluator.assess(rp, a, session)
             await session.commit()
 
-        await _emit(q, {"type": "step_done", "num": 10, "detail": "内容质量评估完成"})
+        await _emit(q, {"type": "step_done", "num": 9, "detail": "内容质量评估完成"})
 
-        # ── Step 8：作者统计更新 ──────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 11, "label": "Step 8 — 作者综合统计更新"})
+        # ── Step 7：作者统计更新 ──────────────────────────────────────────
+        await _emit(q, {"type": "step", "num": 10, "label": "Step 7 — 作者综合统计更新"})
 
         author_stats_updater = AuthorStatsUpdater()
         async with AsyncSessionLocal() as session:
@@ -433,10 +411,10 @@ async def _run_pipeline(url: str, q: asyncio.Queue):
             await author_stats_updater.update(a, session)
             await session.commit()
 
-        await _emit(q, {"type": "step_done", "num": 11, "detail": "统计更新完成"})
+        await _emit(q, {"type": "step_done", "num": 10, "detail": "统计更新完成"})
 
         # ── 汇总结果 ──────────────────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 12, "label": "汇总结果"})
+        await _emit(q, {"type": "step", "num": 11, "label": "汇总结果"})
         data = await _collect_results(raw_post_id, author_id, post_url)
         await _emit(q, {"type": "done", "data": data})
 
@@ -452,9 +430,9 @@ async def _collect_results(raw_post_id: int, author_id: int, post_url: str) -> d
     """从数据库收集所有结果，构建结构化输出。只取本次分析的数据。"""
     from anchor.database.session import AsyncSessionLocal
     from anchor.models import (
-        Assumption, Author, AuthorGroup, AuthorStats, AuthorStanceProfile,
-        Conclusion, ConclusionVerdict, Fact, FactEvaluation,
-        ImplicitCondition, Logic, PostQualityAssessment, Prediction, PredictionVerdict,
+        Author, AuthorGroup, AuthorStats, AuthorStanceProfile,
+        Condition, Conclusion, ConclusionVerdict, Fact, FactEvaluation,
+        Logic, PostQualityAssessment,
         RawPost, Solution, SolutionAssessment, VerificationReference,
     )
     from sqlmodel import select
@@ -476,53 +454,52 @@ async def _collect_results(raw_post_id: int, author_id: int, post_url: str) -> d
             )).all():
                 fact_evals[fe.fact_id] = fe
 
-        ics_by_fact: dict[int, list] = {}
-        if fact_ids:
-            for ic in (await session.exec(
-                select(ImplicitCondition).where(ImplicitCondition.fact_id.in_(fact_ids))
-            )).all():
-                ics_by_fact.setdefault(ic.fact_id, []).append(ic)
-
         facts_out = []
         for f in all_facts:
             fe = fact_evals.get(f.id)
             refs = list((await session.exec(
                 select(VerificationReference).where(VerificationReference.fact_id == f.id)
             )).all())
-            ics = ics_by_fact.get(f.id, [])
             facts_out.append({
                 "id": f.id,
                 "claim": f.claim,
                 "canonical_claim": f.canonical_claim,
+                "verifiable_statement": f.verifiable_statement,
                 "verifiable_expression": f.verifiable_expression,
                 "is_verifiable": f.is_verifiable,
-                "result": str(fe.result) if fe else "pending",
-                "evidence_tier": fe.evidence_tier if fe else None,
-                "evidence_summary": fe.evidence_text if fe else None,
-                "evaluator_notes": fe.evaluator_notes if fe else None,
-                "verification_method": f.verification_method,
-                "validity_start_note": f.validity_start_note,
-                "validity_end_note": f.validity_end_note,
+                "fact_verdict": f.fact_verdict,
+                "fact_source_tier": f.fact_source_tier,
+                "alignment_evidence": f.alignment_evidence,
+                "alignment_tier": f.alignment_tier,
+                "temporal_type": f.temporal_type,
+                "temporal_note": f.temporal_note,
                 "refs": [
                     {"org": r.organization, "desc": r.data_description, "url": r.url}
                     for r in refs
                 ],
-                "implicit_conditions": [
-                    {
-                        "id": ic.id,
-                        "condition_text": ic.condition_text,
-                        "verification_result": ic.verification_result,
-                        "verification_note": ic.verification_note,
-                        "vote_consensus": ic.vote_consensus,
-                        "vote_not_consensus": ic.vote_not_consensus,
-                        "consensus_trend": ic.consensus_trend,
-                        "consensus_trend_note": ic.consensus_trend_note,
-                    }
-                    for ic in ics
-                ],
             })
 
         fact_map = {f["id"]: f for f in facts_out}
+
+        # ── Conditions ────────────────────────────────────────────────────
+        all_conds = list((await session.exec(
+            select(Condition).where(Condition.raw_post_id == raw_post_id)
+        )).all())
+        cond_ids = [c.id for c in all_conds]
+
+        conditions_out = []
+        for cond in all_conds:
+            conditions_out.append({
+                "id": cond.id,
+                "condition_type": cond.condition_type,
+                "condition_text": cond.condition_text,
+                "verifiable_statement": cond.verifiable_statement,
+                "temporal_note": cond.temporal_note,
+                "is_consensus": cond.is_consensus,
+                "is_verifiable": cond.is_verifiable,
+                "condition_verdict": cond.condition_verdict,
+                "alignment_evidence": cond.alignment_evidence,
+            })
 
         # ── Conclusions & Solutions ───────────────────────────────────────
         all_concls = list((await session.exec(
@@ -535,49 +512,27 @@ async def _collect_results(raw_post_id: int, author_id: int, post_url: str) -> d
         )).all())
         sol_ids = [s.id for s in all_sols]
 
-        # Predictions and Assumptions (v2)
-        all_preds = list((await session.exec(
-            select(Prediction).where(Prediction.source_url == post_url)
-        )).all())
-        pred_ids = [p.id for p in all_preds]
-
-        all_assumps = list((await session.exec(
-            select(Assumption).where(Assumption.raw_post_id == raw_post_id)
-        )).all())
-
         # Logics for this analysis
         all_logics = list((await session.exec(select(Logic))).all())
         our_logics = [
             l for l in all_logics
             if (l.logic_type == "inference" and l.conclusion_id in conc_ids)
-            or (l.logic_type == "prediction" and l.prediction_id in pred_ids)
             or (l.logic_type == "derivation" and l.solution_id in sol_ids)
         ]
 
         # conclusion_id → logic info
         conc_logic_map: dict[int, dict] = {}
-        # prediction_id → logic info
-        pred_logic_map: dict[int, dict] = {}
         # solution_id → source_conclusion_ids
         sol_source_map: dict[int, list[int]] = {}
         for l in our_logics:
             if l.logic_type == "inference" and l.conclusion_id:
                 conc_logic_map[l.conclusion_id] = {
                     "supporting": json.loads(l.supporting_fact_ids or "[]"),
-                    "assumptions": json.loads(l.assumption_fact_ids or "[]"),
+                    "conditions": json.loads(l.condition_ids or "[]"),
                     "sup_concs": json.loads(l.supporting_conclusion_ids or "[]"),
-                    "completeness": str(l.logic_completeness) if l.logic_completeness else None,
+                    "chain_summary": l.chain_summary,
+                    "logic_validity": l.logic_validity,
                     "logic_note": l.logic_note,
-                    "summary": l.one_sentence_summary,
-                    "chain_summary": l.chain_summary,
-                    "logic_validity": l.logic_validity,
-                }
-            elif l.logic_type == "prediction" and l.prediction_id:
-                pred_logic_map[l.prediction_id] = {
-                    "supporting": json.loads(l.supporting_fact_ids or "[]"),
-                    "assumptions": json.loads(l.assumption_fact_ids or "[]"),
-                    "chain_summary": l.chain_summary,
-                    "logic_validity": l.logic_validity,
                 }
             elif l.logic_type == "derivation" and l.solution_id:
                 sol_source_map[l.solution_id] = json.loads(l.source_conclusion_ids or "[]")
@@ -649,96 +604,30 @@ async def _collect_results(raw_post_id: int, author_id: int, post_url: str) -> d
                 "id": c.id,
                 "claim": c.claim,
                 "canonical_claim": c.canonical_claim,
+                "verifiable_statement": c.verifiable_statement,
                 "conclusion_type": c.conclusion_type,
+                "temporal_note": c.temporal_note,
                 "time_horizon_note": c.time_horizon_note,
+                "is_core_conclusion": c.is_core_conclusion,
+                "is_in_cycle": c.is_in_cycle,
                 "author_confidence": c.author_confidence,
                 "author_confidence_note": c.author_confidence_note,
                 "status": str(c.status),
                 "verdict": str(cv.verdict) if cv else None,
+                "conclusion_verdict": c.conclusion_verdict,
+                "prediction_verdict": c.prediction_verdict,
                 "logic_trace": logic_trace_parsed,
                 "role_fit": cv.role_fit if cv else None,
                 "role_fit_note": cv.role_fit_note if cv else None,
-                "logic_completeness": logic_info.get("completeness"),
+                "chain_summary": logic_info.get("chain_summary"),
+                "logic_validity": logic_info.get("logic_validity"),
                 "logic_note": logic_info.get("logic_note"),
-                "logic_summary": logic_info.get("summary"),
+                "alignment_evidence": c.alignment_evidence,
                 "supporting_facts": supporting_facts,
                 "supporting_conclusion_ids": logic_info.get("sup_concs", []),
+                "supporting_condition_ids": logic_info.get("conditions", []),
                 "solutions": conc_solutions.get(c.id, []),
-                "conditional_assumption": c.conditional_assumption,
-                "assumption_probability": c.assumption_probability,
-                "conditional_monitoring_status": c.conditional_monitoring_status,
             })
-
-        # ── Predictions (v2) ─────────────────────────────────────────────
-        pred_verdict_map: dict[int, PredictionVerdict] = {}
-        if pred_ids:
-            for pv in (await session.exec(
-                select(PredictionVerdict).where(PredictionVerdict.prediction_id.in_(pred_ids))
-            )).all():
-                pred_verdict_map[pv.prediction_id] = pv
-
-        preds_out = []
-        for p in all_preds:
-            pv = pred_verdict_map.get(p.id)
-            plogic = pred_logic_map.get(p.id, {})
-            preds_out.append({
-                "id": p.id,
-                "claim": p.claim,
-                "canonical_claim": p.canonical_claim,
-                "verifiable_statement": p.verifiable_statement,
-                "temporal_note": p.temporal_note,
-                "author_confidence": p.author_confidence,
-                "author_confidence_note": p.author_confidence_note,
-                "status": str(p.status),
-                "verdict": str(pv.verdict) if pv else None,
-                "alignment_result": p.alignment_result,
-                "alignment_evidence": p.alignment_evidence,
-                "alignment_tier": p.alignment_tier,
-                "conditional_assumption": p.conditional_assumption,
-                "assumption_probability": p.assumption_probability,
-                "conditional_monitoring_status": p.conditional_monitoring_status,
-                "monitoring_source_org": p.monitoring_source_org,
-                "monitoring_period_note": p.monitoring_period_note,
-                "monitoring_start": str(p.monitoring_start) if p.monitoring_start else None,
-                "monitoring_end": str(p.monitoring_end) if p.monitoring_end else None,
-                "chain_summary": plogic.get("chain_summary"),
-                "logic_validity": plogic.get("logic_validity"),
-            })
-
-        # ── Assumptions (v2) ─────────────────────────────────────────────
-        assumps_out = []
-        for a_obj in all_assumps:
-            assumps_out.append({
-                "id": a_obj.id,
-                "condition_text": a_obj.condition_text,
-                "canonical_condition": a_obj.canonical_condition,
-                "verifiable_statement": a_obj.verifiable_statement,
-                "temporal_type": a_obj.temporal_type,
-                "temporal_note": a_obj.temporal_note,
-                "is_verifiable": a_obj.is_verifiable,
-                "alignment_result": a_obj.alignment_result,
-                "alignment_evidence": a_obj.alignment_evidence,
-            })
-
-        # All ICs (flat list for the dedicated IC section)
-        all_ics_flat = list((await session.exec(
-            select(ImplicitCondition).where(ImplicitCondition.fact_id.in_(fact_ids))
-        )).all()) if fact_ids else []
-        ics_out = [
-            {
-                "id": ic.id,
-                "fact_id": ic.fact_id,
-                "conclusion_id": ic.conclusion_id,
-                "condition_text": ic.condition_text,
-                "verification_result": ic.verification_result,
-                "verification_note": ic.verification_note,
-                "vote_consensus": ic.vote_consensus,
-                "vote_not_consensus": ic.vote_not_consensus,
-                "consensus_trend": ic.consensus_trend,
-                "consensus_trend_note": ic.consensus_trend_note,
-            }
-            for ic in all_ics_flat
-        ]
 
         # Author stats
         stats_r = await session.exec(
@@ -816,10 +705,8 @@ async def _collect_results(raw_post_id: int, author_id: int, post_url: str) -> d
             "content_preview": (rp.content or "")[:400],
         },
         "facts": facts_out,
-        "implicit_conditions": ics_out,
+        "conditions": conditions_out,
         "conclusions": concls_out,
-        "predictions": preds_out,
-        "assumptions": assumps_out,
         "author": {
             "id": author.id,
             "name": author.name,
@@ -958,15 +845,45 @@ _HTML = """<!DOCTYPE html>
 
     /* ── Badges ── */
     .badge { display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; line-height: 1.5; }
-    .badge-true, .badge-confirmed, .badge-validated, .badge-consensus { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
-    .badge-false, .badge-refuted, .badge-invalidated, .badge-not_consensus { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
-    .badge-uncertain, .badge-partial { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
+    /* 通用裁定 */
+    .badge-confirmed, .badge-validated { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
+    .badge-refuted, .badge-invalidated { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
+    .badge-partial { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
     .badge-unavailable, .badge-pending, .badge-unverifiable, .badge-expired { background: rgba(107,114,128,0.12); color: var(--gray); border: 1px solid rgba(107,114,128,0.3); }
+    /* v2.2 事实判定 */
+    .badge-credible { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
+    .badge-vague { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
+    .badge-unreliable { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
+    /* v2.2 预测型结论判定 */
+    .badge-accurate { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
+    .badge-directional { background: rgba(96,165,250,0.12); color: var(--blue); border: 1px solid rgba(96,165,250,0.3); }
+    .badge-off_target { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
+    .badge-wrong { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
+    /* v2.2 条件判定 */
+    .badge-consensus { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
+    .badge-non_consensus { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
+    .badge-disputed { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
+    .badge-strong_assumption { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
+    .badge-likely_assumption { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
+    /* 结论类型 */
     .badge-predictive { background: rgba(96,165,250,0.12); color: var(--blue); border: 1px solid rgba(96,165,250,0.3); }
     .badge-retrospective { background: rgba(99,102,241,0.12); color: var(--accent2); border: 1px solid rgba(99,102,241,0.3); }
+    /* 作者可信度 */
     .badge-tier1 { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
     .badge-tier2 { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
     .badge-tier3 { background: rgba(107,114,128,0.12); color: var(--gray); border: 1px solid rgba(107,114,128,0.3); }
+    /* 逻辑有效性 */
+    .badge-valid { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
+    .badge-invalid { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
+    /* 事实来源层 */
+    .badge-authoritative { background: rgba(34,197,94,0.15); color: #4ade80; border: 1px solid rgba(34,197,94,0.4); }
+    .badge-mainstream_media { background: rgba(96,165,250,0.12); color: var(--blue); border: 1px solid rgba(96,165,250,0.3); }
+    .badge-market_data { background: rgba(99,102,241,0.12); color: var(--accent2); border: 1px solid rgba(99,102,241,0.3); }
+    .badge-rumor { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
+    .badge-no_source { background: rgba(107,114,128,0.12); color: var(--gray); border: 1px solid rgba(107,114,128,0.3); }
+    /* 条件类型 */
+    .badge-assumption { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
+    .badge-implicit { background: rgba(107,114,128,0.12); color: var(--gray); border: 1px solid rgba(107,114,128,0.3); }
 
     /* ── Collapsible detail ── */
     .toggle-btn { cursor: pointer; font-size: 11px; color: var(--text-dim); margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); user-select: none; display: flex; align-items: center; gap: 4px; }
@@ -976,15 +893,16 @@ _HTML = """<!DOCTYPE html>
     .detail-text { font-size: 12px; color: var(--text-dim); line-height: 1.7; white-space: pre-wrap; word-break: break-word; margin-bottom: 6px; }
     .detail-label { font-size: 10px; font-weight: 700; color: var(--accent2); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; margin-top: 10px; }
 
-    /* ── IC items ── */
-    .ic-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
-    .ic-item { padding: 10px 14px; background: var(--surface2); border-radius: 8px; border-left: 3px solid var(--border); }
-    .ic-item.consensus { border-left-color: var(--green); }
-    .ic-item.not_consensus { border-left-color: var(--red); }
-    .ic-item.uncertain, .ic-item.pending { border-left-color: var(--yellow); }
-    .ic-text { font-size: 12px; margin-bottom: 8px; }
-    .ic-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-    .vote-text { font-size: 11px; color: var(--text-dim); }
+    /* ── Condition items ── */
+    .cond-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+    .cond-item { padding: 10px 14px; background: var(--surface2); border-radius: 8px; border-left: 3px solid var(--border); }
+    .cond-item.consensus { border-left-color: var(--green); }
+    .cond-item.disputed, .cond-item.non_consensus { border-left-color: var(--red); }
+    .cond-item.strong_assumption { border-left-color: var(--red); }
+    .cond-item.likely_assumption { border-left-color: var(--green); }
+    .cond-item.unavailable, .cond-item.pending { border-left-color: var(--border); }
+    .cond-text { font-size: 12px; margin-bottom: 8px; }
+    .cond-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 
     /* ── Conclusions table ── */
     .table-wrap { overflow-x: auto; border-radius: var(--radius); border: 1px solid var(--border); }
@@ -1056,7 +974,15 @@ _HTML = """<!DOCTYPE html>
     .fill-mid { background: var(--yellow); }
     .fill-low { background: var(--red); }
     .score-row-val { font-size: 12px; min-width: 40px; text-align: right; font-weight: 600; }
+
+    /* ── DAG ── */
+    .dag-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: #0d1117; position: relative; }
+    #dagContainer { width: 100%; height: 480px; }
+    .dag-legend { display: flex; flex-wrap: wrap; gap: 12px; padding: 10px 16px; border-top: 1px solid var(--border); background: var(--surface); }
+    .dag-legend-item { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-dim); }
+    .dag-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
   </style>
+  <script src="/static/vis-network.min.js"></script>
 </head>
 <body>
 
@@ -1097,13 +1023,33 @@ _HTML = """<!DOCTYPE html>
       <div class="cards-grid" id="factsGrid"></div>
     </div>
 
-    <!-- Implicit Conditions -->
+    <!-- Conditions (assumption + implicit) -->
     <div class="section">
       <div class="section-header">
-        <div class="section-title">隐含条件</div>
-        <div class="section-count" id="icsCount"></div>
+        <div class="section-title">条件</div>
+        <div class="section-count" id="condsCount"></div>
       </div>
-      <div class="cards-grid" id="icsGrid"></div>
+      <div class="cards-grid" id="condsGrid"></div>
+    </div>
+
+    <!-- Logic DAG -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-title">逻辑关系图</div>
+        <div class="section-count" id="dagCount"></div>
+      </div>
+      <div class="dag-wrap">
+        <div id="dagContainer"></div>
+        <div class="dag-legend">
+          <div class="dag-legend-item"><div class="dag-dot" style="background:#4ade80"></div>事实（可信）</div>
+          <div class="dag-legend-item"><div class="dag-dot" style="background:#fbbf24"></div>事实（宽泛/小道）</div>
+          <div class="dag-legend-item"><div class="dag-dot" style="background:#f87171"></div>事实（不可信）</div>
+          <div class="dag-legend-item"><div class="dag-dot" style="background:#6b7280"></div>事实（无数据）</div>
+          <div class="dag-legend-item"><div class="dag-dot" style="background:#c084fc;border-radius:2px"></div>结论</div>
+          <div class="dag-legend-item"><div class="dag-dot" style="background:#f59e0b;border-radius:2px"></div>条件</div>
+          <div class="dag-legend-item"><div class="dag-dot" style="background:#60a5fa;border-radius:2px"></div>解决方案</div>
+        </div>
+      </div>
     </div>
 
     <!-- Conclusions Table -->
@@ -1116,10 +1062,10 @@ _HTML = """<!DOCTYPE html>
         <table class="conc-table">
           <thead>
             <tr>
-              <th style="width:28%">结论</th>
-              <th style="width:30%">事实 &amp; 隐含条件</th>
-              <th style="width:22%">解决方案</th>
-              <th style="width:20%">判定结果</th>
+              <th style="width:30%">结论</th>
+              <th style="width:28%">支撑事实</th>
+              <th style="width:20%">解决方案</th>
+              <th style="width:22%">语义判定</th>
             </tr>
           </thead>
           <tbody id="conclusionsBody"></tbody>
@@ -1151,17 +1097,14 @@ const STEPS = [
   {n:1,  l:"采集"},
   {n:2,  l:"观点提取"},
   {n:3,  l:"作者档案"},
-  {n:4,  l:"事实核查"},
-  {n:5,  l:"隐含条件"},
-  {n:6,  l:"逻辑评估"},
-  {n:7,  l:"预测监控"},
-  {n:8,  l:"方案模拟"},
-  {n:9,  l:"逻辑映射"},
-  {n:10, l:"裁定推导"},
-  {n:11, l:"角色评估"},
-  {n:12, l:"质量评估"},
-  {n:13, l:"统计更新"},
-  {n:14, l:"汇总结果"},
+  {n:4,  l:"逻辑验证"},
+  {n:5,  l:"现实对齐"},
+  {n:6,  l:"预测监控"},
+  {n:7,  l:"裁定推导"},
+  {n:8,  l:"角色评估"},
+  {n:9,  l:"质量评估"},
+  {n:10, l:"统计更新"},
+  {n:11, l:"汇总结果"},
 ];
 
 let evtSource = null;
@@ -1243,22 +1186,74 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-const RESULT_LABELS = {
-  true: '✓ 已核实', false: '✗ 不实', uncertain: '? 不确定', unavailable: '— 无数据',
-  pending: '… 待核查', confirmed: '✓ 已确认', refuted: '✗ 已反驳',
-  partial: '△ 部分确认', unverifiable: '— 无法验证', validated: '✓ 有效',
-  invalidated: '✗ 无效', expired: '⌛ 已过期',
+// 通用裁定标签
+const VERDICT_LABELS = {
+  confirmed: '✓ 已确认', refuted: '✗ 已驳斥',
+  partial: '△ 部分支持', unverifiable: '— 无法核实', pending: '… 待裁定',
+};
+// v2.2 实体语义判定标签
+const FACT_VERDICT_LABELS = {
+  credible: '✓ 可信', vague: '~ 宽泛', unreliable: '✗ 不可信', unavailable: '— 无数据',
+};
+const CONC_RETRO_LABELS = {
+  credible: '✓ 可信', vague: '~ 宽泛', unreliable: '✗ 不可信', unavailable: '— 无数据',
+};
+const CONC_PRED_LABELS = {
+  pending: '… 等待中', accurate: '✓ 准确', directional: '→ 方向一致',
+  off_target: '△ 误差较大', wrong: '✗ 错误',
+};
+const COND_ASSUMPTION_LABELS = {
+  strong_assumption: '⚠ 强假设', likely_assumption: '✓ 较大概率', unavailable: '— 无数据',
+};
+const COND_IMPLICIT_LABELS = {
+  consensus: '✓ 共识', non_consensus: '~ 非共识', disputed: '✗ 有争议', unavailable: '— 无数据',
 };
 const CONF_LABELS = { certain:'确定', likely:'可能', uncertain:'不确定', speculative:'猜测' };
 const TIER_LABELS = { 1:'顶级权威', 2:'行业专家', 3:'知名评论员', 4:'普通KOL', 5:'未知' };
+const LOGIC_VALIDITY_LABELS = { valid:'✓ 逻辑有效', partial:'~ 部分有效', invalid:'✗ 逻辑无效' };
+const SOURCE_TIER_LABELS = {
+  authoritative:   '权威来源',
+  mainstream_media:'主流媒体',
+  market_data:     '金融市场',
+  rumor:           '小道消息',
+  no_source:       '无消息源',
+};
 
 function badge(cls, text) {
   return `<span class="badge badge-${cls}">${text}</span>`;
 }
-function resultBadge(r) {
-  if (!r) return badge('pending', '待处理');
-  const key = r.replace(/[^a-z_]/g, '');
-  return badge(key, RESULT_LABELS[r] || r);
+function verdictBadge(v) {
+  if (!v) return badge('pending', '待裁定');
+  const key = String(v).replace(/[^a-z_]/g, '');
+  return badge(key, VERDICT_LABELS[v] || v);
+}
+function factVerdictBadge(v) {
+  if (!v) return badge('pending', '待判定');
+  const key = String(v).replace(/[^a-z_]/g, '');
+  return badge(key, FACT_VERDICT_LABELS[v] || v);
+}
+function concVerdictBadge(c) {
+  if (c.conclusion_type === 'predictive') {
+    const v = c.prediction_verdict;
+    if (!v) return badge('pending', '等待中');
+    const key = String(v).replace(/[^a-z_]/g, '');
+    return badge(key, CONC_PRED_LABELS[v] || v);
+  } else {
+    const v = c.conclusion_verdict;
+    if (!v) return badge('pending', '待判定');
+    const key = String(v).replace(/[^a-z_]/g, '');
+    return badge(key, CONC_RETRO_LABELS[v] || v);
+  }
+}
+function condVerdictBadge(cond) {
+  const v = cond.condition_verdict;
+  if (!v) return badge('pending', '待判定');
+  const key = String(v).replace(/[^a-z_]/g, '');
+  if (cond.condition_type === 'assumption') {
+    return badge(key, COND_ASSUMPTION_LABELS[v] || v);
+  } else {
+    return badge(key, COND_IMPLICIT_LABELS[v] || v);
+  }
 }
 function tierBadge(t) {
   if (!t) return '';
@@ -1284,40 +1279,148 @@ function toggleDetail(id, btn) {
   btn.classList.toggle('collapsed', !hidden);
 }
 
-function icItemHtml(ic) {
-  const cls = ic.verification_result || 'pending';
-  const voteStr = ic.vote_consensus != null
-    ? `<span class="vote-text">共识 ${ic.vote_consensus} / 非共识 ${ic.vote_not_consensus}</span>`
-    : '';
-  const trend = ic.consensus_trend
-    ? `<span style="font-size:11px;color:var(--text-dim)">${trendIcon(ic.consensus_trend)} ${ic.consensus_trend}</span>`
-    : '';
-  const noteHtml = ic.verification_note
-    ? `<div class="detail-text" style="margin-top:8px;">${esc(ic.verification_note)}</div>`
-    : '';
-  return `
-<div class="ic-item ${cls}">
-  <div class="ic-text">${esc(ic.condition_text)}</div>
-  <div class="ic-meta">
-    ${resultBadge(ic.verification_result)}
-    ${voteStr}
-    ${trend}
-  </div>
-  ${noteHtml}
-</div>`;
-}
-
-function trendIcon(t) {
-  return t === 'strengthening' ? '↑' : t === 'weakening' ? '↓' : t === 'stable' ? '→' : '';
-}
 
 // ─── Render all ───────────────────────────────────────────────────────────────
+
+// ─── Logic DAG ────────────────────────────────────────────────────────────────
+
+let _dagNetwork = null;
+
+function renderDAG(data) {
+  if (typeof vis === 'undefined') {
+    document.getElementById('dagCount').textContent = '（vis.js 未加载）';
+    document.getElementById('dagContainer').innerHTML =
+      '<div style="padding:40px;text-align:center;color:var(--text-dim);font-size:13px;">逻辑关系图需要 vis-network 库，当前网络环境无法加载，其他功能不受影响。</div>';
+    return;
+  }
+
+  const facts   = data.facts   || [];
+  const conds   = data.conditions || [];
+  const concls  = data.conclusions || [];
+
+  const nodes = new vis.DataSet();
+  const edges = new vis.DataSet();
+  const addedNodes = new Set();
+
+  function addNode(id, opts) {
+    if (!addedNodes.has(id)) { nodes.add({id, ...opts}); addedNodes.add(id); }
+  }
+
+  // ── Fact nodes ──
+  facts.forEach(f => {
+    const col = f.fact_verdict === 'credible'    ? '#4ade80'
+              : f.fact_verdict === 'vague'        ? '#fbbf24'
+              : f.fact_verdict === 'unreliable'   ? '#f87171'
+              : '#6b7280';
+    const lbl = 'F' + f.id + ': ' + (f.claim||'').substring(0,30) + ((f.claim||'').length>30?'…':'');
+    addNode('f'+f.id, {
+      label: lbl, shape: 'box', level: 0,
+      color: { background: col+'22', border: col, highlight: { background: col+'44', border: col } },
+      font: { color: '#e2e8f0', size: 11, multi: false },
+      margin: 8,
+    });
+  });
+
+  // ── Condition nodes ──
+  conds.forEach(c => {
+    const col = c.condition_type === 'assumption' ? '#f59e0b' : '#94a3b8';
+    const lbl = 'C' + c.id + ': ' + (c.condition_text||'').substring(0,30) + ((c.condition_text||'').length>30?'…':'');
+    addNode('c'+c.id, {
+      label: lbl, shape: 'diamond', level: 0,
+      color: { background: col+'22', border: col, highlight: { background: col+'44', border: col } },
+      font: { color: '#e2e8f0', size: 11 },
+      margin: 8,
+    });
+  });
+
+  // ── Conclusion + Solution nodes & edges ──
+  const solAdded = new Set();
+  concls.forEach(conc => {
+    const isCore  = conc.is_core_conclusion;
+    const isCycle = conc.is_in_cycle;
+    const border  = isCycle ? '#f87171' : isCore ? '#a78bfa' : '#818cf8';
+    const bg      = isCore  ? '#7c3aed' : '#6366f1';
+    const lbl     = (isCore ? '★ ' : '') + 'Conc' + conc.id + ': ' + (conc.claim||'').substring(0,28) + ((conc.claim||'').length>28?'…':'');
+    addNode('conc'+conc.id, {
+      label: lbl, shape: 'ellipse', level: 1,
+      color: { background: bg+'22', border: border, highlight: { background: bg+'44', border: border } },
+      font: { color: '#e2e8f0', size: 11, bold: isCore },
+      margin: 10,
+    });
+
+    // edges: facts → conclusion
+    (conc.supporting_facts || []).forEach(f => {
+      edges.add({ from: 'f'+f.id, to: 'conc'+conc.id, arrows: 'to',
+        color: { color: '#4b5563', highlight: '#818cf8' }, smooth: { type: 'curvedCW', roundness: 0.1 } });
+    });
+    // edges: conditions → conclusion
+    (conc.supporting_condition_ids || []).forEach(cid => {
+      edges.add({ from: 'c'+cid, to: 'conc'+conc.id, arrows: 'to', dashes: true,
+        color: { color: '#4b5563', highlight: '#f59e0b' }, smooth: { type: 'curvedCW', roundness: 0.1 } });
+    });
+    // edges: conclusion → conclusion
+    (conc.supporting_conclusion_ids || []).forEach(cid => {
+      edges.add({ from: 'conc'+cid, to: 'conc'+conc.id, arrows: 'to',
+        color: { color: '#6366f1', highlight: '#a78bfa' }, smooth: { type: 'curvedCW', roundness: 0.15 } });
+    });
+    // solution nodes + edges
+    (conc.solutions || []).forEach(s => {
+      if (!solAdded.has(s.id)) {
+        const lbl = 'Sol' + s.id + ': ' + (s.action_target||s.claim||'').substring(0,28) + ((s.action_target||s.claim||'').length>28?'…':'');
+        addNode('sol'+s.id, {
+          label: lbl, shape: 'box', level: 2,
+          color: { background: '#1e3a5f', border: '#60a5fa', highlight: { background: '#1e40af', border: '#93c5fd' } },
+          font: { color: '#e2e8f0', size: 11 },
+          margin: 8,
+        });
+        solAdded.add(s.id);
+      }
+      edges.add({ from: 'conc'+conc.id, to: 'sol'+s.id, arrows: 'to',
+        color: { color: '#1d4ed8', highlight: '#60a5fa' }, smooth: { type: 'curvedCW', roundness: 0.1 } });
+    });
+  });
+
+  const total = facts.length + conds.length + concls.length + solAdded.size;
+  document.getElementById('dagCount').textContent = total + ' 个节点';
+
+  const container = document.getElementById('dagContainer');
+  if (_dagNetwork) { _dagNetwork.destroy(); }
+  _dagNetwork = new vis.Network(container, { nodes, edges }, {
+    layout: {
+      hierarchical: {
+        enabled: true,
+        direction: 'LR',
+        sortMethod: 'directed',
+        levelSeparation: 220,
+        nodeSpacing: 120,
+        treeSpacing: 180,
+        blockShifting: true,
+        edgeMinimization: true,
+        parentCentralization: true,
+      },
+    },
+    physics: { enabled: false },
+    interaction: { hover: true, tooltipDelay: 200, navigationButtons: false, zoomView: true },
+    edges: {
+      width: 1.5,
+      selectionWidth: 2.5,
+      smooth: { enabled: true },
+    },
+    nodes: { borderWidth: 1.5, borderWidthSelected: 2.5 },
+    background: '#0d1117',
+  });
+}
 
 function renderAll(data) {
   document.getElementById('resultsSection').classList.add('visible');
   renderFacts(data.facts || []);
-  renderICs(data.implicit_conditions || []);
-  renderConclusions(data.conclusions || [], data.facts || []);
+  renderConditions(data.conditions || []);
+  try { renderDAG(data); } catch(e) {
+    console.error('DAG render error:', e);
+    document.getElementById('dagContainer').innerHTML =
+      '<div style="padding:40px;text-align:center;color:var(--text-dim);font-size:13px;">逻辑关系图渲染失败：' + e.message + '</div>';
+  }
+  renderConclusions(data.conclusions || [], data.facts || [], data.conditions || []);
 
   // 收集所有 role_fit 评估（结论 + 解决方案）供作者面板独立展示
   const roleFitItems = [];
@@ -1354,12 +1457,9 @@ function renderFacts(facts) {
   }
   grid.innerHTML = facts.map(f => {
     const detailId = 'fd' + f.id;
-    const hasDetail = f.evidence_summary || f.evaluator_notes || f.verification_method || (f.refs && f.refs.length);
-    const icHtml = f.implicit_conditions && f.implicit_conditions.length
-      ? `<div style="margin-top:14px;"><div style="font-size:10px;font-weight:700;color:var(--accent2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;">隐含条件</div><div class="ic-list">${f.implicit_conditions.map(icItemHtml).join('')}</div></div>`
-      : '';
-    const notVerifiableNote = !f.is_verifiable
-      ? `<div class="detail-text" style="margin-top:8px;font-style:italic;">此事实标记为不可核实</div>`
+    const hasDetail = f.alignment_evidence || (f.refs && f.refs.length);
+    const temporalNote = f.temporal_note
+      ? `<div style="font-size:11px;color:var(--text-dim);margin-top:6px;">⏱ ${esc(f.temporal_note)}</div>`
       : '';
     return `
 <div class="card">
@@ -1368,58 +1468,71 @@ function renderFacts(facts) {
     <div class="card-claim">${esc(f.claim)}</div>
   </div>
   <div class="card-meta">
-    ${resultBadge(f.result)}
-    ${tierBadge(f.evidence_tier)}
+    ${f.fact_source_tier ? badge(f.fact_source_tier, SOURCE_TIER_LABELS[f.fact_source_tier] || f.fact_source_tier) : ''}
+    ${factVerdictBadge(f.fact_verdict)}
     ${!f.is_verifiable ? badge('unavailable','不可核实') : ''}
   </div>
-  ${notVerifiableNote}
+  ${temporalNote}
   ${hasDetail ? `
   <div class="toggle-btn collapsed" onclick="toggleDetail('${detailId}',this)">核查详情</div>
   <div id="${detailId}" style="display:none;" class="detail-block">
-    ${f.evidence_summary ? `<div class="detail-label">核查摘要</div><div class="detail-text">${esc(f.evidence_summary)}</div>` : ''}
-    ${f.evaluator_notes ? `<div class="detail-label">评估备注</div><div class="detail-text">${esc(f.evaluator_notes)}</div>` : ''}
-    ${f.verification_method ? `<div class="detail-label">验证方法</div><div class="detail-text">${esc(f.verification_method)}</div>` : ''}
+    ${f.alignment_evidence ? `<div class="detail-label">核查摘要</div><div class="detail-text">${esc(f.alignment_evidence)}</div>` : ''}
+    ${f.verifiable_statement ? `<div class="detail-label">可验证陈述</div><div class="detail-text">${esc(f.verifiable_statement)}</div>` : ''}
     ${(f.refs && f.refs.length) ? `<div class="detail-label">参考来源</div>${f.refs.map(r => `<div class="detail-text">📌 [${esc(r.org)}] ${esc(r.desc)}${r.url ? ' — <a href="'+esc(r.url)+'" target="_blank" style="font-size:11px;">链接</a>' : ''}</div>`).join('')}` : ''}
   </div>` : ''}
-  ${icHtml}
 </div>`;
   }).join('');
 }
 
-// ─── Implicit Conditions ──────────────────────────────────────────────────────
+// ─── Conditions (assumption + implicit) ──────────────────────────────────────
 
-function renderICs(ics) {
-  document.getElementById('icsCount').textContent = ics.length + ' 条';
-  const grid = document.getElementById('icsGrid');
-  if (!ics.length) {
-    grid.innerHTML = '<div style="color:var(--text-dim);padding:8px;">无隐含条件</div>';
+function renderConditions(conds) {
+  document.getElementById('condsCount').textContent = conds.length + ' 条';
+  const grid = document.getElementById('condsGrid');
+  if (!conds.length) {
+    grid.innerHTML = '<div style="color:var(--text-dim);padding:8px;">无条件</div>';
     return;
   }
-  grid.innerHTML = ics.map(ic => {
-    const parent = ic.fact_id ? 'Fact #' + ic.fact_id : 'Conclusion #' + ic.conclusion_id;
-    const trendNote = ic.consensus_trend_note
-      ? `<div class="detail-text" style="margin-top:8px;">📊 ${esc(ic.consensus_trend_note)}</div>`
-      : '';
+  grid.innerHTML = conds.map(c => {
+    const typeLabel = c.condition_type === 'assumption' ? '假设条件' : '隐含条件';
+    const detailId = 'cd' + c.id;
+    const hasDetail = c.alignment_evidence || c.verifiable_statement;
     return `
 <div class="card">
   <div class="card-header">
-    <div class="card-id" style="font-size:9px;">${parent}</div>
-    <div class="card-claim">${esc(ic.condition_text)}</div>
+    <div class="card-id">C${c.id}</div>
+    <div class="card-claim">${esc(c.condition_text)}</div>
   </div>
   <div class="card-meta">
-    ${resultBadge(ic.verification_result)}
-    ${ic.vote_consensus != null ? `<span class="vote-text" style="font-size:11px;color:var(--text-dim);">共识 ${ic.vote_consensus} / 非共识 ${ic.vote_not_consensus}</span>` : ''}
-    ${ic.consensus_trend ? `<span style="font-size:11px;color:var(--text-dim);">${trendIcon(ic.consensus_trend)} ${ic.consensus_trend}</span>` : ''}
+    ${badge(c.condition_type, typeLabel)}
+    ${condVerdictBadge(c)}
   </div>
-  ${ic.verification_note ? `<div class="detail-text" style="margin-top:10px;">${esc(ic.verification_note)}</div>` : ''}
-  ${trendNote}
+  ${c.temporal_note ? `<div style="font-size:11px;color:var(--text-dim);margin-top:6px;">⏱ ${esc(c.temporal_note)}</div>` : ''}
+  ${hasDetail ? `
+  <div class="toggle-btn collapsed" onclick="toggleDetail('${detailId}',this)">详情</div>
+  <div id="${detailId}" style="display:none;" class="detail-block">
+    ${c.alignment_evidence ? `<div class="detail-label">判定依据</div><div class="detail-text">${esc(c.alignment_evidence)}</div>` : ''}
+    ${c.verifiable_statement ? `<div class="detail-label">可验证陈述</div><div class="detail-text">${esc(c.verifiable_statement)}</div>` : ''}
+  </div>` : ''}
 </div>`;
   }).join('');
+}
+
+function condItemInline(cond) {
+  const typeLabel = cond.condition_type === 'assumption' ? '假设' : '隐含';
+  return `
+<div class="cond-item ${cond.condition_verdict || 'pending'}">
+  <div class="cond-text">${esc(cond.condition_text)}</div>
+  <div class="cond-meta">
+    ${badge(cond.condition_type, typeLabel)}
+    ${condVerdictBadge(cond)}
+  </div>
+</div>`;
 }
 
 // ─── Conclusions Table ────────────────────────────────────────────────────────
 
-function renderConclusions(conclusions, allFacts) {
+function renderConclusions(conclusions, allFacts, allConds) {
   document.getElementById('conclusionsCount').textContent = conclusions.length + ' 个';
   const body = document.getElementById('conclusionsBody');
   if (!conclusions.length) {
@@ -1427,66 +1540,75 @@ function renderConclusions(conclusions, allFacts) {
     return;
   }
 
+  // Build condition map for lookup by id
+  const condMap = {};
+  (allConds || []).forEach(cond => { condMap[cond.id] = cond; });
+
   body.innerHTML = conclusions.map((c, ci) => {
     // ── Col 1: Conclusion ──
     const typeLabel = c.conclusion_type === 'predictive' ? '预测型' : '回顾型';
     const confLabel = c.author_confidence ? (CONF_LABELS[c.author_confidence] || c.author_confidence) : null;
+    const coreTag = c.is_core_conclusion ? `<span style="font-size:11px;color:var(--yellow);font-weight:700;" title="核心结论（逻辑链终点）">★ 核心</span>` : '';
+    const cycleTag = c.is_in_cycle ? `<span style="font-size:11px;color:var(--red);font-weight:700;" title="存在循环引用，跳过裁定">⚠ 循环</span>` : '';
     const col1 = `
 <div class="conc-claim-text">${esc(c.claim)}</div>
 <div class="conc-meta-row">
   ${badge(c.conclusion_type, typeLabel)}
   ${confLabel ? badge(c.author_confidence, confLabel) : ''}
+  ${coreTag}${cycleTag}
 </div>
 ${c.author_confidence_note ? `<div class="conc-quote">"${esc(c.author_confidence_note)}"</div>` : ''}
-${c.time_horizon_note ? `<div style="font-size:11px;color:var(--text-dim);margin-top:6px;">⏱ ${esc(c.time_horizon_note)}</div>` : ''}
-${c.logic_summary ? `<div style="font-size:11px;color:var(--text-dim);margin-top:6px;">💡 ${esc(c.logic_summary)}</div>` : ''}`;
+${c.temporal_note || c.time_horizon_note ? `<div style="font-size:11px;color:var(--text-dim);margin-top:6px;">⏱ ${esc(c.temporal_note || c.time_horizon_note)}</div>` : ''}
+${c.chain_summary ? `<div style="font-size:11px;color:var(--text-dim);margin-top:6px;">💡 ${esc(c.chain_summary)}</div>` : ''}`;
 
-    // ── Col 2: Supporting Facts + ICs ──
-    const sfItems = (c.supporting_facts || []).map(f => {
-      const roleCls = f.role === 'assumption' ? 'role-assumption' : 'role-supporting';
-      const roleLabel = f.role === 'assumption' ? '假设' : '支撑';
-      const icsInFact = (f.implicit_conditions && f.implicit_conditions.length)
-        ? `<div class="ic-list" style="margin-top:8px;">${f.implicit_conditions.map(ic => icItemHtml(ic)).join('')}</div>`
-        : '';
-      return `
-<div class="fact-ref ${roleCls}">
+    // ── Col 2: Supporting Facts + Conditions ──
+    const sfItems = (c.supporting_facts || []).map(f => `
+<div class="fact-ref role-supporting">
   <div class="fact-ref-header">
     <span style="font-size:10px;color:var(--text-dim);font-family:monospace;">F${f.id}</span>
-    ${badge(f.role, roleLabel)}
-    ${resultBadge(f.result)}
+    ${f.fact_source_tier ? badge(f.fact_source_tier, SOURCE_TIER_LABELS[f.fact_source_tier] || f.fact_source_tier) : ''}
+    ${factVerdictBadge(f.fact_verdict)}
   </div>
   <div class="fact-ref-claim">${esc(f.claim)}</div>
-  ${icsInFact}
-</div>`;
-    });
-    const col2 = sfItems.length ? sfItems.join('') : `<span style="color:var(--text-dim);font-size:12px;">无关联事实</span>`;
+</div>`);
+    const condItems = (c.supporting_condition_ids || []).map(cid => {
+      const cond = condMap[cid];
+      return cond ? condItemInline(cond) : '';
+    }).filter(Boolean);
+    const allCol2 = sfItems.concat(condItems.length ? [`<div class="cond-list">${condItems.join('')}</div>`] : []);
+    const col2 = allCol2.length ? allCol2.join('') : `<span style="color:var(--text-dim);font-size:12px;">无关联事实</span>`;
 
     // ── Col 3: Solutions ──
-    const solItems = (c.solutions || []).map(s => {
-      return `
+    const solItems = (c.solutions || []).map(s => `
 <div class="sol-ref">
   <div class="sol-ref-header">
     ${s.action_type ? `<span class="sol-action-tag">${s.action_type.toUpperCase()}</span>` : ''}
     <span style="font-size:13px;font-weight:600;">${esc(s.action_target || '')}</span>
-    ${resultBadge(s.verdict)}
+    ${s.verdict ? verdictBadge(s.verdict) : ''}
   </div>
   <div class="sol-claim">${esc(s.claim)}</div>
   ${s.baseline_value ? `<div class="sol-baseline">基准：${esc(s.baseline_metric || '')} = <strong>${esc(s.baseline_value)}</strong></div>` : ''}
   ${s.monitoring_period_note ? `<div style="font-size:11px;color:var(--text-dim);margin-top:4px;">📅 ${esc(s.monitoring_period_note)}</div>` : ''}
-</div>`;
-    });
+</div>`);
     const col3 = solItems.length ? solItems.join('') : `<span style="color:var(--text-dim);font-size:12px;">无解决方案</span>`;
 
-    // ── Col 4: Verdict ──
+    // ── Col 4: Semantic Verdict ──
     const col4 = (() => {
-      if (!c.verdict || c.verdict === 'null') {
-        return `<div class="verdict-cell"><span style="color:var(--text-dim);font-size:12px;">待裁定</span></div>`;
+      if (c.is_in_cycle) {
+        return `<div class="verdict-cell"><span style="color:var(--red);font-size:12px;">⚠ 跳过（循环）</span></div>`;
       }
-      const lcStr = c.logic_completeness ? `<div class="verdict-sub-row">逻辑：${esc(c.logic_completeness)}</div>` : '';
+      const semanticBadge = concVerdictBadge(c);
+      const overallBadge = c.verdict && c.verdict !== 'null' ? verdictBadge(c.verdict) : '';
+      const lvKey = c.logic_validity;
+      const lvLabel = lvKey ? (LOGIC_VALIDITY_LABELS[lvKey] || lvKey) : '';
+      const lvColor = lvKey === 'valid' ? 'var(--green)' : lvKey === 'invalid' ? 'var(--red)' : 'var(--yellow)';
       return `
 <div class="verdict-cell">
-  <div class="verdict-main">${resultBadge(c.verdict)}</div>
-  <div class="verdict-sub">${lcStr}</div>
+  <div class="verdict-main">${semanticBadge}</div>
+  <div class="verdict-sub">
+    ${overallBadge ? `<div class="verdict-sub-row">${overallBadge}</div>` : ''}
+    ${lvLabel ? `<div class="verdict-sub-row" style="color:${lvColor};font-size:11px;">${esc(lvLabel)}</div>` : ''}
+  </div>
 </div>`;
     })();
 
