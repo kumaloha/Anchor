@@ -10,8 +10,8 @@ Layer3 Step 0 — 作者档案分析器
       profile_note（综合描述，≤80字）
 
 credibility_tier 分级标准：
-  1 — 顶级权威：诺贝尔奖得主、央行行长、国际货币基金组织官员等
-  2 — 行业专家：知名对冲基金管理人、大型机构首席经济学家、学术权威
+  1 — 顶级权威：诺贝尔奖得主、现任国家元首/政府首脑、央行行长、IMF/BIS官员，或管理规模超千亿美元的全球顶尖基金创始人（如桥水、先锋等）
+  2 — 行业专家：知名对冲基金管理人、大型机构首席经济学家、学术权威、前国家元首
   3 — 知名评论员：财经媒体知名主播/记者、有一定从业背景的独立分析师
   4 — 普通媒体/KOL：一般社交媒体账号、无显著专业背景的评论人
   5 — 未知：无法查到任何背景信息
@@ -21,6 +21,7 @@ credibility_tier 分级标准：
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 
@@ -47,8 +48,8 @@ _SYSTEM = """\
 而不是仅列出其"核心"专业。例如宏观经济学家的 expertise_areas 应包含地缘政治风险分析。
 
 credibility_tier 分级：
-  1 = 顶级权威（诺贝尔奖得主、央行行长、IMF/BIS官员等）
-  2 = 行业专家（知名对冲基金管理人、大型机构首席经济学家、顶尖学者）
+  1 = 顶级权威（诺贝尔奖得主、现任国家元首/政府首脑、央行行长、IMF/BIS官员，或管理规模超千亿美元的全球顶尖基金创始人如桥水、先锋等）
+  2 = 行业专家（知名对冲基金管理人、大型机构首席经济学家、顶尖学者、前国家元首）
   3 = 知名评论员（财经媒体知名主播/记者、有从业背景的独立分析师）
   4 = 普通媒体/KOL（一般社交媒体博主、无显著专业背景的评论人）
   5 = 未知（无法找到任何可信背景信息）
@@ -66,11 +67,16 @@ _PROMPT_WITH_SEARCH = """\
 平台：{platform}
 平台个人简介：{description}
 
-## 网络搜索结果
+## 背景搜索结果
 {search_results}
 
+## 当前处境搜索结果
+{situation_results}
+
 ## 任务
-基于以上信息，分析此人的职业背景，生成结构化档案。
+基于以上信息，分析此人的职业背景和当前处境，生成结构化档案。
+situation_note 重点关注：当前民调支持率、近期政治/市场压力、即将到来的选举或关键事件等。
+若当前处境信息不足，situation_note 填 null。
 
 严格输出 JSON：
 
@@ -80,7 +86,8 @@ _PROMPT_WITH_SEARCH = """\
   "expertise_areas": "<专业领域，如'全球宏观经济、债务周期、资本市场'，无则写null>",
   "known_biases": "<已知立场偏见或典型观点倾向，如'长期黄金多头、美元悲观主义'，无则写null>",
   "credibility_tier": <1-5整数>,
-  "profile_note": "<综合描述，≤80字，说明此人的专业背景和观点代表性>"
+  "profile_note": "<综合背景描述，≤80字>",
+  "situation_note": "<当前处境：民调/选举压力/市场地位等，≤150字，无则填null>"
 }}
 ```\
 """
@@ -96,7 +103,7 @@ _PROMPT_NO_SEARCH = """\
 平台个人简介：{description}
 
 ## 任务
-基于你的训练知识，分析此人的职业背景，生成结构化档案。\
+基于你的训练知识，分析此人的职业背景和当前处境，生成结构化档案。\
 若确实无法识别此人，请诚实填写 credibility_tier=5 并在 profile_note 中说明。
 
 严格输出 JSON：
@@ -107,7 +114,8 @@ _PROMPT_NO_SEARCH = """\
   "expertise_areas": "<专业领域，未知则写null>",
   "known_biases": "<已知立场偏见，未知则写null>",
   "credibility_tier": <1-5整数>,
-  "profile_note": "<综合描述，≤80字>"
+  "profile_note": "<综合背景描述，≤80字>",
+  "situation_note": "<当前处境，≤150字，无信息则填null>"
 }}
 ```\
 """
@@ -156,28 +164,35 @@ class AuthorProfiler:
         # 中文名（含非 ASCII 字符）：使用中文关键词，效果显著优于英文
         is_cjk_name = any(ord(c) > 0x2E7F for c in (author.name or ""))
         if is_cjk_name:
-            search_query = f"{author.name} 背景 职业 工作经历 个人简介 投资"
+            bg_query = f"{author.name} 背景 职业 工作经历 个人简介 投资"
+            sit_query = f"{author.name} 2026 最新动态 民调 支持率 选举 处境"
         else:
-            search_query = f"{author.name} background career role expertise biography investor"
+            bg_query = f"{author.name} background career role expertise biography"
+            sit_query = f"{author.name} 2026 latest polls approval rating election pressure"
 
-        # ── 联网搜索（可选）──────────────────────────────────────────────────
-        search_results = await web_search(
-            query=search_query,
-            max_results=5,
+        # ── 联网搜索（背景 + 当前处境，并发）────────────────────────────────
+        bg_results, sit_results = await asyncio.gather(
+            web_search(query=bg_query, max_results=5),
+            web_search(query=sit_query, max_results=3),
         )
 
         # ── 构建 prompt ───────────────────────────────────────────────────────
         description = author.description or "（无平台简介）"
 
-        if search_results:
-            search_text = format_search_results(search_results)
+        if bg_results or sit_results:
+            bg_text = format_search_results(bg_results) if bg_results else "（无结果）"
+            sit_text = format_search_results(sit_results) if sit_results else "（无结果）"
             prompt = _PROMPT_WITH_SEARCH.format(
                 name=author.name,
                 platform=author.platform,
                 description=description,
-                search_results=search_text,
+                search_results=bg_text,
+                situation_results=sit_text,
             )
-            logger.debug(f"[AuthorProfiler] using web search results ({len(search_results)} results)")
+            logger.debug(
+                f"[AuthorProfiler] bg={len(bg_results)} results, "
+                f"situation={len(sit_results)} results"
+            )
         else:
             prompt = _PROMPT_NO_SEARCH.format(
                 name=author.name,
@@ -212,6 +227,7 @@ class AuthorProfiler:
         author.expertise_areas = _to_str(parsed.get("expertise_areas"))
         author.known_biases = _to_str(parsed.get("known_biases"))
         author.profile_note = _to_str(parsed.get("profile_note"))
+        author.situation_note = _to_str(parsed.get("situation_note"))
 
         tier = parsed.get("credibility_tier")
         if isinstance(tier, int) and 1 <= tier <= 5:

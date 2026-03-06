@@ -40,6 +40,7 @@ class EdgeType(str, Enum):
     CONCLUSION_SUPPORTS_CONCLUSION = "conclusion_supports_conclusion"
     CONCLUSION_LEADS_TO_PREDICTION = "conclusion_leads_to_prediction"
     CONCLUSION_ENABLES_SOLUTION = "conclusion_enables_solution"
+    POLICY_SUPPORTS_CONCLUSION = "policy_supports_conclusion"
 
 
 class SourceType(str, Enum):
@@ -95,6 +96,8 @@ class Author(SQLModel, table=True):
     known_biases: Optional[str] = None
     credibility_tier: Optional[int] = None
     profile_note: Optional[str] = None
+    # 当前处境：最新民调、选举压力、政治/市场处境等（≤150字）
+    situation_note: Optional[str] = None
     profile_fetched: bool = False
     profile_fetched_at: Optional[datetime] = None
 
@@ -150,6 +153,21 @@ class RawPost(SQLModel, table=True):
 
     is_processed: bool = False
     processed_at: Optional[datetime] = None
+    content_summary: Optional[str] = None       # Chain1 Step5 叙事摘要
+
+    # 政策文档专属字段（Chain 1 policy 模式写入）
+    issuing_authority: Optional[str] = None     # 发文机关（如"国务院"）
+    authority_level: Optional[str] = None       # 顶层设计|部委联合|部委独立
+
+    # Chain 2 — 内容分类与作者意图
+    content_type: Optional[str] = None          # 市场动向|市场分析|产业调研|公司调研|技术论文|教育科普|政策宣布|政策解读
+    content_type_secondary: Optional[str] = None  # 次分类（可选）
+    content_topic: Optional[str] = None         # 具体主题（≤30字）
+    author_intent: Optional[str] = None         # 传递信息|影响观点|警示风险|推荐行动|教育科普|引发讨论|推广宣传|政治动员
+    intent_note: Optional[str] = None           # 意图说明（≤100字）
+    policy_delta: Optional[str] = None          # 政策对比：与上一年同类政策的核心变化（≤150字）
+    chain2_analyzed: bool = False               # 是否已完成 Chain2 分析
+    chain2_analyzed_at: Optional[datetime] = None
 
     is_duplicate: bool = False
     original_post_id: Optional[int] = Field(
@@ -177,6 +195,7 @@ class Fact(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id", index=True)
 
+    summary: Optional[str] = None                # 一句话摘要（≤15字，高度抽象，用于展示）
     claim: str                                   # 原文陈述（≤120字）
     verifiable_statement: Optional[str] = None   # 单句可核实陈述（供 Chain3 使用）
     temporal_type: str = "retrospective"         # retrospective | predictive
@@ -201,6 +220,7 @@ class Assumption(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id", index=True)
 
+    summary: Optional[str] = None                # 一句话摘要（≤15字）
     condition_text: str                          # 假设条件陈述（≤120字）
     verifiable_statement: Optional[str] = None   # 单句可核实表达
     temporal_note: Optional[str] = None
@@ -225,6 +245,7 @@ class ImplicitCondition(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id", index=True)
 
+    summary: Optional[str] = None                # 一句话摘要（≤15字）
     condition_text: str                          # 隐含条件陈述（≤120字）
     is_obvious_consensus: bool = False           # 显而易见的共识，Chain3 可直接跳过
 
@@ -248,6 +269,7 @@ class Conclusion(SQLModel, table=True):
     raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id", index=True)
     author_id: Optional[int] = Field(default=None, foreign_key="authors.id", index=True)
 
+    summary: Optional[str] = None                # 一句话摘要（≤15字）
     claim: str                                   # 结论陈述（≤120字）
     verifiable_statement: Optional[str] = None   # 单句可核实陈述
 
@@ -276,6 +298,7 @@ class Prediction(SQLModel, table=True):
     raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id", index=True)
     author_id: Optional[int] = Field(default=None, foreign_key="authors.id", index=True)
 
+    summary: Optional[str] = None                # 一句话摘要（≤15字）
     claim: str                                   # 预测陈述（≤120字）
     temporal_note: Optional[str] = None          # 时间范围（如"2026-2030年"）；None 表示无时效
     temporal_validity: str = "no_timeframe"      # has_timeframe | no_timeframe（Chain1 自动标注）
@@ -304,10 +327,57 @@ class Solution(SQLModel, table=True):
     raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id", index=True)
     author_id: Optional[int] = Field(default=None, foreign_key="authors.id", index=True)
 
+    summary: Optional[str] = None                # 一句话摘要（≤15字）
     claim: str                                   # 建议内容（≤120字）
     action_type: Optional[str] = None           # buy|sell|hold|short|diversify|hedge|reduce|advocate
     action_target: Optional[str] = None         # 标的物（如"黄金ETF"、"美国10年期国债"）
     action_rationale: Optional[str] = None      # 此建议如何从结论推导
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+# ===========================================================================
+# 政策专属表（policy 模式，仅在 content_mode="policy" 时写入）
+# ===========================================================================
+
+
+class PolicyTheme(SQLModel, table=True):
+    """政策主旨 — 政策文档的大类主题（民生/产业/军事/财政等）"""
+
+    __tablename__ = "policy_themes"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    raw_post_id: int = Field(foreign_key="raw_posts.id", index=True)
+
+    theme_name: str                              # 民生 / 产业 / 军事 / 财政 / 外贸 / 科技 ...
+    background: Optional[str] = None            # 背景与目的（≤200字）
+    enforcement_note: Optional[str] = None      # 组织保障描述（≤80字）
+    has_enforcement_teeth: bool = False          # 是否纳入考核/有执行主体
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class PolicyItem(SQLModel, table=True):
+    """政策条目 — 每条政策承诺/计划（替代 policy 模式下误用的 Prediction）"""
+
+    __tablename__ = "policy_items"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    raw_post_id: int = Field(foreign_key="raw_posts.id", index=True)
+    policy_theme_id: Optional[int] = Field(default=None, foreign_key="policy_themes.id")
+
+    summary: str                                 # ≤15字摘要
+    policy_text: str                             # 政策内容（≤120字）
+    urgency: str                                 # mandatory|encouraged|pilot|gradual
+    change_type: Optional[str] = None           # 新增|调整|延续（由比对步骤填写，提取时为 null）
+    change_note: Optional[str] = None           # ≤30字变化说明（比对步骤填写）
+    metric_value: Optional[str] = None          # 量化值（如 "4%", "1.3万亿"）
+    target_year: Optional[str] = None           # 目标年份（如 "2026"）
+    is_hard_target: bool = False                 # 是否量化硬约束
+
+    # Chain 3 执行追踪
+    execution_status: Optional[str] = None      # implemented|in_progress|stalled|not_started|unknown
+    execution_note: Optional[str] = None        # ≤80字执行情况说明（含来源依据）
 
     created_at: datetime = Field(default_factory=_utcnow)
 

@@ -1,27 +1,23 @@
 """
-Chain 2 — 作者分析链路
-======================
-输入：author_id
-输出：写入 DB 的 Author 档案 + AuthorStanceProfile
+Chain 2 — 作者分析链路（v2）
+==============================
+输入：raw_post_id（主）→ 自动关联 author
+输出：写入 DB 的 Author 档案 + RawPost 内容分类与意图 + AuthorStanceProfile
 
 流程：
-  author_id
-      → AuthorProfiler().profile()（写 role/expertise/credibility_tier）
-      → 从 DB 读取作者近期 RawPost 内容（最多 10 条）
-      → LLM 分析立场/受众/核心信息
-      → 写入 AuthorStanceProfile
+  Step 1  作者档案分析（AuthorProfiler，已分析过则跳过）
+  Step 2  内容分类 + 作者意图（per-post LLM 分析，写入 RawPost）
+  Step 3  作者立场更新（基于近期帖子聚合，写入 AuthorStanceProfile）
 
-LLM 输出格式：
-  {
-    "stance_label": "看涨/多头|看跌/空头|中立/客观|警告/防御|批判/质疑|政策倡导|教育/分析",
-    "audience": "目标受众（≤40字）",
-    "core_message": "核心信息（≤80字）",
-    "author_summary": "以...身份，持...立场，向...传达...（≤100字）"
-  }
+内容类型枚举（content_type）：
+  市场动向 | 市场分析 | 产业调研 | 公司调研 | 技术论文 | 教育科普 | 政策宣布 | 政策解读
+
+作者意图枚举（author_intent）：
+  传递信息 | 影响观点 | 警示风险 | 推荐行动 | 教育科普 | 引发讨论 | 推广宣传
 
 用法：
   async with AsyncSessionLocal() as session:
-      result = await run_chain2(author_id=1, session=session)
+      result = await run_chain2(post_id=1, session=session)
 """
 
 from __future__ import annotations
@@ -37,7 +33,25 @@ from anchor.llm_client import chat_completion
 from anchor.models import Author, AuthorStanceProfile, RawPost, _utcnow
 from anchor.verify.author_profiler import AuthorProfiler
 
-_MAX_TOKENS = 1200
+_STANCE_MAX_TOKENS = 1200
+_POST_ANALYSIS_MAX_TOKENS = 800
+_MAX_POSTS_FOR_STANCE = 10
+_MAX_POST_CHARS = 400
+
+_VALID_CONTENT_TYPES = {
+    "市场动向", "市场分析", "产业调研", "公司调研",
+    "技术论文", "教育科普", "政策宣布", "政策解读",
+}
+
+_VALID_INTENTS = {
+    "传递信息", "影响观点", "警示风险", "推荐行动",
+    "教育科普", "引发讨论", "推广宣传", "政治动员",
+}
+
+_VALID_STANCE_LABELS = {
+    "看涨/多头", "看跌/空头", "中立/客观", "警告/防御",
+    "批判/质疑", "政策倡导", "教育/分析",
+}
 
 # ---------------------------------------------------------------------------
 # 立场分析提示词
@@ -84,13 +98,70 @@ _STANCE_USER_TEMPLATE = """\
 ```\
 """
 
-_VALID_STANCE_LABELS = {
-    "看涨/多头", "看跌/空头", "中立/客观", "警告/防御",
-    "批判/质疑", "政策倡导", "教育/分析",
-}
 
-_MAX_POSTS = 10       # 用于立场分析的最近帖子数量
-_MAX_POST_CHARS = 400  # 每条帖子的最大字符数（截断）
+# ---------------------------------------------------------------------------
+# 公开函数：前置分类（供 Chain 1 调用）
+# ---------------------------------------------------------------------------
+
+
+async def classify_post(post: RawPost, session: AsyncSession) -> dict:
+    """Chain 2 前两步：作者档案 + 内容分类，供 Chain 1 前置调用。
+
+    不含立场分析（Step 3），不依赖 content_summary。
+    若 post.chain2_analyzed 已为 True，直接返回 DB 字段，不重复 LLM 调用。
+    """
+    author = await _get_or_create_author(post, session)
+    await AuthorProfiler().profile(author, session)
+    await session.flush()
+    await session.refresh(author)
+
+    if not post.chain2_analyzed:
+        post_analysis = await _analyze_post(post, author)
+        if post_analysis:
+            ct = post_analysis.get("content_type")
+            ct2 = post_analysis.get("content_type_secondary")
+            if ct not in _VALID_CONTENT_TYPES:
+                logger.warning(f"[Chain2] classify_post: invalid content_type={ct!r}, ignoring")
+                ct = None
+            if ct2 and ct2 not in _VALID_CONTENT_TYPES:
+                ct2 = None
+            intent = post_analysis.get("author_intent")
+            if intent not in _VALID_INTENTS:
+                logger.warning(f"[Chain2] classify_post: invalid author_intent={intent!r}, ignoring")
+                intent = None
+            post.content_type = ct
+            post.content_type_secondary = ct2 if ct2 != ct else None
+            post.content_topic = _safe_str(post_analysis.get("content_topic"))
+            post.author_intent = intent
+            post.intent_note = _safe_str(post_analysis.get("intent_note"))
+            # 发文机关（仅政策类内容）
+            if ct in {"政策宣布", "政策解读"}:
+                ia = _safe_str(post_analysis.get("issuing_authority"))
+                al = _safe_str(post_analysis.get("authority_level"))
+                if ia:
+                    post.issuing_authority = ia
+                if al:
+                    post.authority_level = al
+        post.chain2_analyzed = True
+        post.chain2_analyzed_at = _utcnow()
+        session.add(post)
+        await session.flush()
+        logger.info(
+            f"[Chain2] classify_post {post.id}: type={post.content_type!r} "
+            f"intent={post.author_intent!r} authority={post.issuing_authority!r}"
+        )
+    else:
+        logger.debug(f"[Chain2] classify_post: post {post.id} already analyzed, returning cached fields")
+
+    return {
+        "content_type": post.content_type,
+        "content_type_secondary": post.content_type_secondary,
+        "content_topic": post.content_topic,
+        "author_intent": post.author_intent,
+        "intent_note": post.intent_note,
+        "issuing_authority": post.issuing_authority,
+        "authority_level": post.authority_level,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -98,46 +169,131 @@ _MAX_POST_CHARS = 400  # 每条帖子的最大字符数（截断）
 # ---------------------------------------------------------------------------
 
 
-async def run_chain2(author_id: int, session: AsyncSession) -> dict:
-    """执行链路2：作者档案分析 + 立场分析
+async def run_chain2(post_id: int, session: AsyncSession) -> dict:
+    """执行链路2：内容分类 + 作者档案 + 立场分析
 
     Args:
-        author_id: authors 表主键
-        session:   异步数据库 Session
+        post_id:  raw_posts 表主键
+        session:  异步数据库 Session
 
     Returns:
         dict with keys:
+          post_id, content_type, content_type_secondary, content_topic,
+          author_intent, intent_note,
           author_id, author_name, role, credibility_tier,
           stance_label, audience, core_message, author_summary
     """
-    # ── Step 1：加载作者 ─────────────────────────────────────────────────
-    author = await session.get(Author, author_id)
-    if not author:
-        raise ValueError(f"Author id={author_id} not found")
+    # ── 加载帖子 ──────────────────────────────────────────────────────────
+    post = await session.get(RawPost, post_id)
+    if not post:
+        raise ValueError(f"RawPost id={post_id} not found")
 
-    logger.info(f"[Chain2] Analyzing author: {author.name} (id={author_id})")
+    logger.info(f"[Chain2] Analyzing post id={post_id} (author={post.author_name})")
 
-    # ── Step 2：AuthorProfiler 档案分析 ──────────────────────────────────
+    # ── 加载/创建作者 ─────────────────────────────────────────────────────
+    author = await _get_or_create_author(post, session)
+
+    # ── Step 1：作者档案分析 ──────────────────────────────────────────────
     await AuthorProfiler().profile(author, session)
     await session.flush()
-    # 重新加载（profile 可能修改了字段）
     await session.refresh(author)
 
-    # ── Step 3：读取近期帖子 ─────────────────────────────────────────────
+    # ── Step 2：内容分类 + 作者意图（per-post）────────────────────────────
+    post_analysis: dict | None = None
+    if not post.chain2_analyzed:
+        post_analysis = await _analyze_post(post, author)
+        if post_analysis:
+            ct = post_analysis.get("content_type")
+            ct2 = post_analysis.get("content_type_secondary")
+            if ct not in _VALID_CONTENT_TYPES:
+                logger.warning(f"[Chain2] Invalid content_type={ct!r}, ignoring")
+                ct = None
+            if ct2 and ct2 not in _VALID_CONTENT_TYPES:
+                ct2 = None
+
+            intent = post_analysis.get("author_intent")
+            if intent not in _VALID_INTENTS:
+                logger.warning(f"[Chain2] Invalid author_intent={intent!r}, ignoring")
+                intent = None
+
+            post.content_type = ct
+            post.content_type_secondary = ct2 if ct2 != ct else None
+            post.content_topic = _safe_str(post_analysis.get("content_topic"))
+            post.author_intent = intent
+            post.intent_note = _safe_str(post_analysis.get("intent_note"))
+            # 发文机关（仅政策类内容）
+            if ct in {"政策宣布", "政策解读"}:
+                ia = _safe_str(post_analysis.get("issuing_authority"))
+                al = _safe_str(post_analysis.get("authority_level"))
+                if ia:
+                    post.issuing_authority = ia
+                if al:
+                    post.authority_level = al
+
+        post.chain2_analyzed = True
+        post.chain2_analyzed_at = _utcnow()
+        session.add(post)
+        await session.flush()
+        logger.info(
+            f"[Chain2] Post {post_id}: type={post.content_type!r} "
+            f"intent={post.author_intent!r} authority={post.issuing_authority!r}"
+        )
+    else:
+        logger.debug(f"[Chain2] Post {post_id} already chain2-analyzed, skipping Step 2")
+
+    # ── Step 3：作者立场分析（基于近期帖子）──────────────────────────────
     posts_result = await session.exec(
         select(RawPost)
         .where(RawPost.author_platform_id == author.platform_id)
         .where(RawPost.source == author.platform)
         .order_by(RawPost.posted_at.desc())
-        .limit(_MAX_POSTS)
+        .limit(_MAX_POSTS_FOR_STANCE)
     )
     recent_posts = list(posts_result.all())
 
-    if not recent_posts:
-        logger.info(f"[Chain2] No recent posts for author id={author_id}, skipping stance analysis")
-        return _build_result(author, None)
+    stance_parsed: dict | None = None
+    if recent_posts:
+        stance_parsed = await _analyze_stance(author, recent_posts)
+        await _upsert_stance_profile(author.id, stance_parsed, session)
+        await session.flush()
 
-    # ── Step 4：LLM 立场分析 ─────────────────────────────────────────────
+    await session.commit()
+
+    logger.info(
+        f"[Chain2] Done: author={author.name} "
+        f"tier={author.credibility_tier} "
+        f"stance={stance_parsed.get('stance_label') if stance_parsed else 'N/A'}"
+    )
+
+    return _build_result(post, author, stance_parsed)
+
+
+# ---------------------------------------------------------------------------
+# LLM 调用
+# ---------------------------------------------------------------------------
+
+
+async def _analyze_post(post: RawPost, author: Author) -> dict | None:
+    """Step 2：内容分类 + 作者意图分析（per-post）。"""
+    from anchor.chains.prompts.post_analysis import SYSTEM, build_user_message
+
+    content = post.enriched_content or post.content or ""
+    user_msg = build_user_message(
+        content=content,
+        author_name=author.name,
+        author_role=author.role,
+        author_expertise=author.expertise_areas,
+        content_summary=post.content_summary,
+        situation_note=author.situation_note,
+    )
+    resp = await chat_completion(system=SYSTEM, user=user_msg, max_tokens=_POST_ANALYSIS_MAX_TOKENS)
+    if resp is None:
+        return None
+    return _parse_json(resp.content)
+
+
+async def _analyze_stance(author: Author, recent_posts: list[RawPost]) -> dict | None:
+    """Step 3：基于近期帖子的作者立场聚合分析。"""
     posts_text = _format_posts(recent_posts)
     prompt = _STANCE_USER_TEMPLATE.format(
         author_name=author.name,
@@ -147,53 +303,44 @@ async def run_chain2(author_id: int, session: AsyncSession) -> dict:
         post_count=len(recent_posts),
         posts_text=posts_text,
     )
-
-    resp = await chat_completion(
-        system=_STANCE_SYSTEM,
-        user=prompt,
-        max_tokens=_MAX_TOKENS,
-    )
-
-    parsed = _parse_json(resp.content) if resp else None
-
-    # ── Step 5：写入 AuthorStanceProfile ─────────────────────────────────
-    await _upsert_stance_profile(author_id, parsed, session)
-    await session.flush()
-
-    logger.info(
-        f"[Chain2] Done: author={author.name} "
-        f"tier={author.credibility_tier} "
-        f"stance={parsed.get('stance_label') if parsed else 'N/A'}"
-    )
-
-    return _build_result(author, parsed)
+    resp = await chat_completion(system=_STANCE_SYSTEM, user=prompt, max_tokens=_STANCE_MAX_TOKENS)
+    if resp is None:
+        return None
+    return _parse_json(resp.content)
 
 
 # ---------------------------------------------------------------------------
-# 辅助函数
+# DB 辅助
 # ---------------------------------------------------------------------------
 
 
-def _format_posts(posts: list[RawPost]) -> str:
-    """格式化帖子列表为分析文本。"""
-    lines: list[str] = []
-    for i, post in enumerate(posts, 1):
-        content = (post.enriched_content or post.content or "").strip()
-        if len(content) > _MAX_POST_CHARS:
-            content = content[:_MAX_POST_CHARS] + "…"
-        lines.append(f"[{i}] ({post.posted_at.strftime('%Y-%m-%d') if post.posted_at else '?'})\n{content}")
-    return "\n\n".join(lines)
+async def _get_or_create_author(post: RawPost, session: AsyncSession) -> Author:
+    """根据帖子信息查找或创建 Author 记录。"""
+    result = await session.exec(
+        select(Author)
+        .where(Author.platform == post.source)
+        .where(Author.platform_id == (post.author_platform_id or post.author_name))
+    )
+    author = result.first()
+    if author is None:
+        author = Author(
+            name=post.author_name,
+            platform=post.source,
+            platform_id=post.author_platform_id or post.author_name,
+        )
+        session.add(author)
+        await session.flush()
+        await session.refresh(author)
+    return author
 
 
 async def _upsert_stance_profile(
     author_id: int, parsed: dict | None, session: AsyncSession
 ) -> None:
-    """更新或创建 AuthorStanceProfile。"""
     result = await session.exec(
         select(AuthorStanceProfile).where(AuthorStanceProfile.author_id == author_id)
     )
     profile = result.first()
-
     if profile is None:
         profile = AuthorStanceProfile(author_id=author_id)
 
@@ -204,7 +351,6 @@ async def _upsert_stance_profile(
             stance = None
 
         if stance:
-            # 更新分布计数
             dist: dict[str, int] = {}
             if profile.stance_distribution:
                 try:
@@ -213,8 +359,6 @@ async def _upsert_stance_profile(
                     pass
             dist[stance] = dist.get(stance, 0) + 1
             profile.stance_distribution = json.dumps(dist, ensure_ascii=False)
-
-            # 更新主导立场
             total = sum(dist.values())
             profile.total_analyzed = total
             dominant = max(dist, key=dist.get)
@@ -227,6 +371,21 @@ async def _upsert_stance_profile(
 
     profile.last_updated = _utcnow()
     session.add(profile)
+
+
+# ---------------------------------------------------------------------------
+# 格式化 / 解析辅助
+# ---------------------------------------------------------------------------
+
+
+def _format_posts(posts: list[RawPost]) -> str:
+    lines: list[str] = []
+    for i, post in enumerate(posts, 1):
+        content = (post.enriched_content or post.content or "").strip()
+        if len(content) > _MAX_POST_CHARS:
+            content = content[:_MAX_POST_CHARS] + "…"
+        lines.append(f"[{i}] ({post.posted_at.strftime('%Y-%m-%d') if post.posted_at else '?'})\n{content}")
+    return "\n\n".join(lines)
 
 
 def _parse_json(raw: str) -> dict | None:
@@ -252,15 +411,21 @@ def _safe_str(value) -> str | None:
     return s if s else None
 
 
-def _build_result(author: Author, parsed: dict | None) -> dict:
+def _build_result(post: RawPost, author: Author, stance_parsed: dict | None) -> dict:
     return {
+        "post_id": post.id,
+        "content_type": post.content_type,
+        "content_type_secondary": post.content_type_secondary,
+        "content_topic": post.content_topic,
+        "author_intent": post.author_intent,
+        "intent_note": post.intent_note,
         "author_id": author.id,
         "author_name": author.name,
         "role": author.role,
         "credibility_tier": author.credibility_tier,
         "expertise_areas": author.expertise_areas,
-        "stance_label": parsed.get("stance_label") if parsed else None,
-        "audience": parsed.get("audience") if parsed else None,
-        "core_message": parsed.get("core_message") if parsed else None,
-        "author_summary": parsed.get("author_summary") if parsed else None,
+        "stance_label": stance_parsed.get("stance_label") if stance_parsed else None,
+        "audience": stance_parsed.get("audience") if stance_parsed else None,
+        "core_message": stance_parsed.get("core_message") if stance_parsed else None,
+        "author_summary": stance_parsed.get("author_summary") if stance_parsed else None,
     }

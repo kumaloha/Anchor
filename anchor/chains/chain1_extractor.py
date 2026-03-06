@@ -36,6 +36,8 @@ from anchor.models import (
     Solution,
 )
 
+_POLICY_TYPES = {"政策宣布", "政策解读"}
+
 
 async def run_chain1(url: str, session: AsyncSession) -> dict:
     """执行链路1：URL → 六实体提取
@@ -85,9 +87,40 @@ async def run_chain1(url: str, session: AsyncSession) -> dict:
     author_name = rp.author_name
     logger.info(f"[Chain1] RawPost id={raw_post_id}, author={author_name}")
 
-    # ── Step 2：六实体提取 ────────────────────────────────────────────────
+    # ── Step 2：内容预分类（Chain 2 Step 1+2 前置）────────────────────────
+    from anchor.chains.chain2_author import classify_post
+    logger.info(f"[Chain1] Pre-classifying RawPost id={raw_post_id}")
+    pre = await classify_post(rp, session)
+    content_type = pre.get("content_type")
+    author_intent = pre.get("author_intent")
+    logger.info(f"[Chain1] Pre-classification done: type={content_type!r} intent={author_intent!r}")
+
+    # ── Step 3：内容路由 ───────────────────────────────────────────────────
+    # 市场分析类 → standard（六实体流水线）
+    # 政策宣布/解读 → policy（PolicyTheme + PolicyItem，change_type 由 compare_policies 单独填写）
+    content_mode = "policy" if content_type in _POLICY_TYPES else "standard"
+    if content_mode == "policy":
+        logger.info(f"[Chain1] Policy mode ({content_type})")
+
+    # ── Step 4：六实体提取 ────────────────────────────────────────────────
     extractor = Extractor()
-    extraction: ExtractionResult | None = await extractor.extract(rp, session)
+    extraction: ExtractionResult | None = await extractor.extract(
+        rp, session,
+        content_mode=content_mode,
+        author_intent=author_intent,
+    )
+
+    # ── Step 4b：政策模式 — 自动搜索上年文档并比对 ────────────────────────
+    if content_mode == "policy" and extraction and extraction.is_relevant_content:
+        logger.info(f"[Chain1] Policy mode: auto-fetching prior year document for comparison")
+        comparison = await extractor.fetch_prior_year_and_compare(rp.id, session)
+        if comparison:
+            logger.info(
+                f"[Chain1] Policy comparison done: {len(comparison.annotations)} annotated, "
+                f"{len(comparison.deleted_summaries)} deleted"
+            )
+        else:
+            logger.warning("[Chain1] Policy comparison skipped or failed")
 
     if extraction is None:
         logger.warning(f"[Chain1] Extraction returned None for RawPost id={raw_post_id}")
@@ -114,7 +147,7 @@ async def run_chain1(url: str, session: AsyncSession) -> dict:
             "conclusions": [], "predictions": [], "solutions": [], "relationships": [],
         }
 
-    # ── Step 3：从 DB 读取写入的实体汇总 ────────────────────────────────
+    # ── Step 5：从 DB 读取写入的实体汇总 ────────────────────────────────
     facts = list(
         (await session.exec(select(Fact).where(Fact.raw_post_id == raw_post_id))).all()
     )

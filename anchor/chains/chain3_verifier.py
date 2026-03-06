@@ -49,12 +49,30 @@ from anchor.models import (
     EntityRelationship,
     Fact,
     ImplicitCondition,
+    PolicyItem,
+    PolicyTheme,
     Prediction,
+    RawPost,
     _utcnow,
 )
 from anchor.verify.web_searcher import format_search_results, web_search
 
 _MAX_TOKENS = 1024
+
+_SYS_POLICY_EXEC = """\
+你是政策执行追踪分析师。给定一条政策承诺及相关搜索结果，判断该政策的当前执行情况。
+
+execution_status 枚举：
+  implemented   — 已完全落地，有明确数据或公告证明
+  in_progress   — 正在推进，已有具体行动但尚未完成
+  stalled       — 推进受阻或明显低于预期，有证据表明延迟/缩水
+  not_started   — 尚无任何落地迹象，仍停留在承诺阶段
+  unknown       — 搜索结果不足以判断
+
+输出 JSON：
+{"execution_status": "...", "execution_note": "≤80字，说明执行进展并注明来源依据"}
+严格输出 JSON，不加任何其他文字。\
+"""
 
 # ---------------------------------------------------------------------------
 # System prompts
@@ -145,6 +163,17 @@ async def run_chain3(raw_post_id: int, session: AsyncSession) -> dict:
     """
     logger.info(f"[Chain3] Starting verification for raw_post_id={raw_post_id}")
 
+    # ── 政策模式：追踪各政策条目执行情况 ────────────────────────────────
+    policy_items = list(
+        (await session.exec(
+            select(PolicyItem).where(PolicyItem.raw_post_id == raw_post_id)
+        )).all()
+    )
+    items_tracked = 0
+    if policy_items:
+        logger.info(f"[Chain3] Policy post detected: {len(policy_items)} items → tracking execution")
+        items_tracked = await _track_policy_execution(raw_post_id, policy_items, session)
+
     # ── 加载该帖子的所有实体 ─────────────────────────────────────────────
     facts = list(
         (await session.exec(select(Fact).where(Fact.raw_post_id == raw_post_id))).all()
@@ -226,6 +255,7 @@ async def run_chain3(raw_post_id: int, session: AsyncSession) -> dict:
 
     logger.info(
         f"[Chain3] Done for raw_post_id={raw_post_id}: "
+        f"items_tracked={items_tracked}, "
         f"facts={facts_verified}, assumptions={assumptions_verified}, "
         f"implicit={implicit_verified}, conclusions={conclusions_derived}, "
         f"predictions={predictions_checked}"
@@ -233,6 +263,7 @@ async def run_chain3(raw_post_id: int, session: AsyncSession) -> dict:
 
     return {
         "raw_post_id": raw_post_id,
+        "items_tracked": items_tracked,
         "facts_verified": facts_verified,
         "assumptions_verified": assumptions_verified,
         "implicit_verified": implicit_verified,
@@ -588,3 +619,66 @@ def _safe_str(value) -> str | None:
         return None
     s = str(value).strip()
     return s if s else None
+
+
+# ---------------------------------------------------------------------------
+# 政策模式 — 追踪各政策条目执行情况
+# ---------------------------------------------------------------------------
+
+
+async def _track_policy_execution(
+    raw_post_id: int,
+    items: list[PolicyItem],
+    session: AsyncSession,
+) -> int:
+    """对每条尚无 execution_status 的 PolicyItem，做 web 搜索并判断执行情况。
+
+    优先追踪硬约束（is_hard_target=True）和强制类（urgency=mandatory）条目。
+
+    Returns:
+        成功追踪的条目数量
+    """
+    post = await session.get(RawPost, raw_post_id)
+    year = post.posted_at.year if post and post.posted_at else datetime.date.today().year
+
+    # 优先级：硬约束 > 强制 > 其余
+    def priority(item: PolicyItem) -> int:
+        if item.is_hard_target:
+            return 0
+        if item.urgency == "mandatory":
+            return 1
+        return 2
+
+    tracked = 0
+    for item in sorted(items, key=priority):
+        if item.execution_status is not None:
+            continue  # 已追踪，跳过
+
+        metric_hint = f"（目标：{item.metric_value}）" if item.metric_value else ""
+        query = f"{year}年 {item.summary}{metric_hint} 落实 进展"
+        search_text = await _search(query)
+
+        prompt = f"""政策年份：{year}年
+政策承诺：{item.policy_text}
+量化目标：{item.metric_value or '无'}
+{search_text}
+
+请判断该政策承诺的当前执行情况。"""
+
+        result = await _call_llm(_SYS_POLICY_EXEC, prompt)
+        if result:
+            status = _normalize(
+                result.get("execution_status"),
+                {"implemented", "in_progress", "stalled", "not_started", "unknown"},
+                "unknown",
+            )
+            item.execution_status = status
+            item.execution_note = _safe_str(result.get("execution_note"))
+            session.add(item)
+            await session.flush()
+            tracked += 1
+            logger.info(
+                f"[Chain3] PolicyItem id={item.id} [{item.summary}] → {status}"
+            )
+
+    return tracked

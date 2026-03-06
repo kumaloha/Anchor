@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     twitter_auth_token: str = ""
     twitter_ct0: str = ""
 
+    # Truth Social（Mastodon API）
+    # 获取方式：https://truthsocial.com/settings/applications → 创建应用 → 复制 access_token
+    truthsocial_access_token: str = ""
+
     # Weibo
     weibo_app_key: str = ""
     weibo_app_secret: str = ""

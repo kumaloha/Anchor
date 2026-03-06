@@ -53,6 +53,12 @@ _WEIBO_PROFILE = re.compile(
 _YOUTUBE_VIDEO = re.compile(
     r"(?:youtube\.com/watch\?(?:.*&)?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})"
 )
+_TRUTHSOCIAL_POST = re.compile(
+    r"truthsocial\.com/@[\w.]+/posts/(\d+)"
+)
+_TRUTHSOCIAL_PROFILE = re.compile(
+    r"truthsocial\.com/@([\w.]+)/?$"
+)
 
 
 def parse_url(url: str) -> ParsedURL:
@@ -95,7 +101,21 @@ def parse_url(url: str) -> ParsedURL:
                 f"https://www.youtube.com/watch?v={video_id}"
             )
 
-    raise ValueError(f"无法识别的 URL 或不支持的平台：{url}")
+    # --- Truth Social ---
+    if "truthsocial.com" in host:
+        if m := _TRUTHSOCIAL_POST.search(url):
+            return ParsedURL("truthsocial", SourceType.POST, m.group(1), url)
+        if m := _TRUTHSOCIAL_PROFILE.search(url):
+            username = m.group(1)
+            return ParsedURL(
+                "truthsocial", SourceType.PROFILE, username,
+                f"https://truthsocial.com/@{username}"
+            )
+
+    # --- 通用网页（兜底）---
+    import hashlib
+    external_id = hashlib.md5(url.encode()).hexdigest()[:16]
+    return ParsedURL("web", SourceType.POST, external_id, url)
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +167,10 @@ async def process_url(url: str, session: AsyncSession) -> InputResult:
 
     # 根据平台获取采集器
     fetcher = _get_fetcher(parsed.platform)
+
+    # Truth Social：传入原始 URL 供 Jina 使用
+    if hasattr(fetcher, "set_url"):
+        fetcher.set_url(parsed.canonical_url)
 
     # 抓取内容
     if parsed.source_type == SourceType.POST:
@@ -257,6 +281,12 @@ def _get_fetcher(platform: str):
     if platform == "youtube":
         from anchor.collect.youtube import YouTubeCollector
         return _YouTubeFetchAdapter(YouTubeCollector())
+    if platform == "truthsocial":
+        from anchor.collect.truthsocial import TruthSocialCollector
+        return _TruthSocialFetchAdapter(TruthSocialCollector())
+    if platform == "web":
+        from anchor.collect.web import WebCollector
+        return _WebFetchAdapter(WebCollector())
     raise ValueError(f"不支持的平台：{platform}")
 
 
@@ -384,6 +414,58 @@ class _WeiboFetchAdapter:
         self, uid: str, since: datetime | None
     ) -> list[RawPostData]:
         return await self._c.collect(uids=[uid])
+
+
+class _TruthSocialFetchAdapter:
+    def __init__(self, collector) -> None:
+        self._c = collector
+        self._url: str = ""  # 保存原始 URL，供 fetch_post 使用
+
+    def set_url(self, url: str) -> None:
+        self._url = url
+
+    async def fetch_post(self, post_id: str) -> list[RawPostData]:
+        # Jina 需要完整 URL；优先用 set_url 传入的原始 URL
+        url = self._url or f"https://truthsocial.com/posts/{post_id}"
+        post = await self._c.collect_by_url(url)
+        return [post] if post else []
+
+    async def fetch_post_updates(
+        self, post_id: str, since: datetime | None
+    ) -> list[RawPostData]:
+        return []
+
+    async def fetch_profile(
+        self, username: str, since: datetime
+    ) -> list[RawPostData]:
+        return []
+
+    async def fetch_profile_since(
+        self, username: str, since: datetime | None
+    ) -> list[RawPostData]:
+        return []
+
+
+class _WebFetchAdapter:
+    def __init__(self, collector) -> None:
+        self._c = collector
+        self._url: str = ""
+
+    def set_url(self, url: str) -> None:
+        self._url = url
+
+    async def fetch_post(self, post_id: str) -> list[RawPostData]:
+        post = await self._c.collect_by_url(self._url)
+        return [post] if post else []
+
+    async def fetch_post_updates(self, post_id: str, since: datetime | None) -> list[RawPostData]:
+        return []
+
+    async def fetch_profile(self, uid: str, since: datetime) -> list[RawPostData]:
+        return []
+
+    async def fetch_profile_since(self, uid: str, since: datetime | None) -> list[RawPostData]:
+        return []
 
 
 class _YouTubeFetchAdapter:
