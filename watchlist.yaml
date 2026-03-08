@@ -65,8 +65,8 @@ authors:
     tier: 1
     category: fund_titan
     sources:
-      - platform: Vanguard Insights
-        url: https://corporate.vanguard.com/content/corporatesite/us/en/corp/articles/index.html
+      - platform: Vanguard Investing Insights
+        url: https://corporate.vanguard.com/content/corporatesite/us/en/corp/what-we-think/investing-insights/index.html
         accessible: true
 
   - name: Ronald O'Hanley
@@ -127,8 +127,8 @@ authors:
     tier: 1
     category: central_banker
     sources:
-      - platform: BOJ 演讲与声明
-        url: https://www.boj.or.jp/en/about/governor/index.htm
+      - platform: RSS（BOJ What's New）
+        url: https://www.boj.or.jp/en/rss/whatsnew.xml
         accessible: true
 
   - name: Kristalina Georgieva
@@ -173,8 +173,8 @@ authors:
     tier: 2
     category: nobel_laureate
     sources:
-      - platform: Project Syndicate
-        url: https://www.project-syndicate.org/columnist/philippe-aghion
+      - platform: Project Syndicate 全站 RSS（按作者过滤）
+        url: https://www.project-syndicate.org/rss
         accessible: true
 
   - name: Daron Acemoglu
@@ -215,8 +215,8 @@ authors:
     tier: 2
     category: nobel_laureate
     sources:
-      - platform: Project Syndicate
-        url: https://www.project-syndicate.org/columnist/robert-j-shiller
+      - platform: Project Syndicate 全站 RSS（按作者过滤）
+        url: https://www.project-syndicate.org/rss
         accessible: true
 
   # ── 顶级宏观对冲基金经理 (Macro Fund Managers) ───────────────────────────
@@ -238,8 +238,8 @@ authors:
       - platform: Twitter/X
         url: https://x.com/BillAckman
         accessible: true
-      - platform: Pershing Square 股东信
-        url: https://www.pershingsquareholdings.com/company-information/letters-to-shareholders/
+      - platform: Pershing Square 官网动态
+        url: https://pershingsquareholdings.com/
         accessible: true
 
   - name: Jeffrey Gundlach
@@ -262,10 +262,9 @@ authors:
     tier: 2
     category: hedge_fund
     sources:
-      - platform: Citadel Insights
-        url: https://www.citadel.com/insights/
+      - platform: Milken Institute YouTube
+        url: https://www.youtube.com/@MilkenInstitute
         accessible: true
-        note: 内容稀少，重点关注 Economic Club / Milken Institute 访谈
 
   - name: George Soros
     institution: 索罗斯基金管理 (Soros Fund Management) 创始人
@@ -325,12 +324,8 @@ authors:
     tier: 2
     category: chief_economist
     sources:
-      - platform: Bloomberg Opinion
-        url: https://www.bloomberg.com/opinion/authors/ABsGWFJr5sA/mohamed-a-elerian
-        accessible: false
-        note: Bloomberg 付费墙，可通过 Project Syndicate 获取部分文章
-      - platform: Project Syndicate
-        url: https://www.project-syndicate.org/columnist/mohamed-a-el-erian
+      - platform: Project Syndicate 全站 RSS（按作者过滤）
+        url: https://www.project-syndicate.org/rss
         accessible: true
 
   - name: Larry Summers
@@ -377,8 +372,8 @@ authors:
     tier: 2
     category: chief_economist
     sources:
-      - platform: PIIE 评论
-        url: https://www.piie.com/experts/senior-research-staff/adam-s-posen
+      - platform: PIIE Update RSS
+        url: https://www.piie.com/rss/update.xml
         accessible: true
 
   - name: Robin Brooks
