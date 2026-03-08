@@ -43,34 +43,34 @@ _VALID_CONTENT_TYPES = {
     "技术论文", "教育科普", "政策宣布", "政策解读",
 }
 
-_VALID_INTENTS = {
-    "传递信息", "影响观点", "警示风险", "推荐行动",
-    "教育科普", "引发讨论", "推广宣传", "政治动员",
-}
+_VALID_INTENTS: set[str] = set()  # 开放式文本，不做枚举校验
 
-_VALID_STANCE_LABELS = {
-    "看涨/多头", "看跌/空头", "中立/客观", "警告/防御",
-    "批判/质疑", "政策倡导", "教育/分析",
-}
+_VALID_STANCE_LABELS: set[str] = set()  # 开放式文本，不做枚举校验
 
 # ---------------------------------------------------------------------------
 # 立场分析提示词
 # ---------------------------------------------------------------------------
 
 _STANCE_SYSTEM = """\
-你是一名专业媒体分析师，擅长识别意见领袖的立场倾向和传播目的。
-给定一位作者的近期帖子集合，分析其整体立场和受众定位。
+你是一名专业媒体与舆论分析师，擅长从多个维度判断意见领袖的真实立场。
+立场是多维度的，需要分别评估以下四个维度：
 
-立场标签分类：
-  看涨/多头   — 对某类资产/经济前景持乐观态度
-  看跌/空头   — 对某类资产/经济前景持悲观态度
-  中立/客观   — 平衡呈现多方观点，不明确表态
-  警告/防御   — 强调风险和防御性策略
-  批判/质疑   — 对现有政策/机构/观点提出质疑
-  政策倡导    — 推动特定政策或政治立场
-  教育/分析   — 主要以教育或学术分析为目的
+【意识形态】该作者的政治/经济主张倾向
+  示例：自由市场主义 / 凯恩斯主义 / 左翼进步派 / 右翼保守派 / 民族主义 / 民粹主义 / 技术官僚 / 无明显倾向
 
-输出必须是合法 JSON，不加任何其他文字。\
+【地缘立场】该作者在国际关系上倾向于哪一方
+  示例：亲美 / 亲中 / 亲俄 / 亲欧 / 反建制 / 多极主义者 / 中立 / 无法判断
+
+【利益代表】该作者的观点背后服务于谁的利益
+  示例：独立分析师 / 所在机构（需注明机构名）/ 华尔街 / 中国官方 / 政党利益 / 个人品牌 / 无法判断
+
+【客观性】该作者整体的中立程度
+  示例：相对客观 / 有明显倾向 / 立场鲜明 / 宣传口吻
+
+要求：
+- 每个维度用≤15字简短描述，无法判断时填"无法判断"
+- 不要用市场情绪词（看涨/看跌）来回答任何维度
+- 输出必须是合法 JSON，不加任何其他文字\
 """
 
 _STANCE_USER_TEMPLATE = """\
@@ -84,16 +84,19 @@ _STANCE_USER_TEMPLATE = """\
 {posts_text}
 
 ## 任务
-基于以上帖子内容，分析该作者的整体立场倾向和传播目的。
+从意识形态、地缘立场、利益代表、客观性四个维度分析该作者的立场。
 
 严格输出 JSON：
 
 ```json
 {{
-  "stance_label": "看涨/多头|看跌/空头|中立/客观|警告/防御|批判/质疑|政策倡导|教育/分析",
+  "ideology": "意识形态（≤15字）",
+  "geo_stance": "地缘立场（≤15字）",
+  "interest_rep": "利益代表（≤20字）",
+  "objectivity": "客观性（≤10字）",
   "audience": "目标受众（≤40字）",
   "core_message": "核心信息（≤80字）",
-  "author_summary": "以...身份，持...立场，向...传达...（≤100字）"
+  "author_summary": "综合一句话描述（≤100字）"
 }}
 ```\
 """
@@ -125,15 +128,24 @@ async def classify_post(post: RawPost, session: AsyncSession) -> dict:
                 ct = None
             if ct2 and ct2 not in _VALID_CONTENT_TYPES:
                 ct2 = None
-            intent = post_analysis.get("author_intent")
-            if intent not in _VALID_INTENTS:
-                logger.warning(f"[Chain2] classify_post: invalid author_intent={intent!r}, ignoring")
-                intent = None
+            intent = _safe_str(post_analysis.get("author_intent"))
             post.content_type = ct
             post.content_type_secondary = ct2 if ct2 != ct else None
             post.content_topic = _safe_str(post_analysis.get("content_topic"))
             post.author_intent = intent
-            post.intent_note = _safe_str(post_analysis.get("intent_note"))
+            # 实际发言人（个人品牌账号）
+            real_name = _safe_str(post_analysis.get("real_author_name"))
+            if real_name and real_name != author.name:
+                logger.info(f"[Chain2] Real author identified: {author.name!r} → {real_name!r}")
+                author.name = real_name
+                post.author_name = real_name
+                # 名字变了，重置档案状态，让 AuthorProfiler 重新搜索真实作者
+                author.profile_fetched = False
+                author.credibility_tier = None
+                author.role = None
+                author.expertise_areas = None
+                author.profile_note = None
+                session.add(author)
             # 发文机关（仅政策类内容）
             if ct in {"政策宣布", "政策解读"}:
                 ia = _safe_str(post_analysis.get("issuing_authority"))
@@ -211,16 +223,23 @@ async def run_chain2(post_id: int, session: AsyncSession) -> dict:
             if ct2 and ct2 not in _VALID_CONTENT_TYPES:
                 ct2 = None
 
-            intent = post_analysis.get("author_intent")
-            if intent not in _VALID_INTENTS:
-                logger.warning(f"[Chain2] Invalid author_intent={intent!r}, ignoring")
-                intent = None
-
+            intent = _safe_str(post_analysis.get("author_intent"))
             post.content_type = ct
             post.content_type_secondary = ct2 if ct2 != ct else None
             post.content_topic = _safe_str(post_analysis.get("content_topic"))
             post.author_intent = intent
-            post.intent_note = _safe_str(post_analysis.get("intent_note"))
+            # 实际发言人（个人品牌账号）
+            real_name = _safe_str(post_analysis.get("real_author_name"))
+            if real_name and real_name != author.name:
+                logger.info(f"[Chain2] Real author identified: {author.name!r} → {real_name!r}")
+                author.name = real_name
+                post.author_name = real_name
+                author.profile_fetched = False
+                author.credibility_tier = None
+                author.role = None
+                author.expertise_areas = None
+                author.profile_note = None
+                session.add(author)
             # 发文机关（仅政策类内容）
             if ct in {"政策宣布", "政策解读"}:
                 ia = _safe_str(post_analysis.get("issuing_authority"))
@@ -345,10 +364,14 @@ async def _upsert_stance_profile(
         profile = AuthorStanceProfile(author_id=author_id)
 
     if parsed:
-        stance = parsed.get("stance_label")
-        if stance and stance not in _VALID_STANCE_LABELS:
-            logger.warning(f"[Chain2] Invalid stance_label={stance!r}, ignoring")
-            stance = None
+        # 四维度拼合成结构化文本存入 dominant_stance
+        dims = [
+            ("意识形态", parsed.get("ideology")),
+            ("地缘立场", parsed.get("geo_stance")),
+            ("利益代表", parsed.get("interest_rep")),
+            ("客观性",   parsed.get("objectivity")),
+        ]
+        stance = "\n".join(f"{k}｜{v}" for k, v in dims if v and v != "无法判断") or None
 
         if stance:
             dist: dict[str, int] = {}
@@ -424,7 +447,7 @@ def _build_result(post: RawPost, author: Author, stance_parsed: dict | None) -> 
         "role": author.role,
         "credibility_tier": author.credibility_tier,
         "expertise_areas": author.expertise_areas,
-        "stance_label": stance_parsed.get("stance_label") if stance_parsed else None,
+        "stance_label": stance_parsed.get("ideology") if stance_parsed else None,
         "audience": stance_parsed.get("audience") if stance_parsed else None,
         "core_message": stance_parsed.get("core_message") if stance_parsed else None,
         "author_summary": stance_parsed.get("author_summary") if stance_parsed else None,

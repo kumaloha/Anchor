@@ -54,6 +54,7 @@ from anchor.extract.schemas import (
     RawEdge,
     PolicyChangeAnnotation,
     PolicyComparisonResult,
+    PolicyExtractionResult,
     PolicyItem as PolicyItemSchema,
     Step1PolicyResult,
     Step1Result,
@@ -71,7 +72,9 @@ from anchor.models import (
     EntityRelationship,
     Fact,
     ImplicitCondition,
+    Policy,
     PolicyItem,
+    PolicyMeasure,
     PolicyTheme,
     Prediction,
     RawPost,
@@ -109,6 +112,7 @@ class Extractor:
         session: AsyncSession,
         content_mode: str = "standard",
         author_intent: str | None = None,
+        force: bool = False,
     ) -> ExtractionResult | None:
         """对一条帖子执行六实体提取，写入数据库，返回提取结果。
 
@@ -117,8 +121,10 @@ class Extractor:
             session:       异步数据库 Session
             content_mode:  "standard"（默认六实体流水线）或 "policy"（政策模式）
             author_intent: Chain 2 前置分类预判的作者意图（注入 Step 1 提示词）
+            force:         True 时跳过 is_processed / is_relevant_content 检查，
+                           强制完整运行（用于手动 run_url.py）
         """
-        if raw_post.is_processed:
+        if not force and raw_post.is_processed:
             logger.debug(f"RawPost {raw_post.id} already processed, skipping")
             return None
 
@@ -158,17 +164,18 @@ class Extractor:
 
         if not step1.is_relevant_content:
             logger.info(f"[v5] RawPost {raw_post.id} not relevant: {step1.skip_reason}")
-            raw_post.is_processed = True
-            raw_post.processed_at = _utcnow()
-            session.add(raw_post)
-            await session.commit()
-            # Return minimal ExtractionResult to signal non-relevant
-            return ExtractionResult(
-                is_relevant_content=False,
-                skip_reason=step1.skip_reason,
-            )
+            if not force:
+                raw_post.is_processed = True
+                raw_post.processed_at = _utcnow()
+                session.add(raw_post)
+                await session.commit()
+                return ExtractionResult(
+                    is_relevant_content=False,
+                    skip_reason=step1.skip_reason,
+                )
+            logger.info(f"[v5] force=True, continuing with empty claims")
 
-        claims = step1.claims
+        claims = step1.claims or []
         edges = step1.edges
         logger.info(f"[v5] Step1 done: {len(claims)} claims, {len(edges)} edges")
 
@@ -235,7 +242,6 @@ class Extractor:
             logger.info("[v5] Step4: skipped (no edges)")
 
         # ── Step 5b：叙事摘要生成 ─────────────────────────────────────────
-        # 传完整 text（而非 summary），保留细节供摘要使用
         core_conclusions_text = [
             claims_by_id[cid].text
             for cid in core_ids
@@ -518,6 +524,177 @@ class Extractor:
             return None
         return _parse_json(raw, Step1PolicyResult, "Step1(policy)")
 
+    async def _step1_policy_themes(self, content: str) -> list[str]:
+        """Step A: 快速主旨扫描，返回 theme 名称列表（3-8个）"""
+        from anchor.extract.prompts.v5_step1_policy import (
+            SYSTEM_THEME_SCAN, build_theme_scan_message,
+        )
+        user = build_theme_scan_message(content)
+        raw = await _call_llm(SYSTEM_THEME_SCAN, user, max_tokens=400)
+        if not raw:
+            return []
+        try:
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+                raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
+            data = json.loads(raw.strip())
+            return data.get("themes", [])
+        except Exception as e:
+            logger.warning(f"[v5/policy] Theme scan parse failed: {e}")
+            return []
+
+    # ------------------------------------------------------------------
+    # 长文档专用方法（content > LONG_DOC_THRESHOLD 时触发）
+    # ------------------------------------------------------------------
+
+    LONG_DOC_THRESHOLD = 15000
+
+    async def _extract_paragraphs_for_theme(self, content: str, theme: str) -> str:
+        """从全文中提取与 theme 相关的段落（原文照录）。"""
+        from anchor.extract.prompts.v5_step1_policy import (
+            SYSTEM_PARA_EXTRACT, build_para_extract_message,
+        )
+        result = await _call_llm(
+            SYSTEM_PARA_EXTRACT, build_para_extract_message(content, theme), max_tokens=2000
+        )
+        return result.strip() if result else "（无相关内容）"
+
+    async def _step1_policy_single_theme(
+        self,
+        theme: str,
+        curr_paragraphs: str,
+        prior_paragraphs: str | None,
+        web_snippet: str | None,
+    ) -> "PolicySchema | None":
+        """对单个主旨做完整六维提取。"""
+        from anchor.extract.prompts.v5_step1_policy import (
+            SYSTEM_SINGLE_THEME, build_single_theme_message,
+        )
+        from anchor.extract.schemas import PolicySchema
+        raw = await _call_llm(
+            SYSTEM_SINGLE_THEME,
+            build_single_theme_message(theme, curr_paragraphs, prior_paragraphs, web_snippet),
+            max_tokens=2000,
+        )
+        if not raw:
+            return None
+        try:
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+            return PolicySchema(**json.loads(raw))
+        except Exception as e:
+            logger.warning(f"[v5/policy/long] Single-theme parse failed ({theme}): {e}")
+            return None
+
+    async def _extract_policy_long(
+        self,
+        content: str,
+        prior_content: str | None,
+        themes: list[str],
+        web_ctx: dict[str, str],
+    ) -> "PolicyExtractionResult":
+        """长文档专用：逐主旨并行提取。
+        Step A2: 每主旨并行提取相关段落（当年 + 上年）
+        Step B:  每主旨单独六维提取
+        最后:    单独一次 facts + conclusions 提取
+        """
+        import asyncio
+        from anchor.extract.schemas import PolicyExtractionResult, PolicySchema, RawClaim
+        from anchor.extract.prompts.v5_step1_policy import (
+            SYSTEM_FACTS_CONCLUSIONS, build_facts_conclusions_message,
+        )
+
+        sem_para = asyncio.Semaphore(5)
+        sem_b = asyncio.Semaphore(3)
+
+        async def get_paragraphs(theme: str) -> tuple[str, str, str | None]:
+            async with sem_para:
+                curr_p = await self._extract_paragraphs_for_theme(content, theme)
+                prior_p = (
+                    await self._extract_paragraphs_for_theme(prior_content, theme)
+                    if prior_content else None
+                )
+            return theme, curr_p, prior_p
+
+        async def run_step_b(theme: str, curr_p: str, prior_p: str | None) -> "PolicySchema | None":
+            async with sem_b:
+                return await self._step1_policy_single_theme(
+                    theme, curr_p, prior_p, web_ctx.get(theme)
+                )
+
+        # Step A2
+        logger.info(f"[v5/policy/long] Step A2: paragraph extraction for {len(themes)} themes")
+        para_results = await asyncio.gather(
+            *[get_paragraphs(t) for t in themes], return_exceptions=True
+        )
+
+        # Step B
+        logger.info(f"[v5/policy/long] Step B: per-theme extraction")
+        valid_paras = [r for r in para_results if isinstance(r, tuple)]
+        policy_results = await asyncio.gather(
+            *[run_step_b(theme, curr_p, prior_p) for theme, curr_p, prior_p in valid_paras],
+            return_exceptions=True,
+        )
+        policies = [p for p in policy_results if isinstance(p, PolicySchema)]
+        logger.info(f"[v5/policy/long] Step B done: {len(policies)}/{len(themes)} policies")
+
+        # Facts + Conclusions
+        facts: list[RawClaim] = []
+        conclusions: list[RawClaim] = []
+        try:
+            fc_raw = await _call_llm(
+                SYSTEM_FACTS_CONCLUSIONS,
+                build_facts_conclusions_message(content, prior_content),
+                max_tokens=1500,
+            )
+            if fc_raw:
+                fc_raw = fc_raw.strip()
+                if fc_raw.startswith("```"):
+                    fc_raw = re.sub(r"^```[a-z]*\n?", "", fc_raw)
+                    fc_raw = re.sub(r"\n?```$", "", fc_raw)
+                fc_data = json.loads(fc_raw)
+                facts = [RawClaim(**f) for f in fc_data.get("facts", [])]
+                conclusions = [RawClaim(**c) for c in fc_data.get("conclusions", [])]
+                logger.info(f"[v5/policy/long] facts={len(facts)}, conclusions={len(conclusions)}")
+        except Exception as e:
+            logger.warning(f"[v5/policy/long] Facts/conclusions failed: {e}")
+
+        return PolicyExtractionResult(
+            is_relevant_content=True,
+            policies=policies,
+            facts=facts,
+            conclusions=conclusions,
+        )
+
+    async def _step1_policy_full(
+        self,
+        current_content: str,
+        prior_content: str | None,
+        web_ctx: dict[str, str],
+        themes: list[str] | None = None,
+    ) -> PolicyExtractionResult | None:
+        """Step B: 完整政策提取（当年全文 + 上年全文 + 联网搜索背景）"""
+        from anchor.extract.prompts.v5_step1_policy import (
+            SYSTEM_FULL_EXTRACT, build_full_extract_message,
+        )
+        user = build_full_extract_message(current_content, prior_content, web_ctx, themes=themes)
+        raw = await _call_llm(SYSTEM_FULL_EXTRACT, user, max_tokens=8000)
+        if not raw:
+            return None
+        try:
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+                raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
+            data = json.loads(raw.strip())
+            return PolicyExtractionResult(**data)
+        except Exception as e:
+            logger.warning(f"[v5/policy] Full extract parse failed: {e}")
+            return None
+
     async def _extract_policy(
         self,
         raw_post: RawPost,
@@ -528,57 +705,116 @@ class Extractor:
         today: str,
         author_intent: str | None,
     ) -> ExtractionResult | None:
-        """Policy 模式完整提取流程：Step1Policy → DB写入 → Step5 摘要"""
-        step1 = await self._step1_claims_policy(
-            content, platform, author, today, author_intent
-        )
-        if step1 is None:
-            logger.warning(f"[v5/policy] Step1Policy failed for RawPost id={raw_post.id}")
+        """Policy 模式完整提取流程（v3）：
+        Step A 主旨扫描 → 并行 Tavily 搜索 + 获取上年文档 → Step B 完整提取 → Step5 摘要 → DB写入
+        """
+        import asyncio
+        from anchor.verify.web_searcher import web_search
+
+        # Step A: 主旨扫描
+        themes = await self._step1_policy_themes(content)
+        logger.info(f"[v5/policy] Step A themes: {themes}")
+
+        # 并行：Tavily 搜索（每主旨一次） + 获取上年文档
+        current_year = raw_post.posted_at.year if raw_post.posted_at else int(today[:4])
+        prior_year = current_year - 1
+
+        async def search_theme(theme: str) -> tuple[str, str]:
+            query = f"{theme} {current_year} 政策背景 宏观形势"
+            try:
+                results = await web_search(query, max_results=3)
+                if results:
+                    snippet = " ".join(
+                        getattr(r, "snippet", "") or getattr(r, "content", "") or ""
+                        for r in results[:2]
+                    )[:400]
+                else:
+                    snippet = ""
+            except Exception as e:
+                logger.warning(f"[v5/policy] Web search failed for '{theme}': {e}")
+                snippet = ""
+            return theme, snippet
+
+        # 并行搜索 + 获取上年 post
+        web_ctx: dict[str, str] = {}
+        if themes:
+            search_coros = [search_theme(t) for t in themes]
+            prior_post_coro = self._find_prior_policy_post(prior_year, session)
+            *search_results, prior_post = await asyncio.gather(
+                *search_coros, prior_post_coro, return_exceptions=True
+            )
+            for pair in search_results:
+                if isinstance(pair, tuple):
+                    web_ctx[pair[0]] = pair[1]
+            if isinstance(prior_post, Exception):
+                logger.warning(f"[v5/policy] _find_prior_policy_post error: {prior_post}")
+                prior_post = None
+        else:
+            prior_post = await self._find_prior_policy_post(prior_year, session)
+
+        prior_content: str | None = None
+        if prior_post and isinstance(prior_post, RawPost):
+            prior_content = prior_post.enriched_content or prior_post.content
+            logger.info(f"[v5/policy] Found prior year post id={prior_post.id}")
+        else:
+            logger.info(f"[v5/policy] No prior year post in DB, auto-fetching {prior_year} document")
+            prior_content = await self._fetch_prior_year_content(raw_post, prior_year)
+
+        # Step B: 根据文档长度选择提取策略
+        if len(content) > self.LONG_DOC_THRESHOLD:
+            logger.info(
+                f"[v5/policy] Long doc detected ({len(content)} chars > {self.LONG_DOC_THRESHOLD}), "
+                f"switching to per-theme extraction"
+            )
+            result = await self._extract_policy_long(content, prior_content, themes, web_ctx)
+        else:
+            result = await self._step1_policy_full(content, prior_content, web_ctx, themes=themes)
+        if result is None:
+            logger.warning(f"[v5/policy] Full extract failed for RawPost id={raw_post.id}")
             return None
 
-        if not step1.is_relevant_content:
-            logger.info(f"[v5/policy] RawPost {raw_post.id} not relevant: {step1.skip_reason}")
+        if not result.is_relevant_content:
+            logger.info(f"[v5/policy] RawPost {raw_post.id} not relevant: {result.skip_reason}")
             raw_post.is_processed = True
             raw_post.processed_at = _utcnow()
             session.add(raw_post)
             await session.commit()
-            return ExtractionResult(is_relevant_content=False, skip_reason=step1.skip_reason)
+            return ExtractionResult(is_relevant_content=False, skip_reason=result.skip_reason)
 
-        n_themes = len(step1.themes)
-        n_policies = sum(len(t.policies) for t in step1.themes)
+        n_policies = len(result.policies)
+        n_measures = sum(len(p.measures) for p in result.policies)
         logger.info(
-            f"[v5/policy] Step1 done: {n_themes} themes, {n_policies} policies, "
-            f"{len(step1.facts)} facts, {len(step1.conclusions)} conclusions"
+            f"[v5/policy] Step B done: {n_policies} policies, {n_measures} measures, "
+            f"{len(result.facts)} facts, {len(result.conclusions)} conclusions"
         )
 
-        # Step 5：叙事摘要（用 conclusions + facts 构造输入）
-        core_conclusions_text = [c.text for c in step1.conclusions]
-        key_facts_text = [f.text for f in step1.facts]
+        # Step C: 叙事摘要
+        core_conclusions_text = [c.text for c in result.conclusions]
+        key_facts_text = [f.text for f in result.facts]
         article_summary: str | None = None
         step5 = await self._step5_summary(core_conclusions_text, [], key_facts_text)
         if step5:
             article_summary = step5
             logger.info(f"[v5/policy] Step5 summary: {article_summary!r}")
 
-        # DB 写入
-        await self._write_policy_entities(step1, raw_post, session, article_summary)
+        # DB 写入（v3 新实体）
+        await self._write_policy_v3_entities(result, raw_post, session, article_summary)
 
-        # 构造返回值（使用简化的 ExtractionResult）
+        # 构造返回值
         facts_extracted = [
             ExtractedFact(summary=f.summary, claim=f.text, verifiable_statement=f.text)
-            for f in step1.facts
+            for f in result.facts
         ]
         conclusions_extracted = [
             ExtractedConclusion(summary=c.summary, claim=c.text, verifiable_statement=c.text)
-            for c in step1.conclusions
+            for c in result.conclusions
         ]
-        result = ExtractionResult(
+        return ExtractionResult(
             is_relevant_content=True,
             article_summary=article_summary,
             facts=facts_extracted,
             conclusions=conclusions_extracted,
         )
-        return result
 
     async def _write_policy_entities(
         self,
@@ -685,6 +921,101 @@ class Extractor:
             f"[v5/policy] RawPost {raw_post.id} written: "
             f"{len(result.themes)} themes, {len(policy_db_ids)} policies, "
             f"{len(fact_db_ids)} facts, {len(conclusion_db_ids)} conclusions"
+        )
+
+    async def _write_policy_v3_entities(
+        self,
+        result: PolicyExtractionResult,
+        raw_post: RawPost,
+        session: AsyncSession,
+        article_summary: str | None = None,
+    ) -> None:
+        """将 PolicyExtractionResult 写入数据库（policies / policy_measures / facts / conclusions）"""
+        conclusion_db_ids: list[int] = []
+        fact_db_ids: list[int] = []
+
+        # 1. 写 Policy + PolicyMeasure
+        for p_schema in result.policies:
+            db_policy = Policy(
+                raw_post_id=raw_post.id,
+                theme=p_schema.theme,
+                change_summary=p_schema.change_summary,
+                target=p_schema.target,
+                target_prev=p_schema.target_prev,
+                intensity=p_schema.intensity,
+                intensity_prev=p_schema.intensity_prev,
+                intensity_note=p_schema.intensity_note,
+                intensity_note_prev=p_schema.intensity_note_prev,
+                background=p_schema.background,
+                background_prev=p_schema.background_prev,
+                organization=p_schema.organization,
+                organization_prev=p_schema.organization_prev,
+            )
+            session.add(db_policy)
+            await session.flush()  # 获取 policy.id
+
+            for m_schema in p_schema.measures:
+                db_measure = PolicyMeasure(
+                    policy_id=db_policy.id,
+                    raw_post_id=raw_post.id,
+                    summary=m_schema.summary,
+                    measure_text=m_schema.measure_text,
+                    trend=m_schema.trend,
+                    trend_note=m_schema.trend_note,
+                )
+                session.add(db_measure)
+
+        # 2. 写 Fact（变化标注事实）
+        for f in result.facts:
+            db_fact = Fact(
+                raw_post_id=raw_post.id,
+                summary=f.summary,
+                claim=f.text,
+                verifiable_statement=f.text,
+            )
+            session.add(db_fact)
+            await session.flush()
+            fact_db_ids.append(db_fact.id)
+
+        # 3. 写 Conclusion（总体政策方向结论）
+        for c in result.conclusions:
+            db_conc = Conclusion(
+                raw_post_id=raw_post.id,
+                summary=c.summary,
+                claim=c.text,
+                verifiable_statement=c.text,
+                is_core_conclusion=True,
+            )
+            session.add(db_conc)
+            await session.flush()
+            conclusion_db_ids.append(db_conc.id)
+
+        # 4. 写 EntityRelationship 边（fact → conclusion）
+        for fact_id in fact_db_ids:
+            for conc_id in conclusion_db_ids:
+                db_rel = EntityRelationship(
+                    raw_post_id=raw_post.id,
+                    source_type="fact",
+                    source_id=fact_id,
+                    target_type="conclusion",
+                    target_id=conc_id,
+                    edge_type="fact_supports_conclusion",
+                )
+                session.add(db_rel)
+
+        # 5. 标记 RawPost 已处理
+        raw_post.is_processed = True
+        raw_post.processed_at = _utcnow()
+        if article_summary:
+            raw_post.content_summary = article_summary
+        session.add(raw_post)
+        await session.flush()
+        await session.commit()
+
+        logger.info(
+            f"[v5/policy/v3] RawPost {raw_post.id} written: "
+            f"{len(result.policies)} policies, {len(fact_db_ids)} facts, "
+            f"{len(conclusion_db_ids)} conclusions"
         )
 
     async def _step2_merge(self, claims: List[RawClaim]) -> Step2Result | None:
@@ -842,19 +1173,73 @@ class Extractor:
         # ── 7. 比对 ─────────────────────────────────────────────────────
         return await self.compare_policies(current_post_id, prior_post.id, session)
 
+    async def _fetch_prior_year_content(self, current_post: RawPost, prior_year: int) -> str | None:
+        """联网搜索并抓取上年同类政策文档全文（仅用于对比，不写 DB）。"""
+        from anchor.verify.web_searcher import web_search
+        from anchor.collect.web import WebCollector
+
+        # 从当年文档标题推断搜索词
+        topic = current_post.content_topic or ""
+        if "政府工作报告" in (current_post.content or "") or "政府工作报告" in topic:
+            query = f"{prior_year}年政府工作报告 全文"
+        else:
+            query = f"{prior_year}年 {topic or '政策文件'} 全文"
+
+        logger.info(f"[v5/policy] Searching prior year doc: {query!r}")
+        try:
+            results = await web_search(
+                query,
+                max_results=5,
+                include_domains=["gov.cn", "xinhuanet.com", "npc.gov.cn", "people.com.cn"],
+            )
+        except Exception as e:
+            logger.warning(f"[v5/policy] Prior year search failed: {e}")
+            return None
+
+        if not results:
+            logger.warning("[v5/policy] No search results for prior year doc")
+            return None
+
+        collector = WebCollector()
+        for r in results[:3]:
+            try:
+                post_data = await collector.collect_by_url(r.url)
+                if post_data and post_data.content and len(post_data.content) >= 500:
+                    logger.info(
+                        f"[v5/policy] Prior year doc fetched from {r.url}: "
+                        f"{len(post_data.content)} chars"
+                    )
+                    return post_data.content
+            except Exception as e:
+                logger.debug(f"[v5/policy] Fetch failed for {r.url}: {e}")
+                continue
+
+        logger.warning("[v5/policy] All prior year fetch attempts failed")
+        return None
+
     async def _find_prior_policy_post(self, prior_year: int, session: AsyncSession) -> "RawPost | None":
-        """在 DB 中查找已提取过 policy 的上年文档。"""
+        """在 DB 中查找已提取过 policy 的上年文档（先查 v3 Policy 表，再查 v2 PolicyTheme 表）。"""
         from datetime import datetime as _dt
         year_start = _dt(prior_year, 1, 1)
         year_end = _dt(prior_year, 12, 31)
-        # 找 posted_at 在上年范围内且有 policy_themes 的 post
-        result = await session.exec(
+        # v3: Policy 表
+        r = await session.exec(
+            select(RawPost)
+            .join(Policy, Policy.raw_post_id == RawPost.id)
+            .where(RawPost.posted_at >= year_start, RawPost.posted_at <= year_end)
+            .limit(1)
+        )
+        post = r.first()
+        if post:
+            return post
+        # v2 fallback: PolicyTheme 表
+        r = await session.exec(
             select(RawPost)
             .join(PolicyTheme, PolicyTheme.raw_post_id == RawPost.id)
             .where(RawPost.posted_at >= year_start, RawPost.posted_at <= year_end)
             .limit(1)
         )
-        return result.first()
+        return r.first()
 
     async def _compare_policy_llm(
         self,
@@ -1042,14 +1427,21 @@ def _apply_merges(
             remap[d] = mg.keep
         summary_update[mg.keep] = mg.merged_summary
 
-    # 过滤掉 discard 节点，更新 keep 节点的 summary
+    # 过滤掉 discard 节点，更新 keep 节点的 text + summary
+    text_update: dict[int, str] = {}
+    for mg in merges:
+        if mg.merged_text:
+            text_update[mg.keep] = mg.merged_text
+
     discard_ids = set(remap.keys())
     new_claims = []
     for c in claims:
         if c.id in discard_ids:
             continue
-        if c.id in summary_update:
-            c = RawClaim(id=c.id, text=c.text, summary=summary_update[c.id])
+        new_text = text_update.get(c.id, c.text)
+        new_summary = summary_update.get(c.id, c.summary)
+        if new_text != c.text or new_summary != c.summary:
+            c = RawClaim(id=c.id, text=new_text, summary=new_summary)
         new_claims.append(c)
 
     # 重定向边，去重，去自环

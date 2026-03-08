@@ -103,10 +103,37 @@ def _parse_article(text: str, url: str) -> RawPostData:
     else:
         content_raw = text
 
-    content = _clean_content(content_raw, title)
+    # ── YouTube 嵌入检测 ──────────────────────────────────────────────────
+    youtube_video_id = _extract_youtube_id(content_raw)
+    youtube_redirect = (
+        f"https://www.youtube.com/watch?v={youtube_video_id}"
+        if youtube_video_id else None
+    )
+
+    # ── 视频/轻内容页检测 ─────────────────────────────────────────────────
+    # 1) 纯播放器 UI（DoubleLine 风格：视频控件关键词 ≥2 个）
+    # 2) 内容包装页：嵌入了非 YouTube 视频且有效正文 < 400 字
+    # 3) 一般内容过短：有效正文 < 200 字
+    meaningful_len = _meaningful_text_length(content_raw)
+    has_non_yt_video = _has_embedded_video(content_raw)
+    is_video_only = (
+        _is_video_only_page(content_raw)
+        or (has_non_yt_video and meaningful_len < 800)   # 嵌入非 YT 视频 + 正文稀少
+        or meaningful_len < 200                           # 一般页面正文极少
+    )
+
+    if is_video_only:
+        logger.info(
+            f"[WebCollector] Video/wrapper page (meaningful={meaningful_len} chars)"
+            + (f", YouTube embed: {youtube_redirect}" if youtube_redirect else "")
+            + f": {url}"
+        )
+        content = ""
+    else:
+        content = _clean_content(content_raw, title)
 
     # ── 提取图片 URL（从 Jina markdown 的 ![...](url) 语法）────────────────
-    media_items = _extract_images(content_raw)
+    media_items = _extract_images(content_raw, source_url=url)
 
     # ── 外部 ID：URL hash ─────────────────────────────────────────────────
     import hashlib
@@ -115,19 +142,23 @@ def _parse_article(text: str, url: str) -> RawPostData:
     return RawPostData(
         source="web",
         external_id=external_id,
-        content=content or title,
+        content=content or title,   # title 作保底（至少有字）
         author_name=author_name,
         author_id=author_name,
         url=url,
         posted_at=posted_at,
-        metadata={"title": title, "source_url": url},
+        metadata={
+            "title": title,
+            "source_url": url,
+            "is_video_only": is_video_only,
+            "youtube_redirect": youtube_redirect,   # 非 None → 管道应改抓此 URL
+        },
         media_items=media_items,
     )
 
 
 def _extract_author(text: str, url: str) -> str:
     """从文章文本或 URL 提取作者/来源机构。"""
-    # 优先匹配"来源：XXX"
     for pattern in [
         r"来源[：:]\s*([^\n\r，,]+)",
         r"作者[：:]\s*([^\n\r，,]+)",
@@ -138,32 +169,127 @@ def _extract_author(text: str, url: str) -> str:
             name = m.group(1).strip()
             # 去除多余尾缀（如 " 分享到：" 等）
             name = re.split(r"\s{2,}|分享|【", name)[0].strip()
-            if name:
+            # 跳过：匹配到 URL（Jina 有时把原始链接放在 Source: 行）
+            if name and not name.startswith(("http://", "https://", "www.")):
                 return name
-    # 降级：使用域名
+    # 降级：使用域名（如 "doubleline"、"goldmansachs" 等）
     domain = urlparse(url).netloc
     return domain.replace("www.", "").split(".")[0]
 
 
-def _extract_images(raw: str) -> list[dict]:
-    """从 Jina markdown 中提取图片 URL，过滤掉图标/二维码等无意义小图。"""
+def _extract_images(raw: str, source_url: str = "") -> list[dict]:
+    """从 Jina markdown 中提取图片 URL，过滤掉图标/二维码/同源受限图片等。"""
+    from urllib.parse import urlparse as _urlparse
+    source_domain = _urlparse(source_url).netloc.lower().lstrip("www.") if source_url else ""
+
     urls = re.findall(r"!\[.*?\]\((https?://[^\s)]+)\)", raw)
     seen: set[str] = set()
     items: list[dict] = []
     skip_keywords = ("icon", "logo", "banner", "qrcode", "zxcode", "space.gif", "favicon")
     image_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+
+    # 已知需要认证、无法公开访问的研究/机构域名
+    _GATED_DOMAINS = (
+        "gspublishing.com", "gs.com",
+        "morganstanley.com", "msci.com",
+        "blackstone.com", "oaktreecapital.com",
+        "doubleline.com", "bridgewater.com",
+        "kkr.com", "apolloglobal.com",
+    )
+
     for url in urls:
         url_lower = url.lower()
+        img_domain = _urlparse(url).netloc.lower().lstrip("www.")
+
+        # 过滤：图标/装饰类
         if any(kw in url_lower for kw in skip_keywords):
             continue
-        # 过滤掉非图片扩展名（如 .html）
+        # 过滤：非图片扩展名
         if not any(url_lower.split("?")[0].endswith(ext) for ext in image_exts):
+            continue
+        # 过滤：与文章同源（需要认证的图片）
+        if source_domain and img_domain and (
+            img_domain == source_domain or img_domain.endswith("." + source_domain)
+        ):
+            continue
+        # 过滤：已知需要认证的机构域名
+        if any(img_domain == d or img_domain.endswith("." + d) for d in _GATED_DOMAINS):
             continue
         if url in seen:
             continue
         seen.add(url)
         items.append({"type": "photo", "url": url})
     return items
+
+
+# 视频播放器 UI 关键词（出现 ≥2 个即判定为纯视频播放器 UI 页）
+_VIDEO_UI_KEYWORDS = [
+    "Video Player is loading",
+    "Playback Rate",
+    "Play Video",
+    "Picture-in-Picture",
+    "Stream Type LIVE",
+    "Beginning of dialog window",
+]
+
+# YouTube 视频 URL 正则（embed / watch / shorts / youtu.be）
+_YOUTUBE_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:"
+    r"youtube\.com/(?:watch\?(?:.*&)?v=|embed/|shorts/)|"
+    r"youtu\.be/"
+    r")([\w\-]{11})"
+)
+
+
+def _extract_youtube_id(raw: str) -> str | None:
+    """从 Jina 内容中提取嵌入的 YouTube 视频 ID（返回第一个匹配）。"""
+    m = _YOUTUBE_URL_RE.search(raw)
+    return m.group(1) if m else None
+
+
+def _is_video_only_page(raw: str) -> bool:
+    """判断 Jina 抓取的页面是否为纯视频播放器（无文字正文）。"""
+    hits = sum(1 for kw in _VIDEO_UI_KEYWORDS if kw in raw)
+    return hits >= 2
+
+
+def _meaningful_text_length(content_raw: str) -> int:
+    """
+    估算页面中「真正文章正文」的字符数。
+    策略：把行内所有 [text](url) 去掉后再计字符，同时跳过导航/表单/页脚行。
+    只统计净文字 ≥ 60 字符的行（真正的段落），排除菜单项、标题链接等噪声。
+    """
+    _SKIP_RE = re.compile(
+        r"^\s*[\*\-]\s+\[.*?\]\(.*?\)\s*$"      # 带链接的 bullet（纯导航）
+        r"|^#{1,6}\s+\[.*?\]\(.*?\)\s*$"         # 标题链接（related articles）
+        r"|^\[.*?\]\(.*?\)\s*$"                  # 纯链接行
+        r"|Please fill out|Sign up for|Stay up-to-date"
+        r"|Email Address|First Name|Last Name|Job Title"
+        r"|Submit|Clear Results|Apply Filter|See Results"
+        r"|Footnote Title|Institutional quality|press inquiries"
+        r"|click here|For office|Individual investor",
+        re.IGNORECASE,
+    )
+    _LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")   # 去掉 [text](url) 中的 url 部分
+
+    total = 0
+    for line in content_raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _SKIP_RE.search(stripped):
+            continue
+        # 把 Markdown 链接替换为纯文字再计长度
+        text_only = _LINK_RE.sub(r"\1", stripped).strip()
+        # 只计入净文字 ≥ 60 字符的行
+        if len(text_only) >= 60:
+            total += len(text_only)
+    return total
+
+
+def _has_embedded_video(content_raw: str) -> bool:
+    """检测页面是否嵌入了非 YouTube 的视频（Brightcove、Vimeo 等）。"""
+    return bool(re.search(r"brightcove\.net|vimeo\.com/video/|wistia\.com", content_raw, re.IGNORECASE))
 
 
 def _clean_content(raw: str, title: str) -> str:

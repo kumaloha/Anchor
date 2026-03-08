@@ -1,0 +1,436 @@
+# Anchor 监控名单
+# 分为两类：顶级权威 (tier: 1) / 行业专家 (tier: 2)
+# source.accessible: true = 系统可直接抓取；false = 需人工获取或付费墙
+# ─────────────────────────────────────────────────────────────────────────────
+
+authors:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TIER 1 — 顶级权威
+  # 准入：手握货币权 / 行政权 / AUM > 1000 亿美元
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── 全球金融巨头 (Fund Titans) ────────────────────────────────────────────
+
+  - name: Larry Fink
+    institution: 贝莱德 (BlackRock) 创始人 / CEO
+    tier: 1
+    category: fund_titan
+    sources:
+      - platform: BlackRock 年度股东信
+        url: https://www.blackrock.com/corporate/investor-relations/larry-fink-annual-chairmans-letter
+        accessible: true
+      - platform: LinkedIn
+        url: https://www.linkedin.com/in/larry-fink-3b35b/
+        accessible: true
+
+  - name: Warren Buffett
+    institution: 伯克希尔·哈撒韦 (Berkshire Hathaway) 创始人 / CEO
+    tier: 1
+    category: fund_titan
+    sources:
+      - platform: 年度股东信 (每年 2 月)
+        url: https://www.berkshirehathaway.com/letters/letters.html
+        accessible: true
+
+  - name: Ray Dalio
+    institution: 桥水基金 (Bridgewater Associates) 创始人
+    tier: 1
+    category: fund_titan
+    sources:
+      - platform: LinkedIn Pulse
+        url: https://www.linkedin.com/today/author/raydalio
+        accessible: true
+      - platform: Twitter/X
+        url: https://x.com/RayDalio
+        accessible: true
+      - platform: Bridgewater 研究洞察 (机构付费)
+        url: https://www.bridgewater.com/research-and-insights/
+        accessible: false
+
+  - name: Steve Schwarzman
+    institution: 黑石集团 (Blackstone) 联合创始人 / CEO
+    tier: 1
+    category: fund_titan
+    sources:
+      - platform: Blackstone Insights
+        url: https://www.blackstone.com/insights/
+        accessible: true
+      - platform: LinkedIn
+        url: https://www.linkedin.com/in/steve-schwarzman/
+        accessible: true
+
+  - name: Salim Ramji
+    institution: 先锋领航 (Vanguard) CEO
+    tier: 1
+    category: fund_titan
+    sources:
+      - platform: Vanguard Insights
+        url: https://corporate.vanguard.com/content/corporatesite/us/en/corp/articles/index.html
+        accessible: true
+
+  - name: Ronald O'Hanley
+    institution: 道富集团 (State Street) 董事长 / CEO
+    tier: 1
+    category: fund_titan
+    sources:
+      - platform: State Street Global Advisors Insights
+        url: https://www.ssga.com/us/en/institutional/ic/insights
+        accessible: true
+
+  - name: Nir Bar Dea
+    institution: 桥水基金 (Bridgewater Associates) CEO
+    tier: 1
+    category: fund_titan
+    sources:
+      - platform: Bridgewater 官网
+        url: https://www.bridgewater.com/research-and-insights/
+        accessible: false
+      - platform: LinkedIn
+        url: https://www.linkedin.com/in/nirbd/
+        accessible: true
+
+  # ── 央行行长 & 多边组织首脑 (Central Bankers & IMF/BIS) ──────────────────
+
+  - name: Jerome Powell
+    institution: 美联储 (Federal Reserve) 主席
+    tier: 1
+    category: central_banker
+    sources:
+      - platform: Fed 演讲与证词
+        url: https://www.federalreserve.gov/newsevents/speeches-testimony.htm
+        accessible: true
+      - platform: FOMC 新闻发布会
+        url: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+        accessible: true
+
+  - name: Christine Lagarde
+    institution: 欧洲央行 (ECB) 行长
+    tier: 1
+    category: central_banker
+    sources:
+      - platform: ECB 演讲
+        url: https://www.ecb.europa.eu/press/key/html/index.en.html
+        accessible: true
+
+  - name: 潘功胜 (Pan Gongsheng)
+    institution: 中国人民银行 行长
+    tier: 1
+    category: central_banker
+    sources:
+      - platform: 央行官网行领导发言
+        url: http://www.pbc.gov.cn/goutongjiaoliu/113456/index.html
+        accessible: true
+
+  - name: 植田和男 (Kazuo Ueda)
+    institution: 日本银行 (BOJ) 总裁
+    tier: 1
+    category: central_banker
+    sources:
+      - platform: BOJ 演讲与声明
+        url: https://www.boj.or.jp/en/about/governor/index.htm
+        accessible: true
+
+  - name: Kristalina Georgieva
+    institution: 国际货币基金组织 (IMF) 总裁
+    tier: 1
+    category: central_banker
+    sources:
+      - platform: IMF Blog
+        url: https://www.imf.org/en/Blogs
+        accessible: true
+      - platform: IMF 演讲
+        url: https://www.imf.org/en/News/Articles
+        accessible: true
+
+  - name: Agustín Carstens
+    institution: 国际清算银行 (BIS) 总经理
+    tier: 1
+    category: central_banker
+    sources:
+      - platform: BIS 演讲
+        url: https://www.bis.org/speeches/index.htm
+        accessible: true
+
+  - name: Andrew Bailey
+    institution: 英国央行 (BOE) 行长
+    tier: 1
+    category: central_banker
+    sources:
+      - platform: BOE 演讲
+        url: https://www.bankofengland.co.uk/news/speeches
+        accessible: true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TIER 2 — 行业专家
+  # 准入：诺贝尔奖 / 顶级基金经理 / 首席经济学家 / 顶尖学术权威
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── 诺贝尔经济学奖得主 (Nobel Laureates) ─────────────────────────────────
+
+  - name: Philippe Aghion
+    institution: 法兰西公学院 教授 (2025 诺贝尔经济学奖得主，创造性破坏理论)
+    tier: 2
+    category: nobel_laureate
+    sources:
+      - platform: Project Syndicate
+        url: https://www.project-syndicate.org/columnist/philippe-aghion
+        accessible: true
+
+  - name: Daron Acemoglu
+    institution: MIT 经济学教授 (2024 诺贝尔经济学奖得主，制度与繁荣)
+    tier: 2
+    category: nobel_laureate
+    sources:
+      - platform: Project Syndicate
+        url: https://www.project-syndicate.org/columnist/daron-acemoglu
+        accessible: true
+      - platform: NBER Working Papers
+        url: https://www.nber.org/search?page=1&perPage=50&q=acemoglu
+        accessible: true
+
+  - name: Ben Bernanke
+    institution: 布鲁金斯学会 (Brookings) 高级研究员 / 前美联储主席 (2022 诺贝尔奖)
+    tier: 2
+    category: nobel_laureate
+    sources:
+      - platform: Brookings Institution
+        url: https://www.brookings.edu/experts/ben-s-bernanke/
+        accessible: true
+
+  - name: Paul Krugman
+    institution: 纽约城市大学 教授 / 前普林斯顿 (2008 诺贝尔奖)
+    tier: 2
+    category: nobel_laureate
+    sources:
+      - platform: Substack
+        url: https://paulkrugman.substack.com/
+        accessible: true
+      - platform: Project Syndicate
+        url: https://www.project-syndicate.org/columnist/paul-krugman
+        accessible: true
+
+  - name: Robert Shiller
+    institution: 耶鲁大学 经济学教授 (2013 诺贝尔奖，资产价格泡沫)
+    tier: 2
+    category: nobel_laureate
+    sources:
+      - platform: Project Syndicate
+        url: https://www.project-syndicate.org/columnist/robert-j-shiller
+        accessible: true
+
+  # ── 顶级宏观对冲基金经理 (Macro Fund Managers) ───────────────────────────
+
+  - name: Howard Marks
+    institution: Oaktree Capital Management 联合创始人 (AUM ~$190B)
+    tier: 2
+    category: hedge_fund
+    sources:
+      - platform: Oaktree Capital Memos
+        url: https://www.oaktreecapital.com/insights
+        accessible: true
+
+  - name: Bill Ackman
+    institution: Pershing Square Capital Management CEO
+    tier: 2
+    category: hedge_fund
+    sources:
+      - platform: Twitter/X
+        url: https://x.com/BillAckman
+        accessible: true
+      - platform: Pershing Square 股东信
+        url: https://www.pershingsquareholdings.com/company-information/letters-to-shareholders/
+        accessible: true
+
+  - name: Jeffrey Gundlach
+    institution: DoubleLine Capital CEO / CIO ("债券之王")
+    tier: 2
+    category: hedge_fund
+    sources:
+      - platform: DoubleLine 市场观点
+        url: https://doubleline.com/markets-insights/
+        accessible: true
+      - platform: DoubleLine 网络研讨会
+        url: https://doubleline.com/doubleline-webcasts/
+        accessible: true
+      - platform: Twitter/X
+        url: https://x.com/TruthGundlach
+        accessible: true
+
+  - name: Ken Griffin
+    institution: Citadel 创始人 / CEO
+    tier: 2
+    category: hedge_fund
+    sources:
+      - platform: Citadel Insights
+        url: https://www.citadel.com/insights/
+        accessible: true
+        note: 内容稀少，重点关注 Economic Club / Milken Institute 访谈
+
+  - name: George Soros
+    institution: 索罗斯基金管理 (Soros Fund Management) 创始人
+    tier: 2
+    category: hedge_fund
+    sources:
+      - platform: Project Syndicate
+        url: https://www.project-syndicate.org/columnist/george-soros
+        accessible: true
+      - platform: Open Society Foundations 文章
+        url: https://www.opensocietyfoundations.org/voices
+        accessible: true
+
+  - name: Bill Gross
+    institution: PIMCO 联合创始人 (已退休，"债券之王"原版)
+    tier: 2
+    category: hedge_fund
+    sources:
+      - platform: Twitter/X
+        url: https://x.com/Bill_Gross
+        accessible: true
+
+  # ── 顶级机构首席经济学家 (Chief Economists) ──────────────────────────────
+
+  - name: Jan Hatzius
+    institution: 高盛 (Goldman Sachs) 首席经济学家
+    tier: 2
+    category: chief_economist
+    sources:
+      - platform: Goldman Sachs Insights
+        url: https://www.goldmansachs.com/intelligence/
+        accessible: true
+
+  - name: Seth Carpenter
+    institution: 摩根士丹利 (Morgan Stanley) 首席经济学家
+    tier: 2
+    category: chief_economist
+    sources:
+      - platform: Morgan Stanley Thoughts on the Market (Podcast)
+        url: https://www.morganstanley.com/what-we-do/research/thoughts-on-the-market
+        accessible: true
+
+  - name: Pierre-Olivier Gourinchas
+    institution: IMF 首席经济学家
+    tier: 2
+    category: chief_economist
+    sources:
+      - platform: IMF World Economic Outlook (WEO)
+        url: https://www.imf.org/en/Publications/WEO
+        accessible: true
+      - platform: IMF Blog
+        url: https://www.imf.org/en/Blogs
+        accessible: true
+
+  - name: Mohamed El-Erian
+    institution: 剑桥皇后学院院长 / 安联 (Allianz) 首席经济顾问 / 前 PIMCO CEO
+    tier: 2
+    category: chief_economist
+    sources:
+      - platform: Bloomberg Opinion
+        url: https://www.bloomberg.com/opinion/authors/ABsGWFJr5sA/mohamed-a-elerian
+        accessible: false
+        note: Bloomberg 付费墙，可通过 Project Syndicate 获取部分文章
+      - platform: Project Syndicate
+        url: https://www.project-syndicate.org/columnist/mohamed-a-el-erian
+        accessible: true
+
+  - name: Larry Summers
+    institution: 哈佛大学 经济学教授 / 前美国财长
+    tier: 2
+    category: chief_economist
+    sources:
+      - platform: Twitter/X
+        url: https://x.com/LHSummers
+        accessible: true
+      - platform: Bloomberg Opinion
+        url: https://www.bloomberg.com/opinion/authors/AP3LSFKPFRA/lawrence-h-summers
+        accessible: false
+      - platform: Project Syndicate
+        url: https://www.project-syndicate.org/columnist/lawrence-h-summers
+        accessible: true
+
+  - name: Nouriel Roubini
+    institution: Atlas Capital Team CEO / 纽约大学教授 ("末日博士")
+    tier: 2
+    category: chief_economist
+    sources:
+      - platform: Project Syndicate
+        url: https://www.project-syndicate.org/columnist/nouriel-roubini
+        accessible: true
+      - platform: Substack
+        url: https://roubini.substack.com/
+        accessible: true
+
+  - name: Jeffrey Sachs
+    institution: 哥伦比亚大学地球研究所主任 / 联合国顾问
+    tier: 2
+    category: chief_economist
+    sources:
+      - platform: Project Syndicate
+        url: https://www.project-syndicate.org/columnist/jeffrey-d-sachs
+        accessible: true
+      - platform: Substack
+        url: https://jeffsachs.substack.com/
+        accessible: true
+
+  - name: Adam Posen
+    institution: 彼得森国际经济研究所 (PIIE) 主席
+    tier: 2
+    category: chief_economist
+    sources:
+      - platform: PIIE 评论
+        url: https://www.piie.com/experts/senior-research-staff/adam-s-posen
+        accessible: true
+
+  - name: Robin Brooks
+    institution: 布鲁金斯学会高级研究员 / 前高盛 FX 策略主管 / 前 IIF 首席经济学家
+    tier: 2
+    category: chief_economist
+    sources:
+      - platform: Substack
+        url: https://robinjbrooks.substack.com/
+        accessible: true
+      - platform: Twitter/X
+        url: https://x.com/robin_j_brooks
+        accessible: true
+
+  # ── 中文圈深度视角 (China Context) ──────────────────────────────────────
+
+  - name: 洪灝 (Hong Hao)
+    institution: 华富证券国际部 CEO / 前 GROW Investment Group 首席经济学家
+    tier: 2
+    category: china_analyst
+    sources:
+      - platform: Twitter/X
+        url: https://x.com/HAOHONG_CFA
+        accessible: true
+      - platform: Caixin Global Opinion
+        url: https://www.caixinglobal.com/hong-hao/
+        accessible: true
+
+  - name: 高善文 (Gao Shanwen)
+    institution: 安信证券首席经济学家
+    tier: 2
+    category: china_analyst
+    sources:
+      - platform: 安信证券研究报告 (通过媒体转载)
+        url: https://weibo.com/u/1728715190
+        accessible: true
+        note: 正式报告需券商渠道；演讲内容常由雪球/微博转载
+
+  - name: 陶冬 (Tao Dong)
+    institution: 前瑞信 (Credit Suisse) 亚洲区首席经济学家
+    tier: 2
+    category: china_analyst
+    sources:
+      - platform: 微博
+        url: https://weibo.com/1182426800
+        accessible: true
+
+  - name: 付鹏 (Fu Peng)
+    institution: 东北证券首席经济学家
+    tier: 2
+    category: china_analyst
+    sources:
+      - platform: YouTube「付鹏的财经世界」
+        url: https://www.youtube.com/@%E4%BB%98%E9%B9%8F%E7%9A%84%E8%B4%A2%E7%BB%8F%E4%B8%96%E7%95%8C
+        accessible: true

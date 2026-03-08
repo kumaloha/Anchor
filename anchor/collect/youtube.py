@@ -41,6 +41,64 @@ from anchor.collect.base import BaseCollector, RawPostData
 from anchor.config import settings
 
 
+def _extract_speaker_from_title(title: str) -> str | None:
+    """
+    从视频标题提取实际说话人姓名。
+    标题里的人名优先于频道名（频道可能只是内容载体，非说话人）。
+
+    支持常见模式：
+      "付鹏：xxx"        → 付鹏
+      "付鹏|xxx"         → 付鹏
+      "【付鹏】xxx"      → 付鹏
+      "专访付鹏 xxx"     → 付鹏
+      "xxx对谈付鹏"      → 付鹏
+      "xxx ft. 付鹏"     → 付鹏
+    """
+    if not title:
+        return None
+
+    # 模式1：姓名在最前，后接 ：| 分隔（含全/半角冒号、竖线）
+    m = re.match(r"^([^\s：:|\-【】]{2,6})[：:|\-]\s*\S", title)
+    if m:
+        candidate = m.group(1).strip()
+        if _looks_like_name(candidate):
+            return candidate
+
+    # 模式2：【姓名】
+    m = re.search(r"【([^】]{2,6})】", title)
+    if m:
+        candidate = m.group(1).strip()
+        if _looks_like_name(candidate):
+            return candidate
+
+    # 模式3：专访/对谈/访谈 + 姓名
+    m = re.search(r"(?:专访|对谈|访谈|采访|连线)\s*([^\s，,、。！？\-|:：]{2,6})", title)
+    if m:
+        candidate = m.group(1).strip()
+        if _looks_like_name(candidate):
+            return candidate
+
+    # 模式4：ft./with + 英文/中文名
+    m = re.search(r"\bft\.?\s+([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+){0,2})", title)
+    if m:
+        return m.group(1).strip()
+
+    return None
+
+
+def _looks_like_name(s: str) -> bool:
+    """粗判断是否像人名（中文 2-4 字，或英文 2 个词以上）。"""
+    if not s:
+        return False
+    # 纯英文：至少包含一个大写字母开头的词
+    if re.search(r"[A-Za-z]", s):
+        return bool(re.match(r"[A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)*$", s))
+    # 纯中文：2-4 个汉字
+    if re.fullmatch(r"[\u4e00-\u9fff]{2,4}", s):
+        return True
+    return False
+
+
 _YT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -86,9 +144,13 @@ class YouTubeCollector(BaseCollector):
         title, author_name, channel_id, duration_s = await self._fetch_metadata(
             video_id, client
         )
-        title       = title or video_id
-        author_name = author_name or "Unknown"
-        channel_id  = channel_id or video_id
+        title        = title or video_id
+        channel_name = author_name or "Unknown"
+        channel_id   = channel_id or video_id
+
+        # 从标题里提取实际说话人（标题里的名字优先于频道名）
+        speaker = _extract_speaker_from_title(title)
+        author_name = speaker if speaker else channel_name
 
         # ── Layer A: 字幕 ─────────────────────────────────────────────
         transcript, method = await self._fetch_subtitle(video_id)
@@ -125,6 +187,7 @@ class YouTubeCollector(BaseCollector):
             posted_at=datetime.now(timezone.utc).replace(tzinfo=None),
             metadata={
                 "title":             title,
+                "channel_name":      channel_name,
                 "channel_id":        channel_id,
                 "duration_s":        duration_s,
                 "transcript_method": method,
