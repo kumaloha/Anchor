@@ -1,1879 +1,1600 @@
-"""Anchor UI — 单文件 FastAPI Web 界面
-=====================================
-运行方式：python anchor_ui.py
-访问：http://localhost:8765
 """
+Anchor UI v5 — 政策与市场分析 Web 界面
+=======================================
+单文件 FastAPI 应用，支持政策模式和标准模式的结果查看与 DEBUG 调试。
 
-import os
-
-# 必须在 anchor 模块导入前设置 DB（与测试脚本使用不同文件）
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./anchor_ui.db")
+启动：
+    DATABASE_URL="sqlite+aiosqlite:///./anchor_v4_test.db" python anchor_ui.py
+"""
 
 import asyncio
 import json
-import sys
+import os
 import uuid
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import Any, Dict
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from sqlmodel import select
 
-sys.path.insert(0, os.path.dirname(__file__))
+os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./anchor_ui.db")
+
+from anchor.database.session import AsyncSessionLocal, create_tables
+from anchor.models import (
+    Assumption,
+    Conclusion,
+    EntityRelationship,
+    Fact,
+    ImplicitCondition,
+    Policy,
+    PolicyItem,
+    PolicyMeasure,
+    PolicyTheme,
+    Prediction,
+    RawPost,
+    Solution,
+)
+
+# ── App ────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Anchor UI v5")
+
+_static = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(_static):
+    app.mount("/static", StaticFiles(directory=_static), name="static")
 
 
-# ── 数据库初始化 ──────────────────────────────────────────────────────────────
-
-async def _init_db():
-    from anchor.database.session import create_tables, engine
-    from sqlalchemy import text
+@app.on_event("startup")
+async def _startup():
     await create_tables()
-    # 迁移：为已存在的数据库补充新字段（忽略"column already exists"错误）
-    async with engine.begin() as conn:
-        migrations = [
-            ("post_quality_assessments", "stance_label",    "TEXT"),
-            ("post_quality_assessments", "stance_note",     "TEXT"),
-            ("authors",                  "author_group_id", "INTEGER"),
-            ("raw_posts",               "is_duplicate",     "INTEGER DEFAULT 0"),
-            ("raw_posts",               "original_post_id", "INTEGER"),
-            # v2 新字段：facts
-            ("facts", "verifiable_statement", "TEXT"),
-            ("facts", "temporal_type",        "TEXT DEFAULT 'retrospective'"),
-            ("facts", "temporal_note",        "TEXT"),
-            ("facts", "alignment_result",     "TEXT"),
-            ("facts", "alignment_evidence",   "TEXT"),
-            ("facts", "alignment_tier",       "INTEGER"),
-            ("facts", "alignment_confidence", "TEXT"),
-            ("facts", "alignment_verified_at","TEXT"),
-            # v2 新字段：conclusions
-            ("conclusions", "verifiable_statement", "TEXT"),
-            ("conclusions", "temporal_type",        "TEXT DEFAULT 'retrospective'"),
-            ("conclusions", "temporal_note",        "TEXT"),
-            ("conclusions", "alignment_result",     "TEXT"),
-            ("conclusions", "alignment_evidence",   "TEXT"),
-            ("conclusions", "alignment_tier",       "INTEGER"),
-            ("conclusions", "alignment_confidence", "TEXT"),
-            ("conclusions", "alignment_verified_at","TEXT"),
-            # v2 新字段：implicit_conditions
-            ("implicit_conditions", "prediction_id",        "INTEGER"),
-            ("implicit_conditions", "verifiable_statement", "TEXT"),
-            ("implicit_conditions", "temporal_type",        "TEXT"),
-            ("implicit_conditions", "temporal_note",        "TEXT"),
-            ("implicit_conditions", "alignment_result",     "TEXT"),
-            ("implicit_conditions", "alignment_evidence",   "TEXT"),
-            ("implicit_conditions", "alignment_tier",       "INTEGER"),
-            ("implicit_conditions", "alignment_confidence", "TEXT"),
-            ("implicit_conditions", "alignment_verified_at","TEXT"),
-            ("implicit_conditions", "is_consensus",         "INTEGER DEFAULT 0"),
-            # v2 新字段：logics
-            ("logics", "prediction_id",              "INTEGER"),
-            ("logics", "source_prediction_ids",      "TEXT"),
-            ("logics", "assumption_ids",             "TEXT"),
-            ("logics", "layer2_implicit_condition_ids", "TEXT"),
-            ("logics", "chain_summary",              "TEXT"),
-            ("logics", "chain_type",                 "TEXT"),
-            ("logics", "logic_validity",             "TEXT"),
-            ("logics", "logic_issues",               "TEXT"),
-            ("logics", "logic_verified_at",          "TEXT"),
-            # v3 新字段
-            ("facts",       "alignment_vagueness",    "TEXT"),
-            ("conclusions", "is_core_conclusion",     "INTEGER DEFAULT 0"),
-            ("conclusions", "is_in_cycle",            "INTEGER DEFAULT 0"),
-            ("logics",      "condition_ids",          "TEXT"),
-            # v2.2 语义化判定标签
-            ("facts",        "fact_verdict",        "TEXT"),
-            ("facts",        "fact_source_tier",    "TEXT"),
-            ("conclusions",  "conclusion_verdict",  "TEXT"),
-            ("conclusions",  "prediction_verdict",  "TEXT"),
-            ("conditions",   "condition_verdict",   "TEXT"),
-        ]
-        for table, col, typedef in migrations:
-            try:
-                await conn.execute(text(
-                    f"ALTER TABLE {table} ADD COLUMN {col} {typedef}"
-                ))
-            except Exception:
-                pass  # 列已存在则忽略
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await _init_db()
-    yield
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _mode(post: RawPost) -> str:
+    return "policy" if (post.content_type or "") in {"政策宣布", "政策解读"} else "standard"
 
 
-app = FastAPI(lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")), name="static")
+# ── API: post list ─────────────────────────────────────────────────────────────
 
-# 存储任务队列 {task_id: asyncio.Queue}
-_tasks: dict[str, asyncio.Queue] = {}
+@app.get("/api/posts")
+async def api_posts():
+    async with AsyncSessionLocal() as s:
+        posts = list((await s.exec(select(RawPost).order_by(RawPost.id.desc()))).all())
+    return [
+        {
+            "id": p.id,
+            "author_name": p.author_name or "未知",
+            "source": p.source or "",
+            "posted_at": p.posted_at.isoformat() if p.posted_at else None,
+            "content_type": p.content_type or "",
+            "content_topic": p.content_topic or "",
+            "content_mode": _mode(p),
+            "is_processed": bool(p.is_processed),
+            "chain2_analyzed": bool(p.chain2_analyzed),
+        }
+        for p in posts
+    ]
 
 
-# ── HTTP 端点 ─────────────────────────────────────────────────────────────────
+# ── API: post detail ───────────────────────────────────────────────────────────
 
-class AnalyzeRequest(BaseModel):
-    url: str
+@app.get("/api/post/{post_id}")
+async def api_post_detail(post_id: int):
+    async with AsyncSessionLocal() as s:
+        post = (await s.exec(select(RawPost).where(RawPost.id == post_id))).first()
+        if not post:
+            return JSONResponse({"error": "not found"}, status_code=404)
 
-
-class ReprofileRequest(BaseModel):
-    author_id: int
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse(content=_HTML)
-
-
-@app.post("/reprofile")
-async def reprofile(req: ReprofileRequest):
-    """强制对某作者重新联网查询档案（修正 tier=5 或过时数据）。"""
-    from anchor.database.session import AsyncSessionLocal
-    from anchor.models import Author
-    from anchor.tracker.author_profiler import AuthorProfiler
-    async with AsyncSessionLocal() as session:
-        author = await session.get(Author, req.author_id)
-        if author is None:
-            raise HTTPException(status_code=404, detail="Author not found")
-        await AuthorProfiler().profile(author, session, force=True)
-        await session.commit()
-        return {
-            "ok": True,
-            "author_id": author.id,
-            "name": author.name,
-            "role": author.role,
-            "credibility_tier": author.credibility_tier,
-            "profile_note": author.profile_note,
+        mode = _mode(post)
+        # Fallback：若 content_type 未保存但 policies 表已有记录，仍作 policy 模式渲染
+        if mode != "policy":
+            pol_count = (await s.exec(
+                select(Policy).where(Policy.raw_post_id == post_id)
+            )).first()
+            if pol_count is not None:
+                mode = "policy"
+        result: Dict[str, Any] = {
+            "post": {
+                "id": post.id,
+                "url": post.url or "",
+                "author_name": post.author_name or "未知",
+                "source": post.source or "",
+                "posted_at": post.posted_at.isoformat() if post.posted_at else None,
+                "content": (post.content or "")[:3000],
+                "content_type": post.content_type or "",
+                "content_type_secondary": post.content_type_secondary or "",
+                "content_topic": post.content_topic or "",
+                "author_intent": post.author_intent or "",
+                "intent_note": post.intent_note or "",
+                "issuing_authority": post.issuing_authority or "",
+                "authority_level": post.authority_level or "",
+                "content_summary": post.content_summary or "",
+                "is_processed": bool(post.is_processed),
+                "chain2_analyzed": bool(post.chain2_analyzed),
+            },
+            "mode": mode,
         }
 
+        if mode == "policy":
+            # ── v3 新实体（policies + policy_measures）──
+            policies_v3 = list((await s.exec(
+                select(Policy).where(Policy.raw_post_id == post_id)
+            )).all())
+            measures_all = list((await s.exec(
+                select(PolicyMeasure).where(PolicyMeasure.raw_post_id == post_id)
+            )).all())
+            by_policy: Dict[int, list] = {}
+            for m in measures_all:
+                by_policy.setdefault(m.policy_id, []).append(m)
 
-@app.post("/analyze")
-async def analyze(req: AnalyzeRequest):
+            if policies_v3:
+                result["policies"] = [
+                    {
+                        "id": p.id,
+                        "theme": p.theme,
+                        "change_summary": p.change_summary or "",
+                        "target": p.target or "",
+                        "target_prev": p.target_prev or "",
+                        "intensity": p.intensity or "",
+                        "intensity_prev": p.intensity_prev or "",
+                        "intensity_note": p.intensity_note or "",
+                        "intensity_note_prev": p.intensity_note_prev or "",
+                        "background": p.background or "",
+                        "background_prev": p.background_prev or "",
+                        "organization": p.organization or "",
+                        "organization_prev": p.organization_prev or "",
+                        "measures": [
+                            {
+                                "id": m.id,
+                                "summary": m.summary,
+                                "measure_text": m.measure_text,
+                                "trend": m.trend or "",
+                                "trend_note": m.trend_note or "",
+                            }
+                            for m in by_policy.get(p.id, [])
+                        ],
+                    }
+                    for p in policies_v3
+                ]
+
+            # ── v2 旧实体（themes + items，旧数据兼容）──
+            themes = list((await s.exec(
+                select(PolicyTheme).where(PolicyTheme.raw_post_id == post_id)
+            )).all())
+            items_all = list((await s.exec(
+                select(PolicyItem).where(PolicyItem.raw_post_id == post_id)
+            )).all())
+            by_theme: Dict[int, list] = {}
+            for it in items_all:
+                by_theme.setdefault(it.policy_theme_id, []).append(it)
+
+            result["themes"] = [
+                {
+                    "id": t.id,
+                    "theme_name": t.theme_name,
+                    "background": t.background or "",
+                    "enforcement_note": t.enforcement_note or "",
+                    "has_enforcement_teeth": bool(t.has_enforcement_teeth),
+                    "items": [
+                        {
+                            "id": it.id,
+                            "summary": it.summary or "",
+                            "policy_text": it.policy_text or "",
+                            "urgency": it.urgency or "",
+                            "is_hard_target": bool(it.is_hard_target),
+                            "metric_value": it.metric_value or "",
+                            "target_year": it.target_year or "",
+                            "change_type": it.change_type or "",
+                            "change_note": it.change_note or "",
+                            "execution_status": it.execution_status or "",
+                            "execution_note": it.execution_note or "",
+                        }
+                        for it in by_theme.get(t.id, [])
+                    ],
+                }
+                for t in themes
+            ]
+
+            facts = list((await s.exec(select(Fact).where(Fact.raw_post_id == post_id))).all())
+            result["facts"] = [
+                {
+                    "id": f.id,
+                    "summary": f.summary or "",
+                    "claim": f.claim or "",
+                    "fact_verdict": f.fact_verdict or "",
+                    "verdict_evidence": f.verdict_evidence or "",
+                }
+                for f in facts
+            ]
+
+            concs = list((await s.exec(
+                select(Conclusion).where(Conclusion.raw_post_id == post_id)
+            )).all())
+            result["conclusions"] = [
+                {
+                    "id": c.id,
+                    "summary": c.summary or "",
+                    "claim": c.claim or "",
+                    "conclusion_verdict": c.conclusion_verdict or "",
+                    "is_core_conclusion": bool(c.is_core_conclusion),
+                    "is_in_cycle": bool(c.is_in_cycle),
+                    "author_confidence": c.author_confidence or "",
+                }
+                for c in concs
+            ]
+
+        else:  # standard
+            facts = list((await s.exec(select(Fact).where(Fact.raw_post_id == post_id))).all())
+            result["facts"] = [
+                {
+                    "id": f.id,
+                    "summary": f.summary or "",
+                    "claim": f.claim or "",
+                    "fact_verdict": f.fact_verdict or "",
+                    "verdict_evidence": f.verdict_evidence or "",
+                }
+                for f in facts
+            ]
+
+            assumptions = list((await s.exec(
+                select(Assumption).where(Assumption.raw_post_id == post_id)
+            )).all())
+            result["assumptions"] = [
+                {
+                    "id": a.id,
+                    "summary": a.summary or "",
+                    "condition_text": a.condition_text or "",
+                    "assumption_verdict": a.assumption_verdict or "",
+                    "verdict_evidence": a.verdict_evidence or "",
+                }
+                for a in assumptions
+            ]
+
+            implicits = list((await s.exec(
+                select(ImplicitCondition).where(ImplicitCondition.raw_post_id == post_id)
+            )).all())
+            result["implicit_conditions"] = [
+                {
+                    "id": ic.id,
+                    "summary": ic.summary or "",
+                    "condition_text": ic.condition_text or "",
+                    "implicit_verdict": ic.implicit_verdict or "",
+                    "verdict_evidence": ic.verdict_evidence or "",
+                }
+                for ic in implicits
+            ]
+
+            concs = list((await s.exec(
+                select(Conclusion).where(Conclusion.raw_post_id == post_id)
+            )).all())
+            result["conclusions"] = [
+                {
+                    "id": c.id,
+                    "summary": c.summary or "",
+                    "claim": c.claim or "",
+                    "conclusion_verdict": c.conclusion_verdict or "",
+                    "is_core_conclusion": bool(c.is_core_conclusion),
+                    "is_in_cycle": bool(c.is_in_cycle),
+                    "author_confidence": c.author_confidence or "",
+                }
+                for c in concs
+            ]
+
+            preds = list((await s.exec(
+                select(Prediction).where(Prediction.raw_post_id == post_id)
+            )).all())
+            result["predictions"] = [
+                {
+                    "id": p.id,
+                    "summary": p.summary or "",
+                    "claim": p.claim or "",
+                    "prediction_verdict": p.prediction_verdict or "",
+                    "temporal_validity": p.temporal_validity or "",
+                    "temporal_note": p.temporal_note or "",
+                }
+                for p in preds
+            ]
+
+            sols = list((await s.exec(
+                select(Solution).where(Solution.raw_post_id == post_id)
+            )).all())
+            result["solutions"] = [
+                {
+                    "id": s.id,
+                    "summary": s.summary or "",
+                    "claim": s.claim or "",
+                    "action_type": s.action_type or "",
+                    "action_target": s.action_target or "",
+                }
+                for s in sols
+            ]
+
+            edges = list((await s.exec(
+                select(EntityRelationship).where(EntityRelationship.raw_post_id == post_id)
+            )).all())
+            result["edges"] = [
+                {
+                    "source_type": e.source_type,
+                    "source_id": e.source_id,
+                    "target_type": e.target_type,
+                    "target_id": e.target_id,
+                    "edge_type": e.edge_type,
+                }
+                for e in edges
+            ]
+
+    return result
+
+
+# ── Analyze pipeline ───────────────────────────────────────────────────────────
+
+_tasks: Dict[str, asyncio.Queue] = {}
+
+
+@app.post("/api/analyze")
+async def api_analyze(req: Request):
+    body = await req.json()
+    url = (body.get("url") or "").strip()
+    if not url:
+        return JSONResponse({"error": "url required"}, status_code=400)
     task_id = str(uuid.uuid4())
-    queue: asyncio.Queue = asyncio.Queue()
-    _tasks[task_id] = queue
-    asyncio.create_task(_run_pipeline(req.url, queue))
+    q: asyncio.Queue = asyncio.Queue()
+    _tasks[task_id] = q
+    asyncio.create_task(_run_pipeline(url, q))
     return {"task_id": task_id}
 
 
-@app.get("/stream/{task_id}")
-async def stream(task_id: str):
-    queue = _tasks.get(task_id)
-    if queue is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    async def generator() -> AsyncGenerator[str, None]:
-        while True:
-            event = await queue.get()
-            yield f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
-            if event.get("type") in ("done", "error"):
-                _tasks.pop(task_id, None)
-                break
-
-    return StreamingResponse(
-        generator(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-# ── Pipeline ──────────────────────────────────────────────────────────────────
-
-async def _emit(q: asyncio.Queue, event: dict):
-    await q.put(event)
+async def _emit(q: asyncio.Queue, event: str, data: Any):
+    await q.put({"event": event, "data": data})
 
 
 async def _run_pipeline(url: str, q: asyncio.Queue):
     try:
-        from anchor.database.session import AsyncSessionLocal
-        from anchor.collector.input_handler import parse_url, process_url
-        from anchor.classifier.extractor import Extractor
-        from anchor.tracker.author_profiler import AuthorProfiler
-        from anchor.tracker.author_stats_updater import AuthorStatsUpdater
-        from anchor.tracker.logic_verifier import LogicVerifier
-        from anchor.tracker.reality_aligner import RealityAligner
-        from anchor.tracker.post_quality_evaluator import PostQualityEvaluator
-        from anchor.tracker.role_evaluator import RoleEvaluator
+        from anchor.chains.chain2_author import run_chain2
+        from anchor.collect.input_handler import process_url
+        from anchor.extract.extractor import Extractor
 
-        from anchor.tracker.verdict_deriver import VerdictDeriver
-        from anchor.models import (
-            Author, AuthorGroup, AuthorStats, AuthorStanceProfile,
-            Condition, Conclusion, ConclusionVerdict, Fact, FactEvaluation,
-            Logic, MonitoredSource, PostQualityAssessment,
-            RawPost, Solution, SolutionAssessment,
-            Topic, VerificationReference,
-        )
-        from sqlmodel import select
+        extractor = Extractor()
 
-        # ── Layer 1：采集 ──────────────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 1, "label": "Layer 1 — 采集内容"})
-
-        async with AsyncSessionLocal() as session:
-            result = await process_url(url, session)
-
-        src = result.monitored_source
-        auth = result.author
-
-        _parsed = parse_url(url)
-        async with AsyncSessionLocal() as session:
-            rp_row = (await session.exec(
-                select(RawPost).where(
-                    RawPost.source == _parsed.platform,
-                    RawPost.external_id == _parsed.platform_id,
-                )
-            )).first()
-            if not rp_row:
-                rp_row = (await session.exec(
-                    select(RawPost).where(RawPost.source == _parsed.platform)
-                    .order_by(RawPost.id.desc())
-                )).first()
-
-        if not rp_row:
-            await _emit(q, {"type": "error", "message": "采集失败：未找到 RawPost，请检查 URL 格式"})
+        await _emit(q, "step", {"num": 1, "label": "采集内容"})
+        async with AsyncSessionLocal() as s:
+            result = await process_url(url, s)
+        if not result or not result.raw_posts:
+            await _emit(q, "error", "采集失败，未生成帖子")
             return
+        rp = result.raw_posts[0]
+        await _emit(q, "step_done", {"num": 1, "detail": f"post_id={rp.id}"})
 
-        raw_post_id = rp_row.id
-        author_id = auth.id
-        post_url = rp_row.url
+        await _emit(q, "step", {"num": 2, "label": "Chain 2 — 内容分类 + 立场分析"})
+        async with AsyncSessionLocal() as s:
+            pre = await run_chain2(rp.id, s)  # Steps 1+2+3（含立场聚合），内部自动 commit
+        ct = pre.get("content_type", "")
+        content_mode = "policy" if ct in {"政策宣布", "政策解读"} else "standard"
+        await _emit(q, "step_done", {"num": 2, "detail": f"{ct} / {pre.get('author_intent', '')} / 立场={pre.get('stance_label', '—')}"})
 
-        await _emit(q, {
-            "type": "step_done", "num": 1,
-            "detail": f"采集成功：{rp_row.author_name} | {rp_row.url}",
-        })
+        await _emit(q, "step", {"num": 3, "label": "Chain 1 — 实体提取"})
+        async with AsyncSessionLocal() as s:
+            rp3 = (await s.exec(select(RawPost).where(RawPost.id == rp.id))).first()
+            await extractor.extract(rp3, s, content_mode=content_mode,
+                                    author_intent=pre.get("author_intent"))
+        await _emit(q, "step_done", {"num": 3, "detail": "提取完成"})
 
-        # ── Layer 2：观点提取 ──────────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 2, "label": "Layer 2 — 观点提取"})
+        from anchor.config import settings as _settings
+        if content_mode != "policy" and _settings.enable_chain3:
+            # 政策模式：同比对比已内嵌于 Chain 1，Chain 3 暂缓
+            # enable_chain3=False（默认）可在调试时跳过验证
+            await _emit(q, "step", {"num": 4, "label": "Chain 3 — 实体验证"})
+            from anchor.chains.chain3_verifier import run_chain3
+            async with AsyncSessionLocal() as s:
+                await run_chain3(rp.id, s)
+            await _emit(q, "step_done", {"num": 4, "detail": "验证完成"})
 
-        async with AsyncSessionLocal() as session:
-            rp = await session.get(RawPost, raw_post_id)
-            extractor = Extractor()
-            extraction = await extractor.extract(rp, session)
+        # ── Notion 同步 ──────────────────────────────────────────────────────
+        try:
+            from anchor.notion_sync import sync_post_to_notion
+            async with AsyncSessionLocal() as s:
+                notion_url = await sync_post_to_notion(rp.id, s)
+            if notion_url:
+                await _emit(q, "step_done", {"num": 5, "label": "Notion 同步", "detail": notion_url})
+        except Exception as _ne:
+            import logging
+            logging.getLogger(__name__).warning("notion_sync error: %s", _ne)
 
-        if extraction and not extraction.is_relevant_content:
-            await _emit(q, {"type": "error", "message": f"内容不相关，跳过：{extraction.skip_reason}"})
-            return
+        detail = await api_post_detail(rp.id)
+        await _emit(q, "done", detail)
 
-        async with AsyncSessionLocal() as session:
-            facts = list((await session.exec(
-                select(Fact).where(Fact.raw_post_id == raw_post_id)
-            )).all())
-            conditions = list((await session.exec(
-                select(Condition).where(Condition.raw_post_id == raw_post_id)
-            )).all())
-            concls = list((await session.exec(
-                select(Conclusion).where(Conclusion.source_url == post_url)
-            )).all())
-            sols = list((await session.exec(
-                select(Solution).where(Solution.source_url == post_url)
-            )).all())
-            conc_ids = [c.id for c in concls]
-            sol_ids = [s.id for s in sols]
-            fact_ids = [f.id for f in facts]
-            cond_ids = [c.id for c in conditions]
-            all_logics = list((await session.exec(select(Logic))).all())
-            logics = [
-                l for l in all_logics
-                if (l.logic_type == "inference" and l.conclusion_id in conc_ids)
-                or (l.logic_type == "derivation" and l.solution_id in sol_ids)
-            ]
-
-        await _emit(q, {
-            "type": "step_done", "num": 2,
-            "detail": (
-                f"提取：{len(facts)} 事实，{len(conditions)} 条件，"
-                f"{len(concls)} 结论，{len(sols)} 解决方案"
-            ),
-        })
-
-        # ── Step 0：作者档案 ───────────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 3, "label": "Step 0 — 作者档案分析"})
-
-        author_profiler = AuthorProfiler()
-        async with AsyncSessionLocal() as session:
-            a = await session.get(Author, author_id)
-            await author_profiler.profile(a, session)
-            await session.commit()
-            tier = a.credibility_tier or "?"
-
-        await _emit(q, {"type": "step_done", "num": 3, "detail": f"作者：{a.name}，Tier{tier}"})
-
-        # ── Step 1：逻辑验证（LogicVerifier）──────────────────────────────
-        await _emit(q, {"type": "step", "num": 4, "label": f"Step 1 — 逻辑链验证（{len(logics)} 条）"})
-
-        logic_verifier = LogicVerifier()
-        async with AsyncSessionLocal() as session:
-            for logic in logics:
-                l = await session.get(Logic, logic.id)
-                if l:
-                    await logic_verifier.verify(l, session)
-            await session.commit()
-
-        await _emit(q, {"type": "step_done", "num": 4, "detail": "逻辑链验证完成"})
-
-        # ── Step 2：现实对齐（RealityAligner）────────────────────────────
-        n_align = len(facts) + len(concls)
-        await _emit(q, {"type": "step", "num": 5, "label": f"Step 2 — 现实对齐（{n_align} 个实体）"})
-
-        aligner = RealityAligner()
-        async with AsyncSessionLocal() as session:
-            for fact in facts:
-                f = await session.get(Fact, fact.id)
-                if f:
-                    await aligner.align_fact(f, session)
-            for conc in concls:
-                c = await session.get(Conclusion, conc.id)
-                if c:
-                    await aligner.align_conclusion(c, session)
-            for cond in conditions:
-                cond_obj = await session.get(Condition, cond.id)
-                if cond_obj:
-                    await aligner.align_condition(cond_obj, session)
-            await session.commit()
-
-        await _emit(q, {"type": "step_done", "num": 5, "detail": "现实对齐完成"})
-
-        # ── Step 3：预测型结论监控配置 ──────────────────────────────────
-        from anchor.tracker.conclusion_monitor import ConclusionMonitor
-        predictive_concls = [c for c in concls if c.conclusion_type == "predictive"]
-        await _emit(q, {"type": "step", "num": 6, "label": f"Step 3 — 预测型结论监控配置（{len(predictive_concls)} 条）"})
-
-        conc_monitor = ConclusionMonitor()
-        if predictive_concls:
-            async with AsyncSessionLocal() as session:
-                for pc in predictive_concls:
-                    c = await session.get(Conclusion, pc.id)
-                    if c:
-                        await conc_monitor.setup(c, session)
-                await session.commit()
-
-        await _emit(q, {
-            "type": "step_done", "num": 6,
-            "detail": f"配置 {len(predictive_concls)} 个预测型结论监控",
-        })
-
-        # ── Step 4：裁定推导（VerdictDeriver）────────────────────────────
-        await _emit(q, {"type": "step", "num": 7, "label": "Step 4 — 裁定推导"})
-
-        deriver = VerdictDeriver()
-        async with AsyncSessionLocal() as session:
-            for conc in concls:
-                c = await session.get(Conclusion, conc.id)
-                if c:
-                    await deriver.derive_conclusion(c, session)
-            await session.commit()
-
-        await _emit(q, {"type": "step_done", "num": 7, "detail": "裁定完成"})
-
-        # ── Step 5：角色匹配评估 ──────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 8, "label": "Step 5 — 角色匹配评估"})
-
-        role_evaluator = RoleEvaluator()
-        async with AsyncSessionLocal() as session:
-            a = await session.get(Author, author_id)
-            all_verdicts = list((await session.exec(
-                select(ConclusionVerdict).where(ConclusionVerdict.conclusion_id.in_(conc_ids))
-            )).all()) if conc_ids else []
-            all_assessments = list((await session.exec(
-                select(SolutionAssessment).where(SolutionAssessment.solution_id.in_(sol_ids))
-            )).all()) if sol_ids else []
-            for verdict in all_verdicts:
-                c = await session.get(Conclusion, verdict.conclusion_id)
-                if c:
-                    await role_evaluator.evaluate_conclusion_verdict(verdict, c, a, session)
-            for assessment in all_assessments:
-                s = await session.get(Solution, assessment.solution_id)
-                if s:
-                    await role_evaluator.evaluate_solution_assessment(assessment, s, a, session)
-            await session.commit()
-
-        await _emit(q, {"type": "step_done", "num": 8, "detail": "角色匹配评估完成"})
-
-        # ── Step 6：内容质量评估 ──────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 9, "label": "Step 6 — 内容质量评估"})
-
-        post_quality_evaluator = PostQualityEvaluator()
-        async with AsyncSessionLocal() as session:
-            rp = await session.get(RawPost, raw_post_id)
-            a = await session.get(Author, author_id)
-            await post_quality_evaluator.assess(rp, a, session)
-            await session.commit()
-
-        await _emit(q, {"type": "step_done", "num": 9, "detail": "内容质量评估完成"})
-
-        # ── Step 7：作者统计更新 ──────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 10, "label": "Step 7 — 作者综合统计更新"})
-
-        author_stats_updater = AuthorStatsUpdater()
-        async with AsyncSessionLocal() as session:
-            a = await session.get(Author, author_id)
-            await author_stats_updater.update(a, session)
-            await session.commit()
-
-        await _emit(q, {"type": "step_done", "num": 10, "detail": "统计更新完成"})
-
-        # ── 汇总结果 ──────────────────────────────────────────────────────
-        await _emit(q, {"type": "step", "num": 11, "label": "汇总结果"})
-        data = await _collect_results(raw_post_id, author_id, post_url)
-        await _emit(q, {"type": "done", "data": data})
-
-    except Exception as exc:
+    except Exception as e:
         import traceback
-        tb = traceback.format_exc()
-        await _emit(q, {"type": "error", "message": f"{exc}\n\n{tb}"})
+        await _emit(q, "error", f"{type(e).__name__}: {e}\n{traceback.format_exc()[-500:]}")
 
 
-# ── 结果收集 ──────────────────────────────────────────────────────────────────
+@app.get("/stream/{task_id}")
+async def stream(task_id: str):
+    q = _tasks.get(task_id)
+    if not q:
+        return JSONResponse({"error": "task not found"}, status_code=404)
 
-async def _collect_results(raw_post_id: int, author_id: int, post_url: str) -> dict:
-    """从数据库收集所有结果，构建结构化输出。只取本次分析的数据。"""
-    from anchor.database.session import AsyncSessionLocal
-    from anchor.models import (
-        Author, AuthorGroup, AuthorStats, AuthorStanceProfile,
-        Condition, Conclusion, ConclusionVerdict, Fact, FactEvaluation,
-        Logic, PostQualityAssessment,
-        RawPost, Solution, SolutionAssessment, VerificationReference,
-    )
-    from sqlmodel import select
+    async def generator():
+        while True:
+            msg = await q.get()
+            event = msg["event"]
+            data = json.dumps(msg["data"], ensure_ascii=False)
+            yield f"event: {event}\ndata: {data}\n\n"
+            if event in ("done", "error"):
+                _tasks.pop(task_id, None)
+                break
 
-    async with AsyncSessionLocal() as session:
-        rp = await session.get(RawPost, raw_post_id)
-        author = await session.get(Author, author_id)
-
-        # ── Facts ────────────────────────────────────────────────────────
-        all_facts = list((await session.exec(
-            select(Fact).where(Fact.raw_post_id == raw_post_id)
-        )).all())
-        fact_ids = [f.id for f in all_facts]
-
-        fact_evals: dict[int, FactEvaluation] = {}
-        if fact_ids:
-            for fe in (await session.exec(
-                select(FactEvaluation).where(FactEvaluation.fact_id.in_(fact_ids))
-            )).all():
-                fact_evals[fe.fact_id] = fe
-
-        facts_out = []
-        for f in all_facts:
-            fe = fact_evals.get(f.id)
-            refs = list((await session.exec(
-                select(VerificationReference).where(VerificationReference.fact_id == f.id)
-            )).all())
-            facts_out.append({
-                "id": f.id,
-                "claim": f.claim,
-                "canonical_claim": f.canonical_claim,
-                "verifiable_statement": f.verifiable_statement,
-                "verifiable_expression": f.verifiable_expression,
-                "is_verifiable": f.is_verifiable,
-                "fact_verdict": f.fact_verdict,
-                "fact_source_tier": f.fact_source_tier,
-                "alignment_evidence": f.alignment_evidence,
-                "alignment_tier": f.alignment_tier,
-                "temporal_type": f.temporal_type,
-                "temporal_note": f.temporal_note,
-                "refs": [
-                    {"org": r.organization, "desc": r.data_description, "url": r.url}
-                    for r in refs
-                ],
-            })
-
-        fact_map = {f["id"]: f for f in facts_out}
-
-        # ── Conditions ────────────────────────────────────────────────────
-        all_conds = list((await session.exec(
-            select(Condition).where(Condition.raw_post_id == raw_post_id)
-        )).all())
-        cond_ids = [c.id for c in all_conds]
-
-        conditions_out = []
-        for cond in all_conds:
-            conditions_out.append({
-                "id": cond.id,
-                "condition_type": cond.condition_type,
-                "condition_text": cond.condition_text,
-                "verifiable_statement": cond.verifiable_statement,
-                "temporal_note": cond.temporal_note,
-                "is_consensus": cond.is_consensus,
-                "is_verifiable": cond.is_verifiable,
-                "condition_verdict": cond.condition_verdict,
-                "alignment_evidence": cond.alignment_evidence,
-            })
-
-        # ── Conclusions & Solutions ───────────────────────────────────────
-        all_concls = list((await session.exec(
-            select(Conclusion).where(Conclusion.source_url == post_url)
-        )).all())
-        conc_ids = [c.id for c in all_concls]
-
-        all_sols = list((await session.exec(
-            select(Solution).where(Solution.source_url == post_url)
-        )).all())
-        sol_ids = [s.id for s in all_sols]
-
-        # Logics for this analysis
-        all_logics = list((await session.exec(select(Logic))).all())
-        our_logics = [
-            l for l in all_logics
-            if (l.logic_type == "inference" and l.conclusion_id in conc_ids)
-            or (l.logic_type == "derivation" and l.solution_id in sol_ids)
-        ]
-
-        # conclusion_id → logic info
-        conc_logic_map: dict[int, dict] = {}
-        # solution_id → source_conclusion_ids
-        sol_source_map: dict[int, list[int]] = {}
-        for l in our_logics:
-            if l.logic_type == "inference" and l.conclusion_id:
-                conc_logic_map[l.conclusion_id] = {
-                    "supporting": json.loads(l.supporting_fact_ids or "[]"),
-                    "conditions": json.loads(l.condition_ids or "[]"),
-                    "sup_concs": json.loads(l.supporting_conclusion_ids or "[]"),
-                    "chain_summary": l.chain_summary,
-                    "logic_validity": l.logic_validity,
-                    "logic_note": l.logic_note,
-                }
-            elif l.logic_type == "derivation" and l.solution_id:
-                sol_source_map[l.solution_id] = json.loads(l.source_conclusion_ids or "[]")
-
-        # Solution assessments
-        sol_assessments: dict[int, SolutionAssessment] = {}
-        if sol_ids:
-            for sa in (await session.exec(
-                select(SolutionAssessment).where(SolutionAssessment.solution_id.in_(sol_ids))
-            )).all():
-                sol_assessments[sa.solution_id] = sa
-
-        # Build solution data list, grouped by source conclusion
-        conc_solutions: dict[int, list] = {}
-        for sol in all_sols:
-            sa = sol_assessments.get(sol.id)
-            sol_data = {
-                "id": sol.id,
-                "claim": sol.claim,
-                "action_type": sol.action_type,
-                "action_target": sol.action_target,
-                "action_rationale": sol.action_rationale,
-                "verdict": str(sa.verdict) if sa else None,
-                "evidence_text": sa.evidence_text if sa else None,
-                "role_fit": sa.role_fit if sa else None,
-                "role_fit_note": sa.role_fit_note if sa else None,
-                "baseline_value": sol.baseline_value,
-                "baseline_metric": sol.baseline_metric,
-                "baseline_recorded_at": str(sol.baseline_recorded_at) if sol.baseline_recorded_at else None,
-                "monitoring_period_note": sol.monitoring_period_note,
-            }
-            for cid in sol_source_map.get(sol.id, []):
-                conc_solutions.setdefault(cid, []).append(sol_data)
-
-        # Conclusion verdicts
-        verdict_map: dict[int, ConclusionVerdict] = {}
-        if conc_ids:
-            for cv in (await session.exec(
-                select(ConclusionVerdict).where(ConclusionVerdict.conclusion_id.in_(conc_ids))
-            )).all():
-                verdict_map[cv.conclusion_id] = cv
-
-        # Build conclusion data list
-        concls_out = []
-        for c in all_concls:
-            logic_info = conc_logic_map.get(c.id, {})
-            supporting_fact_ids = logic_info.get("supporting", [])
-            assumption_fact_ids = logic_info.get("assumptions", [])
-            cv = verdict_map.get(c.id)
-
-            supporting_facts = []
-            for fid in supporting_fact_ids:
-                fd = fact_map.get(fid)
-                if fd:
-                    supporting_facts.append({"role": "supporting", **fd})
-            for fid in assumption_fact_ids:
-                fd = fact_map.get(fid)
-                if fd:
-                    supporting_facts.append({"role": "assumption", **fd})
-
-            logic_trace_parsed = None
-            if cv and cv.logic_trace:
-                try:
-                    logic_trace_parsed = json.loads(cv.logic_trace)
-                except Exception:
-                    pass
-
-            concls_out.append({
-                "id": c.id,
-                "claim": c.claim,
-                "canonical_claim": c.canonical_claim,
-                "verifiable_statement": c.verifiable_statement,
-                "conclusion_type": c.conclusion_type,
-                "temporal_note": c.temporal_note,
-                "time_horizon_note": c.time_horizon_note,
-                "is_core_conclusion": c.is_core_conclusion,
-                "is_in_cycle": c.is_in_cycle,
-                "author_confidence": c.author_confidence,
-                "author_confidence_note": c.author_confidence_note,
-                "status": str(c.status),
-                "verdict": str(cv.verdict) if cv else None,
-                "conclusion_verdict": c.conclusion_verdict,
-                "prediction_verdict": c.prediction_verdict,
-                "logic_trace": logic_trace_parsed,
-                "role_fit": cv.role_fit if cv else None,
-                "role_fit_note": cv.role_fit_note if cv else None,
-                "chain_summary": logic_info.get("chain_summary"),
-                "logic_validity": logic_info.get("logic_validity"),
-                "logic_note": logic_info.get("logic_note"),
-                "alignment_evidence": c.alignment_evidence,
-                "supporting_facts": supporting_facts,
-                "supporting_conclusion_ids": logic_info.get("sup_concs", []),
-                "supporting_condition_ids": logic_info.get("conditions", []),
-                "solutions": conc_solutions.get(c.id, []),
-            })
-
-        # Author stats
-        stats_r = await session.exec(
-            select(AuthorStats).where(AuthorStats.author_id == author_id)
-        )
-        stats = stats_r.first()
-
-        # Post quality
-        pqa_r = await session.exec(
-            select(PostQualityAssessment).where(
-                PostQualityAssessment.raw_post_id == raw_post_id
-            )
-        )
-        pqa = pqa_r.first()
-
-        def _noise_types(p):
-            if not p or not p.noise_types:
-                return []
-            try:
-                return json.loads(p.noise_types)
-            except Exception:
-                return []
-
-        # Author group info
-        author_group_data = None
-        author_group_members = []
-        if author.author_group_id:
-            ag = await session.get(AuthorGroup, author.author_group_id)
-            if ag:
-                author_group_data = {
-                    "id": ag.id,
-                    "canonical_name": ag.canonical_name,
-                    "canonical_role": ag.canonical_role,
-                }
-                other_r = await session.exec(
-                    select(Author).where(
-                        Author.author_group_id == author.author_group_id,
-                        Author.id != author.id,
-                    )
-                )
-                author_group_members = [
-                    {"name": m.name, "platform": m.platform, "role": m.role}
-                    for m in other_r.all()
-                ]
-
-        # Author stance profile
-        stance_profile_data = None
-        sp_r = await session.exec(
-            select(AuthorStanceProfile).where(
-                AuthorStanceProfile.author_id == author_id
-            )
-        )
-        sp = sp_r.first()
-        if sp:
-            dist = {}
-            if sp.stance_distribution:
-                try:
-                    dist = json.loads(sp.stance_distribution)
-                except Exception:
-                    pass
-            stance_profile_data = {
-                "dominant_stance": sp.dominant_stance,
-                "dominant_stance_ratio": sp.dominant_stance_ratio,
-                "total_analyzed": sp.total_analyzed,
-                "distribution": dist,
-            }
-
-    return {
-        "raw_post": {
-            "id": rp.id,
-            "url": rp.url,
-            "author_name": rp.author_name,
-            "source": rp.source,
-            "posted_at": str(rp.posted_at) if rp.posted_at else None,
-            "content_preview": (rp.content or "")[:400],
-        },
-        "facts": facts_out,
-        "conditions": conditions_out,
-        "conclusions": concls_out,
-        "author": {
-            "id": author.id,
-            "name": author.name,
-            "platform": author.platform,
-            "role": author.role,
-            "expertise_areas": author.expertise_areas,
-            "known_biases": author.known_biases,
-            "credibility_tier": author.credibility_tier,
-            "profile_note": author.profile_note,
-            "author_group_id": author.author_group_id,
-            "author_group": author_group_data,
-            "author_group_members": author_group_members,
-        },
-        "stance_profile": stance_profile_data,
-        "quality": {
-            "uniqueness_score": pqa.uniqueness_score if pqa else None,
-            "is_first_mover": pqa.is_first_mover if pqa else None,
-            "similar_claim_count": pqa.similar_claim_count if pqa else None,
-            "similar_author_count": pqa.similar_author_count if pqa else None,
-            "uniqueness_note": pqa.uniqueness_note if pqa else None,
-            "effectiveness_score": pqa.effectiveness_score if pqa else None,
-            "noise_ratio": pqa.noise_ratio if pqa else None,
-            "noise_types": _noise_types(pqa),
-            "effectiveness_note": pqa.effectiveness_note if pqa else None,
-            "stance_label": pqa.stance_label if pqa else None,
-            "stance_note": pqa.stance_note if pqa else None,
-        } if pqa else None,
-        "stats": {
-            "overall_credibility_score": stats.overall_credibility_score if stats else None,
-            "total_posts_analyzed": stats.total_posts_analyzed if stats else None,
-            "fact_accuracy_rate": stats.fact_accuracy_rate if stats else None,
-            "conclusion_accuracy_rate": stats.conclusion_accuracy_rate if stats else None,
-            "prediction_accuracy_rate": stats.prediction_accuracy_rate if stats else None,
-            "logic_rigor_score": stats.logic_rigor_score if stats else None,
-            "recommendation_reliability_rate": stats.recommendation_reliability_rate if stats else None,
-            "content_uniqueness_score": stats.content_uniqueness_score if stats else None,
-            "content_effectiveness_score": stats.content_effectiveness_score if stats else None,
-        } if stats else None,
-    }
+    return StreamingResponse(generator(), media_type="text/event-stream")
 
 
-# ── HTML 模板 ─────────────────────────────────────────────────────────────────
+# ── HTML ───────────────────────────────────────────────────────────────────────
 
 _HTML = """<!DOCTYPE html>
 <html lang="zh">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Anchor — 观点验证系统</title>
-  <style>
-    :root {
-      --bg: #0d0f1a;
-      --surface: #161927;
-      --surface2: #1e2235;
-      --border: #2a2f4a;
-      --text: #e2e8f0;
-      --text-dim: #7c87a0;
-      --accent: #6366f1;
-      --accent2: #818cf8;
-      --green: #22c55e;
-      --red: #f87171;
-      --yellow: #fbbf24;
-      --blue: #60a5fa;
-      --gray: #6b7280;
-      --radius: 10px;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; line-height: 1.65; min-height: 100vh; }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>⚓ Anchor</title>
+<style>
+:root {
+  --bg:#0d1117; --surface:#161b22; --surface2:#21262d; --surface3:#2d333b;
+  --border:#30363d; --text:#e6edf3; --text2:#7d8590; --text3:#8b949e;
+  --accent:#58a6ff; --green:#3fb950; --red:#f85149; --yellow:#d29922;
+  --orange:#e3b341; --purple:#a371f7; --blue:#79c0ff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  background:var(--bg);color:var(--text);font-size:14px;height:100vh;
+  display:flex;flex-direction:column;overflow:hidden}
+header{background:var(--surface);border-bottom:1px solid var(--border);
+  padding:10px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0;z-index:10}
+.logo{font-size:17px;font-weight:700;white-space:nowrap;letter-spacing:-.3px}
+.logo em{color:var(--accent);font-style:normal}
+.url-form{display:flex;flex:1;gap:8px;max-width:680px}
+.url-input{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  padding:6px 12px;color:var(--text);font-size:13px;transition:border-color .15s}
+.url-input:focus{outline:none;border-color:var(--accent)}
+.btn-primary{background:var(--accent);color:#0d1117;border:none;border-radius:6px;
+  padding:6px 16px;cursor:pointer;font-weight:600;font-size:13px;white-space:nowrap}
+.btn-primary:hover{opacity:.9}
+.debug-wrap{display:flex;align-items:center;gap:7px;cursor:pointer;margin-left:auto;white-space:nowrap}
+.debug-wrap input{display:none}
+.toggle-track{width:34px;height:18px;background:var(--surface3);border:1px solid var(--border);
+  border-radius:9px;position:relative;transition:.2s}
+.toggle-thumb{position:absolute;left:2px;top:2px;width:12px;height:12px;
+  background:var(--text2);border-radius:50%;transition:.2s}
+.debug-on .toggle-track{background:var(--accent);border-color:var(--accent)}
+.debug-on .toggle-thumb{left:18px;background:#fff}
+.debug-label{font-size:11px;color:var(--text2);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.debug-on .debug-label{color:var(--accent)}
+#progressBar{background:var(--surface);border-bottom:1px solid var(--border);
+  padding:8px 16px;display:none;gap:6px;align-items:center;overflow-x:auto;flex-shrink:0}
+#progressBar.show{display:flex}
+.spill{display:flex;align-items:center;gap:4px;padding:3px 10px;border-radius:10px;
+  font-size:11px;background:var(--surface2);color:var(--text2);white-space:nowrap}
+.spill.active{background:rgba(88,166,255,.12);color:var(--accent)}
+.spill.done{background:rgba(63,185,80,.1);color:var(--green)}
+.spill.err{background:rgba(248,81,73,.1);color:var(--red)}
+.spill-dot{width:5px;height:5px;border-radius:50%;background:currentColor}
+.spill.active .spill-dot{animation:blink 1s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+.step-sep{color:var(--border);font-size:12px;flex-shrink:0}
+.layout{display:flex;flex:1;overflow:hidden}
+.sidebar{width:250px;background:var(--surface);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;flex-shrink:0}
+.sidebar-hd{padding:10px 14px;font-size:11px;font-weight:600;text-transform:uppercase;
+  letter-spacing:.5px;color:var(--text2);border-bottom:1px solid var(--border);
+  display:flex;justify-content:space-between;align-items:center}
+.sidebar-hd button{background:none;border:none;color:var(--text2);cursor:pointer;font-size:15px;padding:0 2px}
+.sidebar-hd button:hover{color:var(--text)}
+#postList{overflow-y:auto;flex:1}
+.pi{padding:11px 14px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .1s}
+.pi:hover{background:var(--surface2)}
+.pi.active{background:rgba(88,166,255,.08);border-left:2px solid var(--accent);padding-left:12px}
+.pi-author{font-weight:600;font-size:13px;margin-bottom:3px;display:flex;align-items:center;gap:6px}
+.pi-meta{display:flex;gap:5px;flex-wrap:wrap;font-size:11px;color:var(--text2);align-items:center}
+.pi-topic{font-size:11px;color:var(--text3);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dot-ok{color:var(--green);font-size:9px}
+.dot-no{color:var(--text2);font-size:9px}
+.main{flex:1;overflow-y:auto;padding:20px 24px}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  height:100%;color:var(--text2);gap:8px;text-align:center}
+.empty-icon{font-size:44px;line-height:1}
+.bd{display:inline-flex;align-items:center;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:500}
+.bd-green{background:rgba(63,185,80,.12);color:var(--green)}
+.bd-red{background:rgba(248,81,73,.12);color:var(--red)}
+.bd-yellow{background:rgba(210,153,34,.12);color:var(--yellow)}
+.bd-gray{background:rgba(125,133,144,.1);color:var(--text2)}
+.bd-blue{background:rgba(121,192,255,.12);color:var(--blue)}
+.bd-purple{background:rgba(163,113,247,.12);color:var(--purple)}
+.bd-orange{background:rgba(227,179,65,.12);color:var(--orange)}
+.bd-accent{background:rgba(88,166,255,.1);color:var(--accent);border:1px solid rgba(88,166,255,.25)}
+.summary-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:16px 18px;margin-bottom:18px}
+.s-meta{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:8px}
+.s-field{display:flex;flex-direction:column;gap:2px}
+.s-label{font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.4px}
+.s-value{font-size:13px;font-weight:500}
+.s-summary{font-size:13px;color:var(--text3);line-height:1.65;padding-top:10px;
+  border-top:1px solid var(--border);margin-top:6px}
+.dbg-block{background:var(--surface);border:1px solid rgba(88,166,255,.2);border-radius:8px;
+  padding:12px 14px;margin-bottom:14px}
+.dbg-title{font-size:10px;font-weight:600;color:var(--accent);text-transform:uppercase;
+  letter-spacing:.5px;margin-bottom:10px}
+.dbg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px}
+.dbg-field{display:flex;flex-direction:column;gap:2px}
+.dbg-label{font-size:10px;color:var(--text2);text-transform:uppercase}
+.dbg-value{font-size:13px}
+.dbg-note{grid-column:1/-1;font-size:12px;color:var(--text2);margin-top:4px;line-height:1.5}
+.sec{margin-bottom:22px}
+.sec-title{font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;
+  letter-spacing:.5px;margin-bottom:10px;display:flex;align-items:center;gap:7px}
+.cnt{background:var(--surface2);padding:1px 7px;border-radius:8px;font-size:11px;color:var(--text2)}
+.cmp-stats{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.cmp-pill{display:flex;flex-direction:column;align-items:center;padding:8px 18px;
+  border-radius:8px;background:var(--surface2);gap:2px}
+.cmp-num{font-size:22px;font-weight:700}
+.cmp-lbl{font-size:11px;color:var(--text2)}
+.cmp-new{color:var(--green)}.cmp-adj{color:var(--yellow)}.cmp-con{color:var(--text2)}.cmp-del{color:var(--red)}
+.theme-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  margin-bottom:10px;overflow:hidden}
+.theme-hd{display:flex;align-items:center;gap:8px;padding:11px 14px;cursor:pointer;transition:background .1s}
+.theme-hd:hover{background:var(--surface2)}
+.theme-chev{color:var(--text2);font-size:11px;transition:transform .18s;flex-shrink:0}
+.theme-card.open .theme-chev{transform:rotate(90deg)}
+.theme-name{font-weight:700;font-size:17px;flex:1;color:var(--accent);
+  background:rgba(88,166,255,.08);border-radius:5px;padding:2px 8px;letter-spacing:-.2px}
+.theme-body{display:none;border-top:1px solid var(--border)}
+.theme-card.open .theme-body{display:block}
+.theme-bg{padding:10px 14px;font-size:12px;color:var(--text3);line-height:1.65;
+  border-bottom:1px solid var(--border)}
+.theme-bg-lbl{font-size:10px;font-weight:600;color:var(--text2);text-transform:uppercase;margin-bottom:3px}
+.enf-note{padding:8px 14px 10px;font-size:12px;color:var(--text2);border-bottom:1px solid var(--border)}
+.pi-table{width:100%;border-collapse:collapse}
+.pi-table th{text-align:left;padding:7px 12px;font-size:10px;font-weight:600;
+  color:var(--text2);text-transform:uppercase;border-bottom:1px solid var(--border)}
+.pi-table td{padding:9px 12px;vertical-align:top;border-bottom:1px solid var(--border);font-size:13px}
+.pi-table tr:last-child td{border-bottom:none}
+.pi-table tr:hover td{background:rgba(255,255,255,.02)}
+.pi-text{font-size:11px;color:var(--text2);margin-top:4px;line-height:1.5}
+.pi-note{font-size:11px;color:var(--text2);margin-top:3px}
+.pi-id{font-size:10px;color:var(--border)}
+.urg{padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600}
+.urg-m{background:rgba(248,81,73,.1);color:#f85149}
+.urg-e{background:rgba(63,185,80,.1);color:#3fb950}
+.urg-p{background:rgba(121,192,255,.1);color:#79c0ff}
+.urg-g{background:rgba(125,133,144,.1);color:#7d8590}
+.chg{padding:2px 7px;border-radius:4px;font-size:11px;font-weight:500}
+.chg-n{background:rgba(63,185,80,.1);color:#3fb950}
+.chg-a{background:rgba(210,153,34,.1);color:#d29922}
+.chg-c{background:rgba(125,133,144,.08);color:#7d8590}
+.chg-d{background:rgba(248,81,73,.1);color:#f85149}
+.exec{font-size:12px}
+.exec-note{font-size:11px;color:var(--text2);margin-top:3px;line-height:1.4}
+/* Policy v3 styles */
+.int{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
+.int-s{background:rgba(248,81,73,.1);color:#f85149}
+.int-m{background:rgba(210,153,34,.1);color:#d29922}
+.int-w{background:rgba(125,133,144,.08);color:#7d8590}
+.trend{padding:2px 7px;border-radius:4px;font-size:11px;font-weight:500}
+.trend-up{background:rgba(63,185,80,.1);color:#3fb950}
+.trend-down{background:rgba(248,81,73,.1);color:#f85149}
+.trend-cont{background:rgba(125,133,144,.08);color:#7d8590}
+.trend-new{background:rgba(121,192,255,.12);color:#79c0ff}
+.pol-field{display:flex;gap:8px;padding:7px 14px;font-size:12px;line-height:1.55;
+  border-bottom:1px solid var(--border)}
+.pol-field-lbl{min-width:42px;font-size:10px;font-weight:600;text-transform:uppercase;
+  color:var(--text2);padding-top:1px}
+.pol-field-val{flex:1;color:var(--text3)}
+.measure-list{padding:8px 14px 10px}
+.measure-item{display:flex;gap:10px;align-items:flex-start;padding:5px 0;
+  border-bottom:1px solid var(--border)}
+.measure-item:last-child{border-bottom:none}
+.measure-body{flex:1}
+.measure-summary{font-size:13px;font-weight:600;margin-bottom:3px}
+.measure-text{font-size:12px;color:var(--text3);line-height:1.55}
+.measure-note{font-size:11px;color:var(--text2);margin-top:3px}
+.eg{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:10px}
+.ec{background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:11px 13px;transition:border-color .15s}
+.ec:hover{border-color:rgba(88,166,255,.3)}
+.ec-summary{font-size:13px;font-weight:500;margin-bottom:6px;line-height:1.4}
+.ec-claim{font-size:12px;color:var(--text2);line-height:1.55;margin-bottom:6px;margin-top:4px}
+.ec-footer{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.ec-id{font-size:10px;color:var(--border);margin-top:4px}
+.ec-evidence{font-size:11px;color:var(--text2);margin-top:6px;line-height:1.45;
+  padding-top:6px;border-top:1px solid var(--border)}
+.del-list{background:rgba(248,81,73,.04);border:1px solid rgba(248,81,73,.18);
+  border-radius:8px;padding:12px 14px}
+.del-item{font-size:13px;padding:4px 0;border-bottom:1px solid rgba(248,81,73,.08)}
+.del-item:last-child{border-bottom:none}
+/* 变化视图切换 */
+.view-toggle{display:flex;gap:4px;margin-left:auto}
+.view-btn{background:none;border:1px solid var(--border);color:var(--text2);
+  border-radius:5px;padding:3px 10px;font-size:11px;cursor:pointer;font-weight:500}
+.view-btn.active{background:var(--accent);color:#0d1117;border-color:var(--accent);font-weight:700}
+/* 变化视图 diff card */
+.diff-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  margin-bottom:8px;overflow:hidden}
+.diff-hd{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 14px;
+  border-bottom:1px solid var(--border);cursor:pointer;user-select:none}
+.diff-summary{width:100%;font-size:11px;color:var(--text2);margin-top:2px;line-height:1.4;
+  padding-left:18px}
+.diff-hd:hover{background:rgba(255,255,255,.02)}
+.diff-chev{font-size:10px;color:var(--text2);transition:transform .15s}
+.diff-card.open .diff-chev{transform:rotate(90deg)}
+.diff-body{display:none;flex-direction:column}
+.diff-card.open .diff-body{display:flex}
+.diff-no-change{font-size:12px;color:var(--text2);padding:10px 14px;font-style:italic}
+/* 两列表格 */
+.diff-table{width:100%;border-collapse:collapse;font-size:12px}
+.diff-table th{padding:5px 12px;font-size:10px;font-weight:700;text-transform:uppercase;
+  color:var(--text2);border-bottom:1px solid var(--border);text-align:left}
+.diff-table th.col-year{width:50%;border-left:1px solid var(--border)}
+.diff-table td{padding:8px 12px;vertical-align:top;line-height:1.6;color:var(--text3);
+  border-bottom:1px solid rgba(255,255,255,.04)}
+.diff-table td.col-lbl{width:42px;font-size:10px;font-weight:700;text-transform:uppercase;
+  color:var(--text2);white-space:nowrap;border-right:1px solid var(--border)}
+.diff-table td.col-curr{width:50%;border-right:1px solid var(--border)}
+.diff-table td.col-prev{width:50%;color:var(--text2)}
+.diff-table tr:last-child td{border-bottom:none}
+.diff-count{font-size:11px;color:var(--text2);margin-left:auto;white-space:nowrap}
+#dag-wrap{border:1px solid var(--border);border-radius:8px;height:420px;
+  background:var(--surface);overflow:hidden}
+.edge-row{font-size:11px;color:var(--text2);padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.edge-type{color:var(--accent)}
+.raw-content{background:var(--surface2);border:1px solid var(--border);border-radius:6px;
+  padding:10px 12px;font-size:12px;color:var(--text2);line-height:1.6;
+  max-height:180px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin-top:8px}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 
-    /* ── Header ── */
-    .header {
-      position: sticky; top: 0; z-index: 100;
-      background: rgba(13,15,26,0.96); backdrop-filter: blur(14px);
-      border-bottom: 1px solid var(--border);
-      padding: 14px 28px;
-      display: flex; align-items: center; gap: 20px;
-    }
-    .logo { font-size: 20px; font-weight: 800; color: var(--accent2); letter-spacing: -0.5px; flex-shrink: 0; }
-    .url-form { flex: 1; display: flex; gap: 10px; max-width: 840px; }
-    .url-input {
-      flex: 1; padding: 10px 16px; border-radius: var(--radius);
-      background: var(--surface2); border: 1px solid var(--border); color: var(--text);
-      font-size: 14px; outline: none; transition: border-color 0.2s;
-    }
-    .url-input:focus { border-color: var(--accent); }
-    .url-input::placeholder { color: var(--text-dim); }
-    .analyze-btn {
-      padding: 10px 28px; border-radius: var(--radius);
-      background: var(--accent); border: none; color: #fff;
-      font-size: 14px; font-weight: 600; cursor: pointer;
-      transition: opacity 0.2s; white-space: nowrap;
-    }
-    .analyze-btn:hover { opacity: 0.85; }
-    .analyze-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+/* PDF 导出按钮 */
+#pdfBtn{
+  position:fixed;bottom:28px;right:28px;z-index:999;
+  background:var(--accent);color:#0d1117;border:none;border-radius:8px;
+  padding:9px 18px;cursor:pointer;font-weight:700;font-size:13px;
+  box-shadow:0 4px 14px rgba(0,0,0,.4);display:none;
+  transition:opacity .15s,transform .15s}
+#pdfBtn:hover{opacity:.9;transform:translateY(-1px)}
+#pdfBtn.visible{display:block}
 
-    /* ── Layout ── */
-    .main { max-width: 1440px; margin: 0 auto; padding: 28px; }
-
-    /* ── Progress ── */
-    .progress-section { margin-bottom: 28px; display: none; }
-    .progress-steps { display: flex; flex-wrap: wrap; gap: 8px; padding: 16px 20px; background: var(--surface); border-radius: var(--radius); border: 1px solid var(--border); }
-    .step-pill { display: flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 999px; font-size: 12px; background: var(--surface2); color: var(--text-dim); border: 1px solid var(--border); transition: all 0.25s; }
-    .step-pill.active { border-color: var(--accent); color: var(--accent2); background: rgba(99,102,241,0.12); }
-    .step-pill.done { border-color: var(--green); color: var(--green); background: rgba(34,197,94,0.08); }
-    .step-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
-    .step-pill.active .step-dot { animation: blink 1s ease-in-out infinite; }
-    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.25} }
-    .status-bar { margin-top: 12px; padding: 10px 16px; border-radius: 8px; font-size: 13px; }
-    .status-bar.info { background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.25); color: var(--accent2); }
-    .status-bar.error { background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); color: #fca5a5; white-space: pre-wrap; font-family: monospace; font-size: 12px; }
-
-    /* ── Empty state ── */
-    .empty-state { text-align: center; padding: 80px 24px; }
-    .empty-icon { font-size: 56px; opacity: 0.4; margin-bottom: 20px; }
-    .empty-title { font-size: 18px; color: var(--text-dim); }
-    .empty-sub { font-size: 13px; color: var(--text-dim); margin-top: 8px; opacity: 0.7; }
-
-    /* ── Section ── */
-    .results-section { display: none; }
-    .results-section.visible { display: block; }
-    .section { margin-bottom: 36px; }
-    .section-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
-    .section-title { font-size: 15px; font-weight: 700; color: var(--accent2); }
-    .section-count { padding: 2px 8px; border-radius: 999px; background: var(--surface2); color: var(--text-dim); font-size: 11px; font-weight: 600; }
-
-    /* ── Cards grid ── */
-    .cards-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 16px; }
-
-    /* ── Card ── */
-    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; transition: border-color 0.2s; }
-    .card:hover { border-color: rgba(99,102,241,0.5); }
-    .card-header { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
-    .card-id { color: var(--text-dim); font-size: 10px; font-weight: 700; flex-shrink: 0; padding-top: 4px; font-family: monospace; }
-    .card-claim { font-size: 13px; line-height: 1.65; flex: 1; }
-    .card-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-
-    /* ── Badges ── */
-    .badge { display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; line-height: 1.5; }
-    /* 通用裁定 */
-    .badge-confirmed, .badge-validated { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
-    .badge-refuted, .badge-invalidated { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
-    .badge-partial { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
-    .badge-unavailable, .badge-pending, .badge-unverifiable, .badge-expired { background: rgba(107,114,128,0.12); color: var(--gray); border: 1px solid rgba(107,114,128,0.3); }
-    /* v2.2 事实判定 */
-    .badge-credible { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
-    .badge-vague { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
-    .badge-unreliable { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
-    /* v2.2 预测型结论判定 */
-    .badge-accurate { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
-    .badge-directional { background: rgba(96,165,250,0.12); color: var(--blue); border: 1px solid rgba(96,165,250,0.3); }
-    .badge-off_target { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
-    .badge-wrong { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
-    /* v2.2 条件判定 */
-    .badge-consensus { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
-    .badge-non_consensus { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
-    .badge-disputed { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
-    .badge-strong_assumption { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
-    .badge-likely_assumption { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
-    /* 结论类型 */
-    .badge-predictive { background: rgba(96,165,250,0.12); color: var(--blue); border: 1px solid rgba(96,165,250,0.3); }
-    .badge-retrospective { background: rgba(99,102,241,0.12); color: var(--accent2); border: 1px solid rgba(99,102,241,0.3); }
-    /* 作者可信度 */
-    .badge-tier1 { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
-    .badge-tier2 { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
-    .badge-tier3 { background: rgba(107,114,128,0.12); color: var(--gray); border: 1px solid rgba(107,114,128,0.3); }
-    /* 逻辑有效性 */
-    .badge-valid { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
-    .badge-invalid { background: rgba(248,113,113,0.12); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
-    /* 事实来源层 */
-    .badge-authoritative { background: rgba(34,197,94,0.15); color: #4ade80; border: 1px solid rgba(34,197,94,0.4); }
-    .badge-mainstream_media { background: rgba(96,165,250,0.12); color: var(--blue); border: 1px solid rgba(96,165,250,0.3); }
-    .badge-market_data { background: rgba(99,102,241,0.12); color: var(--accent2); border: 1px solid rgba(99,102,241,0.3); }
-    .badge-rumor { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
-    .badge-no_source { background: rgba(107,114,128,0.12); color: var(--gray); border: 1px solid rgba(107,114,128,0.3); }
-    /* 条件类型 */
-    .badge-assumption { background: rgba(251,191,36,0.12); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
-    .badge-implicit { background: rgba(107,114,128,0.12); color: var(--gray); border: 1px solid rgba(107,114,128,0.3); }
-
-    /* ── Collapsible detail ── */
-    .toggle-btn { cursor: pointer; font-size: 11px; color: var(--text-dim); margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); user-select: none; display: flex; align-items: center; gap: 4px; }
-    .toggle-btn::after { content: '▼'; font-size: 9px; }
-    .toggle-btn.collapsed::after { content: '▶'; }
-    .detail-block { padding-top: 10px; }
-    .detail-text { font-size: 12px; color: var(--text-dim); line-height: 1.7; white-space: pre-wrap; word-break: break-word; margin-bottom: 6px; }
-    .detail-label { font-size: 10px; font-weight: 700; color: var(--accent2); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; margin-top: 10px; }
-
-    /* ── Condition items ── */
-    .cond-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
-    .cond-item { padding: 10px 14px; background: var(--surface2); border-radius: 8px; border-left: 3px solid var(--border); }
-    .cond-item.consensus { border-left-color: var(--green); }
-    .cond-item.disputed, .cond-item.non_consensus { border-left-color: var(--red); }
-    .cond-item.strong_assumption { border-left-color: var(--red); }
-    .cond-item.likely_assumption { border-left-color: var(--green); }
-    .cond-item.unavailable, .cond-item.pending { border-left-color: var(--border); }
-    .cond-text { font-size: 12px; margin-bottom: 8px; }
-    .cond-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-
-    /* ── Conclusions table ── */
-    .table-wrap { overflow-x: auto; border-radius: var(--radius); border: 1px solid var(--border); }
-    .conc-table { width: 100%; border-collapse: collapse; }
-    .conc-table th {
-      background: var(--surface2); padding: 12px 18px; text-align: left;
-      font-size: 11px; font-weight: 700; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.07em;
-      border-bottom: 1px solid var(--border); white-space: nowrap;
-    }
-    .conc-table td { padding: 18px; border-bottom: 1px solid var(--border); vertical-align: top; }
-    .conc-table tr:last-child td { border-bottom: none; }
-    .conc-table tbody tr:hover td { background: rgba(99,102,241,0.04); }
-    .conc-claim-text { font-size: 13px; font-weight: 500; line-height: 1.6; margin-bottom: 10px; }
-    .conc-meta-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-    .conc-quote { font-size: 11px; color: var(--text-dim); font-style: italic; margin-top: 6px; }
-
-    /* ── Fact refs in table ── */
-    .fact-ref { padding: 8px 12px; background: var(--surface2); border-radius: 8px; margin-bottom: 8px; border-left: 3px solid var(--border); }
-    .fact-ref.role-supporting { border-left-color: var(--accent); }
-    .fact-ref.role-assumption { border-left-color: var(--yellow); }
-    .fact-ref-header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
-    .fact-ref-claim { font-size: 12px; color: var(--text-dim); line-height: 1.6; }
-
-    /* ── Solution refs in table ── */
-    .sol-ref { padding: 10px 14px; background: var(--surface2); border-radius: 8px; margin-bottom: 8px; }
-    .sol-ref-header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; }
-    .sol-action-tag { padding: 2px 8px; border-radius: 6px; background: rgba(99,102,241,0.2); color: var(--accent2); font-size: 11px; font-weight: 700; }
-    .sol-claim { font-size: 12px; color: var(--text-dim); }
-    .sol-baseline { font-size: 11px; color: var(--text-dim); margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }
-
-    /* ── Verdict cell ── */
-    .verdict-cell { text-align: center; min-width: 120px; }
-    .verdict-main { display: flex; justify-content: center; margin-bottom: 10px; }
-    .verdict-sub { font-size: 11px; color: var(--text-dim); text-align: left; }
-    .verdict-sub-row { margin-bottom: 4px; }
-
-    /* ── Bottom panels ── */
-    .bottom-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px; margin-bottom: 36px; }
-    @media (max-width: 1100px) { .bottom-grid { grid-template-columns: 1fr 1fr; } }
-    @media (max-width: 700px) { .bottom-grid { grid-template-columns: 1fr; } .cards-grid { grid-template-columns: 1fr; } }
-    .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; }
-    .panel-title { font-size: 14px; font-weight: 700; color: var(--accent2); margin-bottom: 20px; }
-
-    /* ── Author panel ── */
-    .info-table { width: 100%; border-collapse: collapse; }
-    .info-table td { padding: 6px 0; vertical-align: top; font-size: 13px; }
-    .info-table td:first-child { color: var(--text-dim); font-size: 12px; min-width: 80px; padding-right: 16px; padding-top: 8px; }
-    .info-table tr + tr td { border-top: 1px solid var(--border); }
-    .tier-badge { display: inline-flex; padding: 4px 12px; border-radius: 999px; font-size: 13px; font-weight: 700; }
-
-    /* ── Quality panel ── */
-    .quality-twin { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
-    .quality-card { text-align: center; padding: 16px 12px; background: var(--surface2); border-radius: 8px; }
-    .quality-num { font-size: 36px; font-weight: 800; line-height: 1; }
-    .quality-lbl { font-size: 11px; color: var(--text-dim); margin-top: 6px; }
-    .quality-sub { font-size: 11px; margin-top: 4px; }
-
-    /* ── Score bars ── */
-    .score-divider { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
-    .score-overall-row { text-align: center; margin-bottom: 20px; }
-    .score-overall-num { font-size: 48px; font-weight: 900; line-height: 1; }
-    .score-overall-lbl { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
-    .score-rows { display: flex; flex-direction: column; gap: 10px; }
-    .score-row { display: flex; align-items: center; gap: 12px; }
-    .score-row-label { font-size: 12px; color: var(--text-dim); min-width: 90px; flex-shrink: 0; }
-    .score-bar-track { flex: 1; height: 5px; background: var(--surface2); border-radius: 999px; overflow: hidden; }
-    .score-bar-fill { height: 100%; border-radius: 999px; transition: width 1.2s cubic-bezier(0.25,1,0.5,1); }
-    .fill-high { background: var(--green); }
-    .fill-mid { background: var(--yellow); }
-    .fill-low { background: var(--red); }
-    .score-row-val { font-size: 12px; min-width: 40px; text-align: right; font-weight: 600; }
-
-    /* ── DAG ── */
-    .dag-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: #0d1117; position: relative; }
-    #dagContainer { width: 100%; height: 480px; }
-    .dag-legend { display: flex; flex-wrap: wrap; gap: 12px; padding: 10px 16px; border-top: 1px solid var(--border); background: var(--surface); }
-    .dag-legend-item { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-dim); }
-    .dag-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-  </style>
-  <script src="/static/vis-network.min.js"></script>
+/* 打印 / PDF 样式 */
+@media print{
+  header,#progressBar,.sidebar,#pdfBtn,.debug-wrap,.dbg-block{display:none!important}
+  .layout{display:block}
+  .main{padding:0;background:#fff;color:#000;border:none}
+  body{background:#fff;color:#000}
+  .summary-card,.theme-card,.sec,.eg{break-inside:avoid;background:#fff!important;border-color:#ccc!important;color:#000!important}
+  .theme-card{display:block!important}
+  .theme-body{display:block!important;max-height:none!important;overflow:visible!important}
+  .int{color:#000!important;border:1px solid #999!important;background:#eee!important}
+  .trend,.bd{color:#000!important;background:#eee!important;border:1px solid #999!important}
+  .sec-title,.pol-theme,.field-label{color:#000!important}
+  .field-val,.pol-target,.pol-bg,.pol-org,.pol-note{color:#111!important}
+  a{color:#000!important;text-decoration:none}
+}
+</style>
 </head>
 <body>
 
-<!-- Header -->
-<div class="header">
-  <div class="logo">⚓ Anchor</div>
-  <form class="url-form" id="form">
-    <input class="url-input" id="urlInput" type="text" placeholder="输入 X (Twitter) 或微博内容链接..." required>
-    <button class="analyze-btn" id="analyzeBtn" type="submit">分析</button>
+<header>
+  <div class="logo">⚓ <em>Anchor</em></div>
+  <form class="url-form" onsubmit="submitAnalyze(event)">
+    <input class="url-input" id="urlInput" type="text"
+      placeholder="输入 URL 开始分析 (Twitter/X · 微博 · Web · PDF)…" autocomplete="off">
+    <button class="btn-primary" type="submit">分析</button>
   </form>
+  <label class="debug-wrap" id="debugWrap">
+    <input type="checkbox" id="debugCb" onchange="toggleDebug(this)">
+    <div class="toggle-track"><div class="toggle-thumb"></div></div>
+    <span class="debug-label">Debug</span>
+  </label>
+</header>
+
+<div id="progressBar"></div>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-hd">
+      <span>帖子列表</span>
+      <button onclick="loadPosts()" title="刷新">↻</button>
+    </div>
+    <div id="postList">
+      <div style="padding:16px;color:var(--text2);font-size:12px;">加载中…</div>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <div class="empty">
+      <div class="empty-icon">⚓</div>
+      <div>选择左侧帖子查看分析结果</div>
+      <div style="font-size:12px;color:var(--text2)">或输入 URL 开始新分析</div>
+    </div>
+  </main>
 </div>
 
-<!-- Main -->
-<div class="main">
+<button id="pdfBtn" onclick="exportPDF()">↓ 导出 PDF</button>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
 
-  <!-- Progress -->
-  <div class="progress-section" id="progressSection">
-    <div class="progress-steps" id="progressSteps"></div>
-    <div id="statusBar"></div>
-  </div>
-
-  <!-- Empty state -->
-  <div class="empty-state" id="emptyState">
-    <div class="empty-icon">🔎</div>
-    <div class="empty-title">输入链接开始分析</div>
-    <div class="empty-sub">支持 X（Twitter）和微博的内容链接</div>
-  </div>
-
-  <!-- Results -->
-  <div class="results-section" id="resultsSection">
-
-    <!-- Facts -->
-    <div class="section">
-      <div class="section-header">
-        <div class="section-title">事实核查</div>
-        <div class="section-count" id="factsCount"></div>
-      </div>
-      <div class="cards-grid" id="factsGrid"></div>
-    </div>
-
-    <!-- Conditions (assumption + implicit) -->
-    <div class="section">
-      <div class="section-header">
-        <div class="section-title">条件</div>
-        <div class="section-count" id="condsCount"></div>
-      </div>
-      <div class="cards-grid" id="condsGrid"></div>
-    </div>
-
-    <!-- Logic DAG -->
-    <div class="section">
-      <div class="section-header">
-        <div class="section-title">逻辑关系图</div>
-        <div class="section-count" id="dagCount"></div>
-      </div>
-      <div class="dag-wrap">
-        <div id="dagContainer"></div>
-        <div class="dag-legend">
-          <div class="dag-legend-item"><div class="dag-dot" style="background:#4ade80"></div>事实（可信）</div>
-          <div class="dag-legend-item"><div class="dag-dot" style="background:#fbbf24"></div>事实（宽泛/小道）</div>
-          <div class="dag-legend-item"><div class="dag-dot" style="background:#f87171"></div>事实（不可信）</div>
-          <div class="dag-legend-item"><div class="dag-dot" style="background:#6b7280"></div>事实（无数据）</div>
-          <div class="dag-legend-item"><div class="dag-dot" style="background:#c084fc;border-radius:2px"></div>结论</div>
-          <div class="dag-legend-item"><div class="dag-dot" style="background:#f59e0b;border-radius:2px"></div>条件</div>
-          <div class="dag-legend-item"><div class="dag-dot" style="background:#60a5fa;border-radius:2px"></div>解决方案</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Conclusions Table -->
-    <div class="section">
-      <div class="section-header">
-        <div class="section-title">结论列表</div>
-        <div class="section-count" id="conclusionsCount"></div>
-      </div>
-      <div class="table-wrap">
-        <table class="conc-table">
-          <thead>
-            <tr>
-              <th style="width:30%">结论</th>
-              <th style="width:28%">支撑事实</th>
-              <th style="width:20%">解决方案</th>
-              <th style="width:22%">语义判定</th>
-            </tr>
-          </thead>
-          <tbody id="conclusionsBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- Author + Content Quality + Author Stats -->
-    <div class="bottom-grid">
-      <div class="panel">
-        <div class="panel-title">作者档案</div>
-        <div id="authorContent"></div>
-      </div>
-      <div class="panel">
-        <div class="panel-title">本篇内容评估</div>
-        <div id="contentQualityContent"></div>
-      </div>
-      <div class="panel">
-        <div class="panel-title">作者历史综合评估</div>
-        <div id="authorStatsContent"></div>
-      </div>
-    </div>
-
-  </div>
-</div>
-
+<script src="/static/vis-network.min.js"></script>
 <script>
-const STEPS = [
-  {n:1,  l:"采集"},
-  {n:2,  l:"观点提取"},
-  {n:3,  l:"作者档案"},
-  {n:4,  l:"逻辑验证"},
-  {n:5,  l:"现实对齐"},
-  {n:6,  l:"预测监控"},
-  {n:7,  l:"裁定推导"},
-  {n:8,  l:"角色评估"},
-  {n:9,  l:"质量评估"},
-  {n:10, l:"统计更新"},
-  {n:11, l:"汇总结果"},
-];
+// ── State ──────────────────────────────────────────────────────────────────────
+let debugMode = localStorage.getItem('anchorDebug') === '1';
+let currentData = null;
 
-let evtSource = null;
-
-document.getElementById('form').addEventListener('submit', e => {
-  e.preventDefault();
-  const url = document.getElementById('urlInput').value.trim();
-  if (!url) return;
-  startAnalysis(url);
-});
-
-function startAnalysis(url) {
-  document.getElementById('emptyState').style.display = 'none';
-  document.getElementById('resultsSection').classList.remove('visible');
-  document.getElementById('progressSection').style.display = 'block';
-  document.getElementById('analyzeBtn').disabled = true;
-
-  const stepsEl = document.getElementById('progressSteps');
-  stepsEl.innerHTML = STEPS.map(s =>
-    `<div class="step-pill" id="sp${s.n}"><div class="step-dot"></div>${s.l}</div>`
-  ).join('');
-  setStatus('正在连接...', 'info');
-
-  if (evtSource) evtSource.close();
-
-  fetch('/analyze', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({url})
-  }).then(r => r.json()).then(({task_id}) => {
-    evtSource = new EventSource('/stream/' + task_id);
-    evtSource.onmessage = onEvent;
-    evtSource.onerror = () => {
-      setStatus('连接中断，请刷新重试', 'error');
-      document.getElementById('analyzeBtn').disabled = false;
-      evtSource.close();
-    };
-  }).catch(err => {
-    setStatus('请求失败：' + err, 'error');
-    document.getElementById('analyzeBtn').disabled = false;
-  });
-}
-
-function onEvent(e) {
-  const ev = JSON.parse(e.data);
-  if (ev.type === 'step') {
-    const el = document.getElementById('sp' + ev.num);
-    if (el) { el.classList.add('active'); el.classList.remove('done'); }
-    setStatus('⏳ ' + ev.label + '...', 'info');
-  } else if (ev.type === 'step_done') {
-    const el = document.getElementById('sp' + ev.num);
-    if (el) { el.classList.remove('active'); el.classList.add('done'); }
-    setStatus('✓ ' + ev.detail, 'info');
-  } else if (ev.type === 'done') {
-    evtSource.close();
-    document.getElementById('analyzeBtn').disabled = false;
-    STEPS.forEach(s => {
-      const el = document.getElementById('sp' + s.n);
-      if (el) { el.classList.remove('active'); el.classList.add('done'); }
-    });
-    setStatus('✅ 分析完成', 'info');
-    renderAll(ev.data);
-  } else if (ev.type === 'error') {
-    evtSource.close();
-    document.getElementById('analyzeBtn').disabled = false;
-    setStatus('❌ 错误：' + ev.message, 'error');
+(function init(){
+  if (debugMode) {
+    document.getElementById('debugCb').checked = true;
+    document.getElementById('debugWrap').classList.add('debug-on');
   }
+  loadPosts();
+})();
+
+function toggleDebug(cb) {
+  debugMode = cb.checked;
+  localStorage.setItem('anchorDebug', debugMode ? '1' : '0');
+  document.getElementById('debugWrap').classList.toggle('debug-on', debugMode);
+  if (currentData) renderPost(currentData);
 }
 
-function setStatus(msg, cls) {
-  document.getElementById('statusBar').innerHTML =
-    `<div class="status-bar ${cls}">${msg}</div>`;
+// ── Post list ──────────────────────────────────────────────────────────────────
+async function loadPosts() {
+  const res = await fetch('/api/posts');
+  const posts = await res.json();
+  const el = document.getElementById('postList');
+  if (!posts.length) {
+    el.innerHTML = '<div style="padding:16px;color:var(--text2);font-size:12px;">暂无数据</div>';
+    return;
+  }
+  el.innerHTML = posts.map(p => {
+    const date = p.posted_at ? p.posted_at.slice(0,10) : '无日期';
+    const modeBd = p.content_mode === 'policy'
+      ? `<span class="bd bd-accent" style="font-size:10px;padding:1px 6px;">政策</span>`
+      : `<span class="bd bd-gray" style="font-size:10px;padding:1px 6px;">标准</span>`;
+    const ok = p.is_processed ? '●' : '○';
+    const okCls = p.is_processed ? 'dot-ok' : 'dot-no';
+    return `<div class="pi" onclick="selectPost(${p.id})" id="pi-${p.id}">
+      <div class="pi-author"><span class="${okCls}">${ok}</span>${esc(p.author_name)}</div>
+      <div class="pi-meta"><span>${date}</span>${p.content_type?`<span>${esc(p.content_type)}</span>`:''} ${modeBd}</div>
+      ${p.content_topic?`<div class="pi-topic">${esc(p.content_topic)}</div>`:''}
+    </div>`;
+  }).join('');
 }
 
-// ─── Utilities ────────────────────────────────────────────────────────────────
-
-function esc(s) {
-  if (s == null) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+async function selectPost(id) {
+  document.querySelectorAll('.pi').forEach(e => e.classList.remove('active'));
+  const pi = document.getElementById(`pi-${id}`);
+  if (pi) pi.classList.add('active');
+  document.getElementById('main').innerHTML =
+    '<div style="padding:40px;color:var(--text2);text-align:center;font-size:13px;">加载中…</div>';
+  const res = await fetch(`/api/post/${id}`);
+  if (!res.ok) {
+    document.getElementById('main').innerHTML =
+      '<div style="padding:40px;color:var(--red)">加载失败</div>';
+    return;
+  }
+  currentData = await res.json();
+  renderPost(currentData);
 }
 
-// 通用裁定标签
-const VERDICT_LABELS = {
-  confirmed: '✓ 已确认', refuted: '✗ 已驳斥',
-  partial: '△ 部分支持', unverifiable: '— 无法核实', pending: '… 待裁定',
-};
-// v2.2 实体语义判定标签
-const FACT_VERDICT_LABELS = {
-  credible: '✓ 可信', vague: '~ 宽泛', unreliable: '✗ 不可信', unavailable: '— 无数据',
-};
-const CONC_RETRO_LABELS = {
-  credible: '✓ 可信', vague: '~ 宽泛', unreliable: '✗ 不可信', unavailable: '— 无数据',
-};
-const CONC_PRED_LABELS = {
-  pending: '… 等待中', accurate: '✓ 准确', directional: '→ 方向一致',
-  off_target: '△ 误差较大', wrong: '✗ 错误',
-};
-const COND_ASSUMPTION_LABELS = {
-  strong_assumption: '⚠ 强假设', likely_assumption: '✓ 较大概率', unavailable: '— 无数据',
-};
-const COND_IMPLICIT_LABELS = {
-  consensus: '✓ 共识', non_consensus: '~ 非共识', disputed: '✗ 有争议', unavailable: '— 无数据',
-};
-const CONF_LABELS = { certain:'确定', likely:'可能', uncertain:'不确定', speculative:'猜测' };
-const TIER_LABELS = { 1:'顶级权威', 2:'行业专家', 3:'知名评论员', 4:'普通KOL', 5:'未知' };
-const LOGIC_VALIDITY_LABELS = { valid:'✓ 逻辑有效', partial:'~ 部分有效', invalid:'✗ 逻辑无效' };
-const SOURCE_TIER_LABELS = {
-  authoritative:   '权威来源',
-  mainstream_media:'主流媒体',
-  market_data:     '金融市场',
-  rumor:           '小道消息',
-  no_source:       '无消息源',
-};
-
-function badge(cls, text) {
-  return `<span class="badge badge-${cls}">${text}</span>`;
-}
-function verdictBadge(v) {
-  if (!v) return badge('pending', '待裁定');
-  const key = String(v).replace(/[^a-z_]/g, '');
-  return badge(key, VERDICT_LABELS[v] || v);
-}
-function factVerdictBadge(v) {
-  if (!v) return badge('pending', '待判定');
-  const key = String(v).replace(/[^a-z_]/g, '');
-  return badge(key, FACT_VERDICT_LABELS[v] || v);
-}
-function concVerdictBadge(c) {
-  if (c.conclusion_type === 'predictive') {
-    const v = c.prediction_verdict;
-    if (!v) return badge('pending', '等待中');
-    const key = String(v).replace(/[^a-z_]/g, '');
-    return badge(key, CONC_PRED_LABELS[v] || v);
+// ── Render dispatcher ──────────────────────────────────────────────────────────
+function renderPost(data) {
+  const main = document.getElementById('main');
+  if (data.mode === 'policy') {
+    main.innerHTML = renderPolicy(data);
+    document.querySelectorAll('.theme-hd').forEach(h => {
+      h.onclick = () => h.closest('.theme-card').classList.toggle('open');
+    });
+    document.querySelectorAll('.theme-card').forEach(c => c.classList.add('open'));
   } else {
-    const v = c.conclusion_verdict;
-    if (!v) return badge('pending', '待判定');
-    const key = String(v).replace(/[^a-z_]/g, '');
-    return badge(key, CONC_RETRO_LABELS[v] || v);
+    main.innerHTML = renderStandard(data);
+    renderDAG(data);
   }
+  document.getElementById('pdfBtn').classList.add('visible');
 }
-function condVerdictBadge(cond) {
-  const v = cond.condition_verdict;
-  if (!v) return badge('pending', '待判定');
-  const key = String(v).replace(/[^a-z_]/g, '');
-  if (cond.condition_type === 'assumption') {
-    return badge(key, COND_ASSUMPTION_LABELS[v] || v);
-  } else {
-    return badge(key, COND_IMPLICIT_LABELS[v] || v);
+
+function exportPDF() {
+  // 展开所有折叠卡片
+  document.querySelectorAll('.theme-card').forEach(c => c.classList.add('open'));
+  const el = document.getElementById('main');
+  const post = currentData && currentData.post;
+  const topic = post && post.content_topic ? post.content_topic : 'anchor-report';
+  const filename = topic.replace(/[\\/:*?"<>|]/g, '_').slice(0, 60) + '.pdf';
+  html2pdf().set({
+    margin: [12, 10, 12, 10],
+    filename,
+    image: {type: 'jpeg', quality: 0.95},
+    html2canvas: {scale: 2, useCORS: true, backgroundColor: '#ffffff'},
+    jsPDF: {unit: 'mm', format: 'a4', orientation: 'portrait'},
+    pagebreak: {mode: ['avoid-all', 'css']}
+  }).from(el).save();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// POLICY MODE
+// ══════════════════════════════════════════════════════════════════════════════
+
+let policyView = 'diff'; // 'diff' | 'full'
+
+function setPolicyView(mode) {
+  policyView = mode;
+  document.querySelectorAll('.view-btn').forEach(b => b.classList.toggle('active', b.dataset.v === mode));
+  if (currentData) renderPost(currentData);
+}
+
+// 高亮：数字（蓝）、强硬语气词（红）、方向词（橙）、组织变更（绿）
+function hilightField(text, type) {
+  if (!text) return '<span style="color:var(--text2)">—</span>';
+  let s = esc(text);
+  if (type === 'target') {
+    s = s.replace(
+      /(\d+(?:\.\d+)?(?:万亿|亿|万|千亿|%|百分点|个百分点|元|倍|次|年))/g,
+      '<span style="color:#79c0ff;font-weight:600">$1</span>'
+    );
   }
-}
-function tierBadge(t) {
-  if (!t) return '';
-  return badge('tier' + t, 'Tier' + t);
-}
-function scoreColor(v) {
-  if (v == null) return 'var(--text-dim)';
-  if (v >= 0.7) return 'var(--green)';
-  if (v >= 0.4) return 'var(--yellow)';
-  return 'var(--red)';
-}
-function fillClass(v) {
-  if (v == null) return 'fill-mid';
-  if (v >= 0.7) return 'fill-high';
-  if (v >= 0.4) return 'fill-mid';
-  return 'fill-low';
-}
-function toggleDetail(id, btn) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  const hidden = el.style.display === 'none' || el.style.display === '';
-  el.style.display = hidden ? 'block' : 'none';
-  btn.classList.toggle('collapsed', !hidden);
-}
-
-
-// ─── Render all ───────────────────────────────────────────────────────────────
-
-// ─── Logic DAG ────────────────────────────────────────────────────────────────
-
-let _dagNetwork = null;
-
-function renderDAG(data) {
-  if (typeof vis === 'undefined') {
-    document.getElementById('dagCount').textContent = '（vis.js 未加载）';
-    document.getElementById('dagContainer').innerHTML =
-      '<div style="padding:40px;text-align:center;color:var(--text-dim);font-size:13px;">逻辑关系图需要 vis-network 库，当前网络环境无法加载，其他功能不受影响。</div>';
-    return;
+  if (type === 'intensity') {
+    s = s.replace(
+      /(坚决|必须|严禁|严格|不得|绝不|强化|大力|加快|超常规|历史性)/g,
+      '<span style="color:#f85149;font-weight:600">$1</span>'
+    );
+    s = s.replace(
+      /(扩张|积极|稳健|宽松|收紧|由.{1,8}(?:转为|改为|升级为)|升级|降级)/g,
+      '<span style="color:#d29922;font-weight:600">$1</span>'
+    );
   }
-
-  const facts   = data.facts   || [];
-  const conds   = data.conditions || [];
-  const concls  = data.conclusions || [];
-
-  const nodes = new vis.DataSet();
-  const edges = new vis.DataSet();
-  const addedNodes = new Set();
-
-  function addNode(id, opts) {
-    if (!addedNodes.has(id)) { nodes.add({id, ...opts}); addedNodes.add(id); }
+  if (type === 'org') {
+    s = s.replace(
+      /(新增|新设|调整|纳入考核|问责|联合|牵头|统筹)/g,
+      '<span style="color:#3fb950;font-weight:600">$1</span>'
+    );
   }
-
-  // ── Fact nodes ──
-  facts.forEach(f => {
-    const col = f.fact_verdict === 'credible'    ? '#4ade80'
-              : f.fact_verdict === 'vague'        ? '#fbbf24'
-              : f.fact_verdict === 'unreliable'   ? '#f87171'
-              : '#6b7280';
-    const lbl = 'F' + f.id + ': ' + (f.claim||'').substring(0,30) + ((f.claim||'').length>30?'…':'');
-    addNode('f'+f.id, {
-      label: lbl, shape: 'box', level: 0,
-      color: { background: col+'22', border: col, highlight: { background: col+'44', border: col } },
-      font: { color: '#e2e8f0', size: 11, multi: false },
-      margin: 8,
-    });
-  });
-
-  // ── Condition nodes ──
-  conds.forEach(c => {
-    const col = c.condition_type === 'assumption' ? '#f59e0b' : '#94a3b8';
-    const lbl = 'C' + c.id + ': ' + (c.condition_text||'').substring(0,30) + ((c.condition_text||'').length>30?'…':'');
-    addNode('c'+c.id, {
-      label: lbl, shape: 'diamond', level: 0,
-      color: { background: col+'22', border: col, highlight: { background: col+'44', border: col } },
-      font: { color: '#e2e8f0', size: 11 },
-      margin: 8,
-    });
-  });
-
-  // ── Conclusion + Solution nodes & edges ──
-  const solAdded = new Set();
-  concls.forEach(conc => {
-    const isCore  = conc.is_core_conclusion;
-    const isCycle = conc.is_in_cycle;
-    const border  = isCycle ? '#f87171' : isCore ? '#a78bfa' : '#818cf8';
-    const bg      = isCore  ? '#7c3aed' : '#6366f1';
-    const lbl     = (isCore ? '★ ' : '') + 'Conc' + conc.id + ': ' + (conc.claim||'').substring(0,28) + ((conc.claim||'').length>28?'…':'');
-    addNode('conc'+conc.id, {
-      label: lbl, shape: 'ellipse', level: 1,
-      color: { background: bg+'22', border: border, highlight: { background: bg+'44', border: border } },
-      font: { color: '#e2e8f0', size: 11, bold: isCore },
-      margin: 10,
-    });
-
-    // edges: facts → conclusion
-    (conc.supporting_facts || []).forEach(f => {
-      edges.add({ from: 'f'+f.id, to: 'conc'+conc.id, arrows: 'to',
-        color: { color: '#4b5563', highlight: '#818cf8' }, smooth: { type: 'curvedCW', roundness: 0.1 } });
-    });
-    // edges: conditions → conclusion
-    (conc.supporting_condition_ids || []).forEach(cid => {
-      edges.add({ from: 'c'+cid, to: 'conc'+conc.id, arrows: 'to', dashes: true,
-        color: { color: '#4b5563', highlight: '#f59e0b' }, smooth: { type: 'curvedCW', roundness: 0.1 } });
-    });
-    // edges: conclusion → conclusion
-    (conc.supporting_conclusion_ids || []).forEach(cid => {
-      edges.add({ from: 'conc'+cid, to: 'conc'+conc.id, arrows: 'to',
-        color: { color: '#6366f1', highlight: '#a78bfa' }, smooth: { type: 'curvedCW', roundness: 0.15 } });
-    });
-    // solution nodes + edges
-    (conc.solutions || []).forEach(s => {
-      if (!solAdded.has(s.id)) {
-        const lbl = 'Sol' + s.id + ': ' + (s.action_target||s.claim||'').substring(0,28) + ((s.action_target||s.claim||'').length>28?'…':'');
-        addNode('sol'+s.id, {
-          label: lbl, shape: 'box', level: 2,
-          color: { background: '#1e3a5f', border: '#60a5fa', highlight: { background: '#1e40af', border: '#93c5fd' } },
-          font: { color: '#e2e8f0', size: 11 },
-          margin: 8,
-        });
-        solAdded.add(s.id);
-      }
-      edges.add({ from: 'conc'+conc.id, to: 'sol'+s.id, arrows: 'to',
-        color: { color: '#1d4ed8', highlight: '#60a5fa' }, smooth: { type: 'curvedCW', roundness: 0.1 } });
-    });
-  });
-
-  const total = facts.length + conds.length + concls.length + solAdded.size;
-  document.getElementById('dagCount').textContent = total + ' 个节点';
-
-  const container = document.getElementById('dagContainer');
-  if (_dagNetwork) { _dagNetwork.destroy(); }
-  _dagNetwork = new vis.Network(container, { nodes, edges }, {
-    layout: {
-      hierarchical: {
-        enabled: true,
-        direction: 'LR',
-        sortMethod: 'directed',
-        levelSeparation: 220,
-        nodeSpacing: 120,
-        treeSpacing: 180,
-        blockShifting: true,
-        edgeMinimization: true,
-        parentCentralization: true,
-      },
-    },
-    physics: { enabled: false },
-    interaction: { hover: true, tooltipDelay: 200, navigationButtons: false, zoomView: true },
-    edges: {
-      width: 1.5,
-      selectionWidth: 2.5,
-      smooth: { enabled: true },
-    },
-    nodes: { borderWidth: 1.5, borderWidthSelected: 2.5 },
-    background: '#0d1117',
-  });
+  return s;
 }
 
-function renderAll(data) {
-  document.getElementById('resultsSection').classList.add('visible');
-  renderFacts(data.facts || []);
-  renderConditions(data.conditions || []);
-  try { renderDAG(data); } catch(e) {
-    console.error('DAG render error:', e);
-    document.getElementById('dagContainer').innerHTML =
-      '<div style="padding:40px;text-align:center;color:var(--text-dim);font-size:13px;">逻辑关系图渲染失败：' + e.message + '</div>';
-  }
-  renderConclusions(data.conclusions || [], data.facts || [], data.conditions || []);
+// 变化视图 diff card — 两列对比表格
+function renderPolicyDiffCard(pol) {
+  const intMap = {
+    strong:['int int-s','强'], moderate:['int int-m','中'], weak:['int int-w','宽']
+  };
+  const [intCls, intLbl] = intMap[pol.intensity] || ['int int-w', pol.intensity||'—'];
+  const [prevCls, prevLbl] = intMap[pol.intensity_prev] || ['int int-w', pol.intensity_prev||'—'];
 
-  // 收集所有 role_fit 评估（结论 + 解决方案）供作者面板独立展示
-  const roleFitItems = [];
-  (data.conclusions || []).forEach(c => {
-    if (c.role_fit) roleFitItems.push({
-      label: c.canonical_claim || c.claim || '',
-      role_fit: c.role_fit,
-      note: c.role_fit_note || null,
-      kind: 'conclusion',
-    });
-    (c.solutions || []).forEach(s => {
-      if (s.role_fit) roleFitItems.push({
-        label: s.claim || '',
-        role_fit: s.role_fit,
-        note: s.role_fit_note || null,
-        kind: 'solution',
-      });
-    });
-  });
+  const hasPrev = !!(pol.target_prev || pol.background_prev || pol.organization_prev || pol.intensity_prev);
+  const intensityChanged = pol.intensity && pol.intensity_prev && pol.intensity !== pol.intensity_prev;
 
-  renderAuthor(data.author, roleFitItems);
-  renderContentQuality(data.quality, data.stance_profile);
-  renderAuthorStats(data.stats);
-}
+  // 判断是否有实质变化（任一字段不同）
+  const hasChange = intensityChanged ||
+    (pol.intensity_note && pol.intensity_note.length > 0);
 
-// ─── Facts ────────────────────────────────────────────────────────────────────
+  const rows = [
+    {lbl:'目标', curr: pol.target,      prev: pol.target_prev,      type:'target'},
+    {lbl:'力度', curr: pol.intensity,   prev: pol.intensity_prev,   type:'intensity'},
+    {lbl:'背景', curr: pol.background,  prev: pol.background_prev,  type:'bg'},
+    {lbl:'组织', curr: pol.organization,prev: pol.organization_prev,type:'org'},
+  ];
 
-function renderFacts(facts) {
-  document.getElementById('factsCount').textContent = facts.length + ' 条';
-  const grid = document.getElementById('factsGrid');
-  if (!facts.length) {
-    grid.innerHTML = '<div style="color:var(--text-dim);padding:8px;">无事实</div>';
-    return;
-  }
-  grid.innerHTML = facts.map(f => {
-    const detailId = 'fd' + f.id;
-    const hasDetail = f.alignment_evidence || (f.refs && f.refs.length);
-    const temporalNote = f.temporal_note
-      ? `<div style="font-size:11px;color:var(--text-dim);margin-top:6px;">⏱ ${esc(f.temporal_note)}</div>`
-      : '';
-    return `
-<div class="card">
-  <div class="card-header">
-    <div class="card-id">F${f.id}</div>
-    <div class="card-claim">${esc(f.claim)}</div>
-  </div>
-  <div class="card-meta">
-    ${f.fact_source_tier ? badge(f.fact_source_tier, SOURCE_TIER_LABELS[f.fact_source_tier] || f.fact_source_tier) : ''}
-    ${factVerdictBadge(f.fact_verdict)}
-    ${!f.is_verifiable ? badge('unavailable','不可核实') : ''}
-  </div>
-  ${temporalNote}
-  ${hasDetail ? `
-  <div class="toggle-btn collapsed" onclick="toggleDetail('${detailId}',this)">核查详情</div>
-  <div id="${detailId}" style="display:none;" class="detail-block">
-    ${f.alignment_evidence ? `<div class="detail-label">核查摘要</div><div class="detail-text">${esc(f.alignment_evidence)}</div>` : ''}
-    ${f.verifiable_statement ? `<div class="detail-label">可验证陈述</div><div class="detail-text">${esc(f.verifiable_statement)}</div>` : ''}
-    ${(f.refs && f.refs.length) ? `<div class="detail-label">参考来源</div>${f.refs.map(r => `<div class="detail-text">📌 [${esc(r.org)}] ${esc(r.desc)}${r.url ? ' — <a href="'+esc(r.url)+'" target="_blank" style="font-size:11px;">链接</a>' : ''}</div>`).join('')}` : ''}
-  </div>` : ''}
-</div>`;
-  }).join('');
-}
+  // 表头年份
+  const currYear = currentData && currentData.post && currentData.post.posted_at
+    ? currentData.post.posted_at.slice(0,4) : '当年';
+  const prevYear = String(parseInt(currYear) - 1) || '上年';
 
-// ─── Conditions (assumption + implicit) ──────────────────────────────────────
+  const thead = `<tr>
+    <th style="width:42px"></th>
+    <th class="col-year">${currYear}</th>
+    <th class="col-year">${hasPrev ? prevYear : '上年（未获取）'}</th>
+  </tr>`;
 
-function renderConditions(conds) {
-  document.getElementById('condsCount').textContent = conds.length + ' 条';
-  const grid = document.getElementById('condsGrid');
-  if (!conds.length) {
-    grid.innerHTML = '<div style="color:var(--text-dim);padding:8px;">无条件</div>';
-    return;
-  }
-  grid.innerHTML = conds.map(c => {
-    const typeLabel = c.condition_type === 'assumption' ? '假设条件' : '隐含条件';
-    const detailId = 'cd' + c.id;
-    const hasDetail = c.alignment_evidence || c.verifiable_statement;
-    return `
-<div class="card">
-  <div class="card-header">
-    <div class="card-id">C${c.id}</div>
-    <div class="card-claim">${esc(c.condition_text)}</div>
-  </div>
-  <div class="card-meta">
-    ${badge(c.condition_type, typeLabel)}
-    ${condVerdictBadge(c)}
-  </div>
-  ${c.temporal_note ? `<div style="font-size:11px;color:var(--text-dim);margin-top:6px;">⏱ ${esc(c.temporal_note)}</div>` : ''}
-  ${hasDetail ? `
-  <div class="toggle-btn collapsed" onclick="toggleDetail('${detailId}',this)">详情</div>
-  <div id="${detailId}" style="display:none;" class="detail-block">
-    ${c.alignment_evidence ? `<div class="detail-label">判定依据</div><div class="detail-text">${esc(c.alignment_evidence)}</div>` : ''}
-    ${c.verifiable_statement ? `<div class="detail-label">可验证陈述</div><div class="detail-text">${esc(c.verifiable_statement)}</div>` : ''}
-  </div>` : ''}
-</div>`;
-  }).join('');
-}
-
-function condItemInline(cond) {
-  const typeLabel = cond.condition_type === 'assumption' ? '假设' : '隐含';
-  return `
-<div class="cond-item ${cond.condition_verdict || 'pending'}">
-  <div class="cond-text">${esc(cond.condition_text)}</div>
-  <div class="cond-meta">
-    ${badge(cond.condition_type, typeLabel)}
-    ${condVerdictBadge(cond)}
-  </div>
-</div>`;
-}
-
-// ─── Conclusions Table ────────────────────────────────────────────────────────
-
-function renderConclusions(conclusions, allFacts, allConds) {
-  document.getElementById('conclusionsCount').textContent = conclusions.length + ' 个';
-  const body = document.getElementById('conclusionsBody');
-  if (!conclusions.length) {
-    body.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-dim);padding:40px;">无结论</td></tr>';
-    return;
-  }
-
-  // Build condition map for lookup by id
-  const condMap = {};
-  (allConds || []).forEach(cond => { condMap[cond.id] = cond; });
-
-  body.innerHTML = conclusions.map((c, ci) => {
-    // ── Col 1: Conclusion ──
-    const typeLabel = c.conclusion_type === 'predictive' ? '预测型' : '回顾型';
-    const confLabel = c.author_confidence ? (CONF_LABELS[c.author_confidence] || c.author_confidence) : null;
-    const coreTag = c.is_core_conclusion ? `<span style="font-size:11px;color:var(--yellow);font-weight:700;" title="核心结论（逻辑链终点）">★ 核心</span>` : '';
-    const cycleTag = c.is_in_cycle ? `<span style="font-size:11px;color:var(--red);font-weight:700;" title="存在循环引用，跳过裁定">⚠ 循环</span>` : '';
-    const col1 = `
-<div class="conc-claim-text">${esc(c.claim)}</div>
-<div class="conc-meta-row">
-  ${badge(c.conclusion_type, typeLabel)}
-  ${confLabel ? badge(c.author_confidence, confLabel) : ''}
-  ${coreTag}${cycleTag}
-</div>
-${c.author_confidence_note ? `<div class="conc-quote">"${esc(c.author_confidence_note)}"</div>` : ''}
-${c.temporal_note || c.time_horizon_note ? `<div style="font-size:11px;color:var(--text-dim);margin-top:6px;">⏱ ${esc(c.temporal_note || c.time_horizon_note)}</div>` : ''}
-${c.chain_summary ? `<div style="font-size:11px;color:var(--text-dim);margin-top:6px;">💡 ${esc(c.chain_summary)}</div>` : ''}`;
-
-    // ── Col 2: Supporting Facts + Conditions ──
-    const sfItems = (c.supporting_facts || []).map(f => `
-<div class="fact-ref role-supporting">
-  <div class="fact-ref-header">
-    <span style="font-size:10px;color:var(--text-dim);font-family:monospace;">F${f.id}</span>
-    ${f.fact_source_tier ? badge(f.fact_source_tier, SOURCE_TIER_LABELS[f.fact_source_tier] || f.fact_source_tier) : ''}
-    ${factVerdictBadge(f.fact_verdict)}
-  </div>
-  <div class="fact-ref-claim">${esc(f.claim)}</div>
-</div>`);
-    const condItems = (c.supporting_condition_ids || []).map(cid => {
-      const cond = condMap[cid];
-      return cond ? condItemInline(cond) : '';
-    }).filter(Boolean);
-    const allCol2 = sfItems.concat(condItems.length ? [`<div class="cond-list">${condItems.join('')}</div>`] : []);
-    const col2 = allCol2.length ? allCol2.join('') : `<span style="color:var(--text-dim);font-size:12px;">无关联事实</span>`;
-
-    // ── Col 3: Solutions ──
-    const solItems = (c.solutions || []).map(s => `
-<div class="sol-ref">
-  <div class="sol-ref-header">
-    ${s.action_type ? `<span class="sol-action-tag">${s.action_type.toUpperCase()}</span>` : ''}
-    <span style="font-size:13px;font-weight:600;">${esc(s.action_target || '')}</span>
-    ${s.verdict ? verdictBadge(s.verdict) : ''}
-  </div>
-  <div class="sol-claim">${esc(s.claim)}</div>
-  ${s.baseline_value ? `<div class="sol-baseline">基准：${esc(s.baseline_metric || '')} = <strong>${esc(s.baseline_value)}</strong></div>` : ''}
-  ${s.monitoring_period_note ? `<div style="font-size:11px;color:var(--text-dim);margin-top:4px;">📅 ${esc(s.monitoring_period_note)}</div>` : ''}
-</div>`);
-    const col3 = solItems.length ? solItems.join('') : `<span style="color:var(--text-dim);font-size:12px;">无解决方案</span>`;
-
-    // ── Col 4: Semantic Verdict ──
-    const col4 = (() => {
-      if (c.is_in_cycle) {
-        return `<div class="verdict-cell"><span style="color:var(--red);font-size:12px;">⚠ 跳过（循环）</span></div>`;
-      }
-      const semanticBadge = concVerdictBadge(c);
-      const overallBadge = c.verdict && c.verdict !== 'null' ? verdictBadge(c.verdict) : '';
-      const lvKey = c.logic_validity;
-      const lvLabel = lvKey ? (LOGIC_VALIDITY_LABELS[lvKey] || lvKey) : '';
-      const lvColor = lvKey === 'valid' ? 'var(--green)' : lvKey === 'invalid' ? 'var(--red)' : 'var(--yellow)';
-      return `
-<div class="verdict-cell">
-  <div class="verdict-main">${semanticBadge}</div>
-  <div class="verdict-sub">
-    ${overallBadge ? `<div class="verdict-sub-row">${overallBadge}</div>` : ''}
-    ${lvLabel ? `<div class="verdict-sub-row" style="color:${lvColor};font-size:11px;">${esc(lvLabel)}</div>` : ''}
-  </div>
-</div>`;
-    })();
-
-    return `<tr><td>${col1}</td><td>${col2}</td><td>${col3}</td><td>${col4}</td></tr>`;
-  }).join('');
-}
-
-// ─── Author ───────────────────────────────────────────────────────────────────
-
-function renderAuthor(a, roleFitItems) {
-  if (!a) { document.getElementById('authorContent').innerHTML = '<div style="color:var(--text-dim)">暂无数据</div>'; return; }
-  const tier = a.credibility_tier;
-  const tierColor = tier === 1 ? 'var(--green)' : tier === 2 ? 'var(--yellow)' : 'var(--text-dim)';
-  const tierLbl = tier ? `Tier${tier} · ${TIER_LABELS[tier] || '?'}` : '—';
-
-  // 跨平台关联
-  let groupHtml = '';
-  if (a.author_group && (a.author_group_members && a.author_group_members.length > 0)) {
-    const members = a.author_group_members.map(m =>
-      `<span style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;background:rgba(99,102,241,0.1);border-radius:6px;font-size:11px;margin-right:4px;">${esc(m.platform)} · ${esc(m.name)}</span>`
-    ).join('');
-    groupHtml = `<tr><td>跨平台关联</td><td style="font-size:12px;">${members}</td></tr>`;
-  }
-
-  const reprofileBtn = a.id
-    ? `<button onclick="reprofileAuthor(${a.id})" style="margin-top:14px;padding:6px 14px;border-radius:6px;background:rgba(99,102,241,0.15);border:1px solid rgba(99,102,241,0.4);color:var(--accent2);font-size:12px;cursor:pointer;" title="强制重新联网查询作者档案（修正 tier=5 或过时数据）">🔄 重新联网查询档案</button>`
-    : '';
-
-  // ── 专业背景评估模块 ──────────────────────────────────────────────────────
-  let bgAssessHtml = '';
-  const items = roleFitItems || [];
-
-  // 可信度不足时的警告（tier 4/5 或未知）
-  let credWarning = '';
-  if (!tier || tier >= 4) {
-    const warnMsg = tier === 4
-      ? '该作者为普通媒体/KOL，专业背景有限，观点仅供参考。'
-      : '该作者专业背景不明，无法评估其观点的权威性。';
-    credWarning = `
-<div style="margin-bottom:10px;padding:8px 12px;border-radius:6px;background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);font-size:12px;color:#fbbf24;">
-  ⚠ ${warnMsg}
-</div>`;
-  }
-
-  // role_fit 汇总
-  const RF_COLOR = { appropriate: 'var(--green)', questionable: '#fbbf24', mismatched: 'var(--red)' };
-  const RF_LABEL = { appropriate: '匹配', questionable: '存疑', mismatched: '不匹配' };
-  const hasIssues = items.some(r => r.role_fit === 'questionable' || r.role_fit === 'mismatched');
-
-  let rfSummaryHtml = '';
-  if (items.length > 0) {
-    const issueCnt = items.filter(r => r.role_fit !== 'appropriate').length;
-    const summaryLine = issueCnt > 0
-      ? `<div style="font-size:12px;color:#fbbf24;margin-bottom:8px;">⚠ ${issueCnt} 个观点存在角色匹配问题（不影响裁定，仅供参考）</div>`
-      : `<div style="font-size:12px;color:var(--text-dim);margin-bottom:8px;">所有观点与作者背景匹配（不影响裁定）</div>`;
-
-    const rfRows = items.map(r => {
-      const col = RF_COLOR[r.role_fit] || 'var(--text-dim)';
-      const lbl = RF_LABEL[r.role_fit] || r.role_fit;
-      const noteHtml = r.note ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px;font-style:italic;">${esc(r.note)}</div>` : '';
-      const kindBadge = r.kind === 'solution'
-        ? `<span style="font-size:10px;background:rgba(99,102,241,0.15);padding:1px 5px;border-radius:4px;margin-right:4px;">建议</span>`
-        : '';
-      return `
-<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05);">
-  <div style="display:flex;align-items:flex-start;gap:8px;">
-    <span style="color:${col};font-weight:600;font-size:11px;white-space:nowrap;padding-top:1px;">${lbl}</span>
-    <span style="font-size:12px;color:var(--text-secondary);flex:1;">${kindBadge}${esc(r.label)}</span>
-  </div>
-  ${noteHtml}
-</div>`;
-    }).join('');
-
-    rfSummaryHtml = summaryLine + `<div style="border-top:1px solid rgba(255,255,255,0.07);">${rfRows}</div>`;
-  }
-
-  if (credWarning || rfSummaryHtml) {
-    bgAssessHtml = `
-<div style="margin-top:16px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.1);">
-  <div style="font-size:11px;font-weight:600;letter-spacing:.06em;color:var(--text-dim);text-transform:uppercase;margin-bottom:10px;">专业背景评估</div>
-  ${credWarning}${rfSummaryHtml}
-</div>`;
-  }
-
-  document.getElementById('authorContent').innerHTML = `
-<table class="info-table">
-  <tr><td>姓名</td><td><strong style="font-size:15px;">${esc(a.name || '—')}</strong></td></tr>
-  <tr><td>平台</td><td>${esc(a.platform || '—')}</td></tr>
-  <tr><td>角色</td><td>${esc(a.role || '—')}</td></tr>
-  <tr><td>可信度</td><td><span class="tier-badge" style="color:${tierColor};background:transparent;padding-left:0;">${tierLbl}</span></td></tr>
-  <tr><td>专业领域</td><td style="color:var(--text-dim)">${esc(a.expertise_areas || '—')}</td></tr>
-  <tr><td>已知偏见</td><td style="color:var(--text-dim)">${esc(a.known_biases || '—')}</td></tr>
-  ${a.profile_note ? `<tr><td>简介</td><td style="color:var(--text-dim);font-size:12px;">${esc(a.profile_note)}</td></tr>` : ''}
-  ${groupHtml}
-</table>
-${bgAssessHtml}
-${reprofileBtn}`;
-}
-
-async function reprofileAuthor(authorId) {
-  const btn = event.target;
-  btn.disabled = true;
-  btn.textContent = '⏳ 查询中...';
-  try {
-    const resp = await fetch('/reprofile', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({author_id: authorId}),
-    });
-    const data = await resp.json();
-    if (data.ok) {
-      btn.textContent = `✓ 已更新：Tier${data.credibility_tier} ${esc(data.role || '')}`;
-      btn.style.color = 'var(--green)';
-      btn.style.borderColor = 'rgba(34,197,94,0.4)';
+  const tbody = rows.map(r => {
+    let currCell, prevCell;
+    if (r.type === 'intensity') {
+      // 力度行：两列都显示 badge，下方附 intensity_note
+      const [cCls, cLbl] = intMap[r.curr] || ['int int-w', r.curr||'—'];
+      const [pCls, pLbl] = intMap[r.prev] || ['int int-w', r.prev||''];
+      currCell = `<span class="${cCls}">${cLbl}</span>` +
+        (pol.intensity_note ? `<div style="font-size:11px;color:var(--yellow);margin-top:4px">${esc(pol.intensity_note)}</div>` : '');
+      prevCell = r.prev ? `<span class="${pCls}">${pLbl}</span>` +
+        (pol.intensity_note_prev ? `<div style="font-size:11px;color:var(--yellow);margin-top:4px">${esc(pol.intensity_note_prev)}</div>` : '')
+        : '<span style="color:var(--text2)">—</span>';
     } else {
-      btn.textContent = '✗ 查询失败';
-      btn.style.color = 'var(--red)';
+      currCell = hilightField(r.curr, r.type);
+      prevCell = hilightField(r.prev, r.type);
     }
-  } catch(e) {
-    btn.textContent = '✗ 请求失败: ' + e;
-    btn.style.color = 'var(--red)';
-  }
-}
+    return `<tr>
+      <td class="col-lbl">${r.lbl}</td>
+      <td class="col-curr">${currCell}</td>
+      <td class="col-prev">${prevCell}</td>
+    </tr>`;
+  }).join('');
 
-// ─── Content Quality (本篇内容评估) ──────────────────────────────────────────
-
-const STANCE_COLORS = {
-  '看涨/多头':  '#22c55e',
-  '看跌/空头':  '#f87171',
-  '中立/客观':  '#7c87a0',
-  '警告/防御':  '#fbbf24',
-  '批判/质疑':  '#fb923c',
-  '政策倡导':   '#a78bfa',
-  '教育/分析':  '#60a5fa',
-  '其他':       '#6b7280',
-};
-
-function renderContentQuality(q, stanceProfile) {
-  let html = '';
-  if (!q) {
-    html = '<div style="color:var(--text-dim);font-size:13px;">质量评估暂无数据</div>';
-    document.getElementById('contentQualityContent').innerHTML = html;
-    return;
-  }
-
-  const uPct = q.uniqueness_score != null ? (q.uniqueness_score * 100).toFixed(0) : null;
-  const ePct = q.effectiveness_score != null ? (q.effectiveness_score * 100).toFixed(0) : null;
-
-  html += `
-<div class="quality-twin">
-  <div class="quality-card">
-    <div class="quality-num" style="color:${scoreColor(q.uniqueness_score)}">${uPct != null ? uPct + '%' : '—'}</div>
-    <div class="quality-lbl">内容独特性</div>
-    <div class="quality-sub" style="color:var(--text-dim)">${q.is_first_mover ? '🥇 首发内容' : '已有类似观点'}</div>
-  </div>
-  <div class="quality-card">
-    <div class="quality-num" style="color:${scoreColor(q.effectiveness_score)}">${ePct != null ? ePct + '%' : '—'}</div>
-    <div class="quality-lbl">内容有效性</div>
-    <div class="quality-sub" style="color:var(--text-dim)">噪声率 ${q.noise_ratio != null ? (q.noise_ratio*100).toFixed(0)+'%' : '—'}</div>
-  </div>
-</div>`;
-
-  if (q.uniqueness_note) html += `<div class="detail-text" style="margin-bottom:8px;">${esc(q.uniqueness_note)}</div>`;
-  if (q.effectiveness_note) html += `<div class="detail-text" style="margin-bottom:8px;">${esc(q.effectiveness_note)}</div>`;
-  if (q.noise_types && q.noise_types.length) {
-    html += `<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px;">噪声类型：${q.noise_types.map(t => `<span style="padding:1px 6px;background:rgba(248,113,113,0.1);border-radius:4px;color:var(--red);margin-right:4px;">${esc(t)}</span>`).join('')}</div>`;
-  }
-
-  // ── 当篇立场分析 ──
-  if (q.stance_label) {
-    const stanceColor = STANCE_COLORS[q.stance_label] || '#7c87a0';
-    html += `<hr class="score-divider">
-<div style="margin-bottom:10px;">
-  <div class="detail-label" style="margin-bottom:8px;">当篇立场</div>
-  <span style="display:inline-block;padding:4px 14px;border-radius:999px;font-size:13px;font-weight:700;color:${stanceColor};background:${stanceColor}18;border:1px solid ${stanceColor}44;">${esc(q.stance_label)}</span>
-</div>`;
-    if (q.stance_note) {
-      html += `<div class="detail-text">${esc(q.stance_note)}</div>`;
-    }
-  }
-
-  // ── 作者立场历史分布 ──
-  if (stanceProfile && stanceProfile.total_analyzed > 0) {
-    const domColor = STANCE_COLORS[stanceProfile.dominant_stance] || '#7c87a0';
-    const domPct = stanceProfile.dominant_stance_ratio != null
-      ? (stanceProfile.dominant_stance_ratio * 100).toFixed(0) + '%' : '—';
-    html += `<hr class="score-divider">
-<div style="margin-bottom:10px;">
-  <div class="detail-label" style="margin-bottom:8px;">作者立场历史（${stanceProfile.total_analyzed} 篇）</div>
-  <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
-    <span style="display:inline-block;padding:3px 12px;border-radius:999px;font-size:12px;font-weight:700;color:${domColor};background:${domColor}18;border:1px solid ${domColor}44;">${esc(stanceProfile.dominant_stance || '—')}</span>
-    <span style="font-size:12px;color:var(--text-dim);">主导立场 · ${domPct}</span>
+  const body = `<div class="diff-body">
+    <table class="diff-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table>
   </div>`;
 
-    // 分布条
-    const dist = stanceProfile.distribution || {};
-    const total = stanceProfile.total_analyzed;
-    const entries = Object.entries(dist).sort((a,b) => b[1]-a[1]);
-    if (entries.length > 0) {
-      html += `<div style="display:flex;flex-direction:column;gap:5px;">`;
-      for (const [stance, count] of entries) {
-        const pct = (count / total * 100).toFixed(0);
-        const color = STANCE_COLORS[stance] || '#6b7280';
-        html += `<div style="display:flex;align-items:center;gap:8px;">
-  <div style="font-size:11px;color:var(--text-dim);min-width:80px;flex-shrink:0;">${esc(stance)}</div>
-  <div style="flex:1;height:4px;background:var(--surface2);border-radius:999px;overflow:hidden;">
-    <div style="height:100%;width:${pct}%;background:${color};border-radius:999px;"></div>
-  </div>
-  <div style="font-size:11px;color:var(--text-dim);min-width:28px;text-align:right;">${count}</div>
-</div>`;
-      }
-      html += `</div>`;
-    }
-    html += `</div>`;
-  }
+  const summaryRow = pol.change_summary
+    ? `<div class="diff-summary">${esc(pol.change_summary)}</div>`
+    : '';
 
-  document.getElementById('contentQualityContent').innerHTML = html;
+  return `<div class="diff-card open">
+    <div class="diff-hd" onclick="this.closest('.diff-card').classList.toggle('open')">
+      <span class="diff-chev">▶</span>
+      <span class="theme-name">${esc(pol.theme)}</span>
+      ${hasChange
+        ? `<span class="diff-count" style="color:var(--yellow)">有变化</span>`
+        : `<span class="diff-count" style="color:var(--text2)">基本延续</span>`}
+      ${summaryRow}
+    </div>
+    ${body}
+  </div>`;
 }
 
-// ─── Author Stats (作者历史综合评估) ─────────────────────────────────────────
+// v3 完整视图 card
+function renderPolicyCardV3(pol) {
+  const intMap = {
+    strong:['int int-s','强'], moderate:['int int-m','中'], weak:['int int-w','宽']
+  };
+  const [intCls, intLbl] = intMap[pol.intensity] || ['int int-w', pol.intensity||'—'];
 
-function renderAuthorStats(stats) {
-  let html = '';
-  if (!stats || stats.overall_credibility_score == null) {
-    html = '<div style="color:var(--text-dim);font-size:13px;">作者综合评估暂无数据</div>';
-    document.getElementById('authorStatsContent').innerHTML = html;
+  const trendMap = {
+    '升级':'trend trend-up','降级':'trend trend-down',
+    '延续':'trend trend-cont','新增':'trend trend-new','删除':'trend trend-cont'
+  };
+
+  const measuresHtml = pol.measures.length
+    ? `<div class="measure-list">
+        ${pol.measures.map(m => {
+          const tCls = trendMap[m.trend] || 'trend trend-cont';
+          return `<div class="measure-item">
+            <div style="padding-top:2px;flex-shrink:0"><span class="${tCls}">${esc(m.trend||'—')}</span></div>
+            <div class="measure-body">
+              <div class="measure-summary">${esc(m.summary)}</div>
+              <div class="measure-text">${esc(m.measure_text)}</div>
+              ${m.trend_note ? `<div class="measure-note">${esc(m.trend_note)}</div>` : ''}
+              ${debugMode ? `<div class="measure-note" style="color:var(--border)">measure_id=${m.id}</div>` : ''}
+            </div>
+          </div>`;
+        }).join('')}
+      </div>`
+    : '<div style="padding:8px 14px;font-size:12px;color:var(--text2);">暂无手段条目</div>';
+
+  return `<div class="theme-card">
+    <div class="theme-hd">
+      <span class="theme-chev">▶</span>
+      <span class="theme-name">${esc(pol.theme)}</span>
+      <span class="${intCls}">${intLbl}</span>
+      <span class="cnt">${pol.measures.length} 条手段</span>
+      ${debugMode ? `<span style="font-size:10px;color:var(--text2)">id=${pol.id}</span>` : ''}
+    </div>
+    <div class="theme-body">
+      ${pol.target ? `<div class="pol-field"><span class="pol-field-lbl">目标</span><span class="pol-field-val">${esc(pol.target)}</span></div>` : ''}
+      ${pol.intensity_note ? `<div class="pol-field"><span class="pol-field-lbl">力度对比</span><span class="pol-field-val" style="color:var(--yellow)">${esc(pol.intensity_note)}</span></div>` : ''}
+      ${pol.background ? `<div class="pol-field"><span class="pol-field-lbl">背景</span><span class="pol-field-val">${esc(pol.background)}</span></div>` : ''}
+      ${pol.organization ? `<div class="pol-field"><span class="pol-field-lbl">组织</span><span class="pol-field-val">${esc(pol.organization)}</span></div>` : ''}
+      ${measuresHtml}
+    </div>
+  </div>`;
+}
+
+function renderPolicyV3(data) {
+  const p = data.post;
+  const policies = data.policies || [];
+  const facts = data.facts || [];
+  const conclusions = data.conclusions || [];
+
+  const deleted = facts.filter(f => f.summary && f.summary.startsWith('[删除]'));
+  const regularFacts = facts.filter(f => !f.summary.startsWith('[删除]'));
+
+  // Trend stats
+  let nUp=0, nDown=0, nCont=0, nNew=0;
+  policies.forEach(pol => pol.measures.forEach(m => {
+    if (m.trend==='升级') nUp++;
+    else if (m.trend==='降级') nDown++;
+    else if (m.trend==='延续') nCont++;
+    else if (m.trend==='新增') nNew++;
+  }));
+  const hasTrend = (nUp+nDown+nCont+nNew) > 0;
+
+  let h = '';
+
+  // Summary card
+  h += `<div class="summary-card">
+    <div class="s-meta">
+      ${sfield('作者', esc(p.author_name))}
+      ${p.posted_at ? sfield('日期', esc(p.posted_at.slice(0,10))) : ''}
+      ${p.issuing_authority ? sfield('发文机关', esc(p.issuing_authority)) : ''}
+      ${p.authority_level ? sfield('权威级别', esc(p.authority_level)) : ''}
+      ${p.content_type ? sfield('类型', `<span class="bd bd-accent">${esc(p.content_type)}</span>`) : ''}
+    </div>
+    ${p.content_topic ? `<div style="font-size:15px;font-weight:600;margin-bottom:6px;">${esc(p.content_topic)}</div>` : ''}
+    ${p.content_summary ? `<div class="s-summary">${esc(p.content_summary)}</div>` : ''}
+  </div>`;
+
+  if (debugMode) {
+    h += `<div class="dbg-block">
+      <div class="dbg-title">Chain 2 — 分类输出</div>
+      <div class="dbg-grid">
+        ${dbgField('内容类型', p.content_type)}
+        ${p.content_type_secondary ? dbgField('次要类型', p.content_type_secondary) : ''}
+        ${dbgField('内容主题', p.content_topic)}
+        ${dbgField('作者意图', p.author_intent)}
+        ${dbgField('发文机关', p.issuing_authority)}
+        ${dbgField('机关级别', p.authority_level)}
+      </div>
+      ${p.intent_note ? `<div class="dbg-note">意图说明：${esc(p.intent_note)}</div>` : ''}
+    </div>`;
+  }
+
+  if (debugMode && p.content) {
+    h += `<div class="sec"><div class="sec-title">原始内容</div>
+      <div class="raw-content">${esc(p.content)}</div></div>`;
+  }
+
+  // Trend stats
+  if (hasTrend) {
+    h += `<div class="sec"><div class="sec-title">手段趋势概览</div>
+      <div class="cmp-stats">
+        <div class="cmp-pill"><div class="cmp-num cmp-new">${nUp}</div><div class="cmp-lbl">升级</div></div>
+        <div class="cmp-pill"><div class="cmp-num cmp-adj">${nNew}</div><div class="cmp-lbl">新增</div></div>
+        <div class="cmp-pill"><div class="cmp-num cmp-con">${nCont}</div><div class="cmp-lbl">延续</div></div>
+        <div class="cmp-pill"><div class="cmp-num cmp-del">${nDown}</div><div class="cmp-lbl">降级</div></div>
+      </div></div>`;
+  }
+
+  // Policy cards
+  if (policies.length) {
+    const cardHtml = policyView === 'diff'
+      ? policies.map(pol => renderPolicyDiffCard(pol)).join('')
+      : policies.map(pol => renderPolicyCardV3(pol)).join('');
+    h += `<div class="sec">
+      <div class="sec-title" style="display:flex;align-items:center">
+        政策主旨 <span class="cnt">${policies.length}</span>
+        <div class="view-toggle">
+          <button class="view-btn ${policyView==='diff'?'active':''}" data-v="diff" onclick="setPolicyView('diff')">变化视图</button>
+          <button class="view-btn ${policyView==='full'?'active':''}" data-v="full" onclick="setPolicyView('full')">完整视图</button>
+        </div>
+      </div>
+      ${cardHtml}</div>`;
+  }
+
+  if (regularFacts.length) {
+    h += `<div class="sec"><div class="sec-title">事实陈述 <span class="cnt">${regularFacts.length}</span></div>
+      <div class="eg">${regularFacts.map(f => renderFactCard(f)).join('')}</div></div>`;
+  }
+
+  if (deleted.length) {
+    h += `<div class="sec">
+      <div class="sec-title" style="color:var(--red)">删除政策 <span class="cnt">${deleted.length}</span></div>
+      <div class="del-list">
+        ${deleted.map(f => `<div class="del-item">• ${esc(f.summary.replace(/^\[删除\]\s*/,''))}</div>`).join('')}
+      </div></div>`;
+  }
+
+  if (conclusions.length) {
+    h += `<div class="sec"><div class="sec-title">结论 <span class="cnt">${conclusions.length}</span></div>
+      <div class="eg">${conclusions.map(c => renderConcCard(c)).join('')}</div></div>`;
+  }
+
+  return h;
+}
+
+function renderPolicy(data) {
+  // v3 数据（新 Policy 实体）
+  if (data.policies && data.policies.length > 0) {
+    return renderPolicyV3(data);
+  }
+  // v2 兼容（旧 PolicyTheme + PolicyItem）
+  const p = data.post;
+  const themes = data.themes || [];
+  const facts = data.facts || [];
+  const conclusions = data.conclusions || [];
+
+  let nNew=0, nAdj=0, nCon=0;
+  themes.forEach(t => t.items.forEach(it => {
+    if (it.change_type==='新增') nNew++;
+    else if (it.change_type==='调整') nAdj++;
+    else if (it.change_type==='延续') nCon++;
+  }));
+  const deleted = facts.filter(f => f.summary && f.summary.startsWith('[删除]'));
+  const regularFacts = facts.filter(f => !f.summary.startsWith('[删除]'));
+  const hasCompare = themes.some(t => t.items.some(it => it.change_type));
+
+  let h = '';
+
+  // Summary
+  h += `<div class="summary-card">
+    <div class="s-meta">
+      ${sfield('作者', esc(p.author_name))}
+      ${p.posted_at ? sfield('日期', esc(p.posted_at.slice(0,10))) : ''}
+      ${p.issuing_authority ? sfield('发文机关', esc(p.issuing_authority)) : ''}
+      ${p.authority_level ? sfield('权威级别', esc(p.authority_level)) : ''}
+      ${p.content_type ? sfield('类型', `<span class="bd bd-accent">${esc(p.content_type)}</span>`) : ''}
+    </div>
+    ${p.content_topic ? `<div style="font-size:15px;font-weight:600;margin-bottom:6px;">${esc(p.content_topic)}</div>` : ''}
+    ${p.content_summary ? `<div class="s-summary">${esc(p.content_summary)}</div>` : ''}
+  </div>`;
+
+  // Debug: Chain 2
+  if (debugMode) {
+    h += `<div class="dbg-block">
+      <div class="dbg-title">Chain 2 — 分类输出</div>
+      <div class="dbg-grid">
+        ${dbgField('内容类型', p.content_type)}
+        ${p.content_type_secondary ? dbgField('次要类型', p.content_type_secondary) : ''}
+        ${dbgField('内容主题', p.content_topic)}
+        ${dbgField('作者意图', p.author_intent)}
+        ${dbgField('发文机关', p.issuing_authority)}
+        ${dbgField('机关级别', p.authority_level)}
+      </div>
+      ${p.intent_note ? `<div class="dbg-note">意图说明：${esc(p.intent_note)}</div>` : ''}
+    </div>`;
+  }
+
+  // Debug: raw content
+  if (debugMode && p.content) {
+    h += `<div class="sec"><div class="sec-title">原始内容</div>
+      <div class="raw-content">${esc(p.content)}</div></div>`;
+  }
+
+  // Compare stats
+  if (hasCompare) {
+    h += `<div class="sec"><div class="sec-title">年度变化概览</div>
+      <div class="cmp-stats">
+        <div class="cmp-pill"><div class="cmp-num cmp-new">${nNew}</div><div class="cmp-lbl">新增</div></div>
+        <div class="cmp-pill"><div class="cmp-num cmp-adj">${nAdj}</div><div class="cmp-lbl">调整</div></div>
+        <div class="cmp-pill"><div class="cmp-num cmp-con">${nCon}</div><div class="cmp-lbl">延续</div></div>
+        <div class="cmp-pill"><div class="cmp-num cmp-del">${deleted.length}</div><div class="cmp-lbl">删除</div></div>
+      </div></div>`;
+  }
+
+  // Themes
+  if (themes.length) {
+    h += `<div class="sec"><div class="sec-title">政策主旨 <span class="cnt">${themes.length}</span></div>
+      ${themes.map(t => renderTheme(t)).join('')}</div>`;
+  }
+
+  // Regular facts
+  if (regularFacts.length) {
+    h += `<div class="sec"><div class="sec-title">事实陈述 <span class="cnt">${regularFacts.length}</span></div>
+      <div class="eg">${regularFacts.map(f => renderFactCard(f)).join('')}</div></div>`;
+  }
+
+  // Deleted
+  if (deleted.length) {
+    h += `<div class="sec">
+      <div class="sec-title" style="color:var(--red)">删除政策 <span class="cnt">${deleted.length}</span></div>
+      <div class="del-list">
+        ${deleted.map(f => `<div class="del-item">• ${esc(f.summary.replace(/^\[删除\]\s*/,''))}</div>`).join('')}
+      </div></div>`;
+  }
+
+  // Conclusions
+  if (conclusions.length) {
+    h += `<div class="sec"><div class="sec-title">结论 <span class="cnt">${conclusions.length}</span></div>
+      <div class="eg">${conclusions.map(c => renderConcCard(c)).join('')}</div></div>`;
+  }
+
+  return h;
+}
+
+function renderTheme(t) {
+  const teeth = t.has_enforcement_teeth;
+  const teethCls = teeth ? 'bd bd-green' : 'bd bd-gray';
+  const teethLbl = teeth ? '✓ 有保障' : '△ 无保障';
+
+  const tableHtml = t.items.length
+    ? `<table class="pi-table">
+        <thead><tr>
+          <th>紧迫性</th><th>政策摘要</th><th>量化目标</th>
+          <th>变化</th><th>执行状态</th>
+          ${debugMode ? '<th style="color:var(--text2)">id</th>' : ''}
+        </tr></thead>
+        <tbody>${t.items.map(it => renderPolicyItem(it)).join('')}</tbody>
+      </table>`
+    : '<div style="padding:10px 14px;color:var(--text2);font-size:12px;">暂无政策条目</div>';
+
+  return `<div class="theme-card">
+    <div class="theme-hd">
+      <span class="theme-chev">▶</span>
+      <span class="theme-name">${esc(t.theme_name)}</span>
+      <span class="${teethCls}" style="font-size:11px;">${teethLbl}</span>
+      <span class="cnt">${t.items.length}</span>
+      ${debugMode ? `<span style="font-size:10px;color:var(--text2);">id=${t.id}</span>` : ''}
+    </div>
+    <div class="theme-body">
+      ${t.background ? `<div class="theme-bg"><div class="theme-bg-lbl">背景与目的</div>${esc(t.background)}</div>` : ''}
+      ${debugMode && t.enforcement_note
+        ? `<div class="enf-note"><span style="font-size:10px;font-weight:600;text-transform:uppercase;color:var(--text2)">组织保障：</span>${esc(t.enforcement_note)}</div>`
+        : ''}
+      ${tableHtml}
+    </div>
+  </div>`;
+}
+
+function renderPolicyItem(it) {
+  const urgMap = {
+    mandatory:['urg urg-m','强制'], encouraged:['urg urg-e','鼓励'],
+    pilot:['urg urg-p','试点'],     gradual:['urg urg-g','渐进']
+  };
+  const [urgCls, urgLbl] = urgMap[it.urgency] || ['urg urg-g', it.urgency||'—'];
+  const chgMap = {新增:'chg chg-n',调整:'chg chg-a',延续:'chg chg-c',删除:'chg chg-d'};
+  const chgCls = chgMap[it.change_type] || '';
+  const execIcon = {implemented:'✅',in_progress:'🔄',stalled:'⚠️',not_started:'⏳',unknown:'❓'}[it.execution_status]||'—';
+  const execZh = {implemented:'已落地',in_progress:'推进中',stalled:'受阻',not_started:'未启动',unknown:'未知'}[it.execution_status]||'';
+
+  return `<tr>
+    <td>
+      <span class="${urgCls}">${urgLbl}</span>
+      ${it.is_hard_target ? '<div style="font-size:10px;color:var(--red);margin-top:3px;">[硬目标]</div>' : ''}
+    </td>
+    <td>
+      <div>${esc(it.summary)}</div>
+      ${debugMode ? `<div class="pi-text">${esc(it.policy_text)}</div>` : ''}
+    </td>
+    <td>
+      ${it.metric_value
+        ? `<span style="font-weight:600;color:var(--accent)">${esc(it.metric_value)}</span>`
+        : '<span style="color:var(--text2)">—</span>'}
+      ${debugMode && it.target_year ? `<div style="font-size:10px;color:var(--text2)">目标年：${esc(it.target_year)}</div>` : ''}
+    </td>
+    <td>
+      ${it.change_type ? `<span class="${chgCls}">${it.change_type}</span>` : '<span style="color:var(--text2)">—</span>'}
+      ${debugMode && it.change_note ? `<div class="pi-note">${esc(it.change_note)}</div>` : ''}
+    </td>
+    <td>
+      <span class="exec">${execIcon} ${execZh}</span>
+      ${debugMode && it.execution_note ? `<div class="exec-note">${esc(it.execution_note)}</div>` : ''}
+    </td>
+    ${debugMode ? `<td class="pi-id">${it.id}</td>` : ''}
+  </tr>`;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STANDARD MODE
+// ══════════════════════════════════════════════════════════════════════════════
+function renderStandard(data) {
+  const p = data.post;
+  const facts = data.facts || [];
+  const assumptions = data.assumptions || [];
+  const implicits = data.implicit_conditions || [];
+  const conclusions = data.conclusions || [];
+  const predictions = data.predictions || [];
+  const solutions = data.solutions || [];
+
+  let h = '';
+
+  h += `<div class="summary-card">
+    <div class="s-meta">
+      ${sfield('作者', esc(p.author_name))}
+      ${p.posted_at ? sfield('日期', esc(p.posted_at.slice(0,10))) : ''}
+      ${p.content_type ? sfield('类型', `<span class="bd bd-gray">${esc(p.content_type)}</span>`) : ''}
+      ${p.author_intent ? sfield('意图', esc(p.author_intent)) : ''}
+    </div>
+    ${p.content_topic ? `<div style="font-size:15px;font-weight:600;margin-bottom:6px;">${esc(p.content_topic)}</div>` : ''}
+    ${p.content_summary ? `<div class="s-summary">${esc(p.content_summary)}</div>` : ''}
+  </div>`;
+
+  if (debugMode) {
+    h += `<div class="dbg-block">
+      <div class="dbg-title">Chain 2 — 分类输出</div>
+      <div class="dbg-grid">
+        ${dbgField('内容类型', p.content_type)}
+        ${p.content_type_secondary ? dbgField('次要类型', p.content_type_secondary) : ''}
+        ${dbgField('内容主题', p.content_topic)}
+        ${dbgField('作者意图', p.author_intent)}
+      </div>
+      ${p.intent_note ? `<div class="dbg-note">意图说明：${esc(p.intent_note)}</div>` : ''}
+    </div>`;
+  }
+
+  if (debugMode && p.content) {
+    h += `<div class="sec"><div class="sec-title">原始内容</div>
+      <div class="raw-content">${esc(p.content)}</div></div>`;
+  }
+
+  const hasGraph = conclusions.length && data.edges && data.edges.length;
+  if (hasGraph) {
+    const total = facts.length + assumptions.length + implicits.length + conclusions.length + predictions.length;
+    h += `<div class="sec">
+      <div class="sec-title">论证图谱 <span class="cnt">${total} 节点 · ${data.edges.length} 边</span></div>
+      <div id="dag-wrap"></div>
+    </div>`;
+  }
+
+  if (facts.length) {
+    h += `<div class="sec"><div class="sec-title">事实 <span class="cnt">${facts.length}</span></div>
+      <div class="eg">${facts.map(f => renderFactCard(f)).join('')}</div></div>`;
+  }
+  if (assumptions.length) {
+    h += `<div class="sec"><div class="sec-title">假设条件 <span class="cnt">${assumptions.length}</span></div>
+      <div class="eg">${assumptions.map(a => renderAssumCard(a)).join('')}</div></div>`;
+  }
+  if (implicits.length) {
+    h += `<div class="sec"><div class="sec-title">隐含条件 <span class="cnt">${implicits.length}</span></div>
+      <div class="eg">${implicits.map(ic => renderImplicitCard(ic)).join('')}</div></div>`;
+  }
+  if (conclusions.length) {
+    h += `<div class="sec"><div class="sec-title">结论 <span class="cnt">${conclusions.length}</span></div>
+      <div class="eg">${conclusions.map(c => renderConcCard(c)).join('')}</div></div>`;
+  }
+  if (predictions.length) {
+    h += `<div class="sec"><div class="sec-title">预测 <span class="cnt">${predictions.length}</span></div>
+      <div class="eg">${predictions.map(p => renderPredCard(p)).join('')}</div></div>`;
+  }
+  if (solutions.length) {
+    h += `<div class="sec"><div class="sec-title">解决方案 <span class="cnt">${solutions.length}</span></div>
+      <div class="eg">${solutions.map(s => renderSolCard(s)).join('')}</div></div>`;
+  }
+
+  if (debugMode && data.edges && data.edges.length) {
+    h += `<div class="sec"><div class="sec-title">关系边 <span class="cnt">${data.edges.length}</span></div>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 14px;">
+        ${data.edges.map(e =>
+          `<div class="edge-row">${e.source_type}[${e.source_id}] → ${e.target_type}[${e.target_id}]
+           <span class="edge-type">${e.edge_type}</span></div>`
+        ).join('')}
+      </div></div>`;
+  }
+
+  return h;
+}
+
+// ── DAG ────────────────────────────────────────────────────────────────────────
+function renderDAG(data) {
+  const container = document.getElementById('dag-wrap');
+  if (!container || typeof vis === 'undefined') return;
+
+  const facts = data.facts || [];
+  const assumptions = data.assumptions || [];
+  const implicits = data.implicit_conditions || [];
+  const conclusions = data.conclusions || [];
+  const predictions = data.predictions || [];
+  const edges_raw = data.edges || [];
+
+  const fvC={credible:'#3fb950',vague:'#d29922',unreliable:'#f85149',unavailable:'#4a5568'};
+  const avC={high_probability:'#3fb950',medium_probability:'#d29922',low_probability:'#f85149',unavailable:'#4a5568'};
+  const cvC={confirmed:'#3fb950',partial:'#d29922',refuted:'#f85149',unverifiable:'#4a5568',pending:'#58a6ff'};
+  const pvC={accurate:'#3fb950',directional:'#d29922',off_target:'#e3b341',wrong:'#f85149',pending:'#58a6ff'};
+
+  const nodes=[], edges=[];
+
+  facts.forEach(f => nodes.push({
+    id:`fact-${f.id}`, label:crop(f.summary||f.claim,28),
+    shape:'box', color:{background:fvC[f.fact_verdict]||'#4a5568',border:'#30363d'},
+    font:{color:'#0d1117',size:11}, title:`Fact ${f.id} · ${f.fact_verdict||'未验证'}`
+  }));
+  assumptions.forEach(a => nodes.push({
+    id:`assumption-${a.id}`, label:crop(a.summary||a.condition_text,28),
+    shape:'diamond', color:{background:avC[a.assumption_verdict]||'#4a5568',border:'#30363d'},
+    font:{color:'#0d1117',size:11}, title:`Assumption ${a.id} · ${a.assumption_verdict||'待评估'}`
+  }));
+  implicits.forEach(ic => nodes.push({
+    id:`implicit_condition-${ic.id}`, label:crop(ic.summary||ic.condition_text,28),
+    shape:'diamond', color:{background:'#6e40c9',border:'#30363d'},
+    font:{color:'#fff',size:11}, title:`Implicit ${ic.id} · ${ic.implicit_verdict||'未评估'}`
+  }));
+  conclusions.forEach(c => nodes.push({
+    id:`conclusion-${c.id}`,
+    label:crop(c.summary||c.claim,28)+(c.is_core_conclusion?' ★':'')+(c.is_in_cycle?' ⚠':''),
+    shape:'ellipse',
+    color:{background:c.is_in_cycle?'#4a5568':(cvC[c.conclusion_verdict]||'#58a6ff'),
+           border:c.is_core_conclusion?'#e6edf3':'#30363d'},
+    font:{color:'#0d1117',size:11}, borderWidth:c.is_core_conclusion?2:1,
+    title:`Conclusion ${c.id} · ${c.conclusion_verdict||'未推导'}`
+  }));
+  predictions.forEach(p => nodes.push({
+    id:`prediction-${p.id}`, label:crop(p.summary||p.claim,28),
+    shape:'box', color:{background:pvC[p.prediction_verdict]||'#58a6ff',border:'#30363d'},
+    font:{color:'#0d1117',size:11}, title:`Prediction ${p.id} · ${p.prediction_verdict||'待验证'}`
+  }));
+
+  edges_raw.forEach((e, i) => {
+    const dashed = e.source_type.includes('assumption') || e.source_type.includes('implicit');
+    edges.push({id:i,
+      from:`${e.source_type}-${e.source_id}`, to:`${e.target_type}-${e.target_id}`,
+      arrows:'to', dashes:dashed, color:{color:'#4d5566'}, width:1.2, title:e.edge_type
+    });
+  });
+
+  if (!nodes.length) {
+    container.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text2);font-size:13px;">无实体数据</div>';
     return;
   }
 
-  const ov = stats.overall_credibility_score;
-  const ovColor = scoreColor(ov / 100);
-  const SCORE_ROWS = [
-    ['① 事实准确率', stats.fact_accuracy_rate],
-    ['② 结论准确性', stats.conclusion_accuracy_rate],
-    ['③ 预测准确性', stats.prediction_accuracy_rate],
-    ['④ 逻辑严谨性', stats.logic_rigor_score],
-    ['⑤ 建议可靠性', stats.recommendation_reliability_rate],
-    ['⑥ 内容独特性', stats.content_uniqueness_score],
-    ['⑦ 内容有效性', stats.content_effectiveness_score],
-  ];
-  html += `
-<div class="score-overall-row">
-  <div class="score-overall-num" style="color:${ovColor}">${ov.toFixed(1)}</div>
-  <div class="score-overall-lbl">综合可信度评分（满分 100）</div>
-</div>
-<div class="score-rows">
-${SCORE_ROWS.map(([lbl, v]) => {
-  if (v == null) return `<div class="score-row"><div class="score-row-label">${lbl}</div><div class="score-bar-track"><div class="score-bar-fill fill-mid" style="width:0%"></div></div><div class="score-row-val" style="color:var(--text-dim)">N/A</div></div>`;
-  const pct = (v * 100).toFixed(0);
-  return `<div class="score-row"><div class="score-row-label">${lbl}</div><div class="score-bar-track"><div class="score-bar-fill ${fillClass(v)}" style="width:${pct}%"></div></div><div class="score-row-val" style="color:${scoreColor(v)}">${pct}%</div></div>`;
-}).join('')}
-</div>`;
+  new vis.Network(container,
+    {nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges)},
+    {layout:{hierarchical:{enabled:true,direction:'LR',sortMethod:'directed',
+       levelSeparation:200,nodeSpacing:90}},
+     physics:{enabled:false},
+     interaction:{hover:true,tooltipDelay:150},
+     nodes:{margin:{top:6,bottom:6,left:10,right:10}}}
+  );
+}
 
-  if (stats.total_posts_analyzed != null) {
-    html += `<div style="font-size:11px;color:var(--text-dim);margin-top:14px;">基于 ${stats.total_posts_analyzed} 篇内容分析</div>`;
-  }
+// ── Entity cards ───────────────────────────────────────────────────────────────
+function renderFactCard(f) {
+  const vb = factVb(f.fact_verdict);
+  const txt = f.summary || f.claim || '';
+  const debug = debugMode ? `
+    <div class="ec-claim">${esc(f.claim)}</div>
+    ${f.verdict_evidence ? `<div class="ec-evidence">核查依据：${esc(f.verdict_evidence.slice(0,220))}</div>` : ''}
+    <div class="ec-id">id=${f.id}</div>` : '';
+  return `<div class="ec"><div class="ec-summary">${esc(txt)}</div>
+    <div class="ec-footer">${vb}</div>${debug}</div>`;
+}
+function renderAssumCard(a) {
+  const vb = assumVb(a.assumption_verdict);
+  const txt = a.summary || a.condition_text || '';
+  const debug = debugMode ? `
+    <div class="ec-claim">${esc(a.condition_text)}</div>
+    ${a.verdict_evidence ? `<div class="ec-evidence">${esc(a.verdict_evidence.slice(0,200))}</div>` : ''}
+    <div class="ec-id">id=${a.id}</div>` : '';
+  return `<div class="ec" style="border-left:3px solid var(--yellow)">
+    <div class="ec-summary">${esc(txt)}</div><div class="ec-footer">${vb}</div>${debug}</div>`;
+}
+function renderImplicitCard(ic) {
+  const vb = implicitVb(ic.implicit_verdict);
+  const txt = ic.summary || ic.condition_text || '';
+  const debug = debugMode ? `
+    <div class="ec-claim">${esc(ic.condition_text)}</div>
+    <div class="ec-id">id=${ic.id}</div>` : '';
+  return `<div class="ec" style="border-left:3px solid var(--purple)">
+    <div class="ec-summary">${esc(txt)}</div><div class="ec-footer">${vb}</div>${debug}</div>`;
+}
+function renderConcCard(c) {
+  const vb = concVb(c.conclusion_verdict);
+  const core = c.is_core_conclusion ? '<span class="bd bd-yellow" style="font-size:10px;padding:1px 6px;">★核心</span>' : '';
+  const cycle = c.is_in_cycle ? '<span class="bd bd-red" style="font-size:10px;padding:1px 6px;">⚠循环</span>' : '';
+  const txt = c.summary || c.claim || '';
+  const debug = debugMode ? `
+    <div class="ec-claim">${esc(c.claim)}</div>
+    <div class="ec-id">id=${c.id} · ${c.author_confidence||''}</div>` : '';
+  return `<div class="ec" ${c.is_core_conclusion?'style="border-left:3px solid var(--yellow)"':''}>
+    <div class="ec-summary">${esc(txt)}</div>
+    <div class="ec-footer" style="gap:4px">${vb}${core}${cycle}</div>${debug}</div>`;
+}
+function renderPredCard(p) {
+  const vb = predVb(p.prediction_verdict);
+  const tv = p.temporal_validity === 'has_timeframe'
+    ? `<span class="bd bd-blue" style="font-size:10px;padding:1px 6px;">${p.temporal_note||'有时间窗口'}</span>`
+    : '<span class="bd bd-gray" style="font-size:10px;padding:1px 6px;">无时间窗口</span>';
+  const txt = p.summary || p.claim || '';
+  const debug = debugMode ? `
+    <div class="ec-claim">${esc(p.claim)}</div>
+    <div class="ec-id">id=${p.id}</div>` : '';
+  return `<div class="ec" style="border-left:3px solid var(--blue)">
+    <div class="ec-summary">${esc(txt)}</div>
+    <div class="ec-footer" style="gap:4px">${vb}${tv}</div>${debug}</div>`;
+}
+function renderSolCard(s) {
+  const txt = s.summary || s.claim || '';
+  const debug = debugMode ? `
+    <div class="ec-claim">${esc(s.claim)}</div>
+    <div class="ec-id">${s.action_type||''}${s.action_target?' · '+esc(s.action_target):''} id=${s.id}</div>` : '';
+  return `<div class="ec" style="border-left:3px solid var(--green)">
+    <div class="ec-summary">${esc(txt)}</div>${debug}</div>`;
+}
 
-  document.getElementById('authorStatsContent').innerHTML = html;
+// ── Verdict badges ─────────────────────────────────────────────────────────────
+function factVb(v) {
+  const m={credible:['bd-green','可信'],vague:['bd-yellow','模糊'],
+    unreliable:['bd-red','不可信'],unavailable:['bd-gray','不可查']};
+  const [c,l]=m[v]||['bd-gray','未验证'];
+  return `<span class="bd ${c}">${l}</span>`;
+}
+function assumVb(v) {
+  const m={high_probability:['bd-green','高概率'],medium_probability:['bd-yellow','中概率'],
+    low_probability:['bd-red','低概率'],unavailable:['bd-gray','不可评']};
+  const [c,l]=m[v]||['bd-gray','待评估'];
+  return `<span class="bd ${c}">${l}</span>`;
+}
+function implicitVb(v) {
+  const m={consensus:['bd-green','共识'],contested:['bd-yellow','有争议'],false:['bd-red','已证伪']};
+  const [c,l]=m[v]||['bd-gray','未评估'];
+  return `<span class="bd ${c}">${l}</span>`;
+}
+function concVb(v) {
+  const m={confirmed:['bd-green','已确认'],partial:['bd-yellow','部分成立'],
+    refuted:['bd-red','已否定'],unverifiable:['bd-gray','不可核实'],pending:['bd-blue','待验证']};
+  const [c,l]=m[v]||['bd-gray','未推导'];
+  return `<span class="bd ${c}">${l}</span>`;
+}
+function predVb(v) {
+  const m={accurate:['bd-green','准确'],directional:['bd-yellow','方向正确'],
+    off_target:['bd-orange','偏差'],wrong:['bd-red','错误'],pending:['bd-blue','待验证']};
+  const [c,l]=m[v]||['bd-gray','未验证'];
+  return `<span class="bd ${c}">${l}</span>`;
+}
+
+// ── Analyze ────────────────────────────────────────────────────────────────────
+async function submitAnalyze(evt) {
+  evt.preventDefault();
+  const url = document.getElementById('urlInput').value.trim();
+  if (!url) return;
+
+  const bar = document.getElementById('progressBar');
+  bar.classList.add('show');
+  bar.innerHTML = '<span class="spill active"><span class="spill-dot"></span>启动中…</span>';
+
+  const res = await fetch('/api/analyze', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})
+  });
+  const {task_id, error} = await res.json();
+  if (error) { bar.innerHTML = `<span class="spill err">✗ ${esc(error)}</span>`; return; }
+
+  const steps = {};
+  const es = new EventSource(`/stream/${task_id}`);
+
+  es.addEventListener('step', e => {
+    const d = JSON.parse(e.data);
+    steps[d.num] = {...d, done:false};
+    updateProgress(steps);
+  });
+  es.addEventListener('step_done', e => {
+    const d = JSON.parse(e.data);
+    steps[d.num] = {...(steps[d.num]||{}), ...d, done:true};
+    updateProgress(steps);
+  });
+  es.addEventListener('done', e => {
+    es.close();
+    currentData = JSON.parse(e.data);
+    renderPost(currentData);
+    loadPosts();
+    document.getElementById('urlInput').value = '';
+    if (currentData.post && currentData.post.id) {
+      document.querySelectorAll('.pi').forEach(el => el.classList.remove('active'));
+      const pi = document.getElementById(`pi-${currentData.post.id}`);
+      if (pi) pi.classList.add('active');
+    }
+    setTimeout(() => bar.classList.remove('show'), 2500);
+  });
+  es.addEventListener('error', e => {
+    es.close();
+    try { bar.innerHTML = `<span class="spill err">✗ ${esc(JSON.parse(e.data))}</span>`; }
+    catch { bar.innerHTML = '<span class="spill err">✗ 分析失败</span>'; }
+  });
+}
+
+function updateProgress(steps) {
+  const bar = document.getElementById('progressBar');
+  const pills = Object.values(steps).sort((a,b)=>a.num-b.num).map(s => {
+    const cls = s.done ? 'done' : 'active';
+    const icon = s.done ? '✓ ' : '';
+    const detail = s.done && s.detail ? ` — ${s.detail}` : '';
+    return `<div class="spill ${cls}"><div class="spill-dot"></div>${icon}${esc(s.label)}${esc(detail)}</div>`;
+  });
+  bar.innerHTML = pills.join('<span class="step-sep">›</span>');
+}
+
+// ── Utils ──────────────────────────────────────────────────────────────────────
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function crop(s, n) {
+  if (!s) return '';
+  return s.length > n ? s.slice(0,n)+'…' : s;
+}
+function sfield(label, value) {
+  if (!value) return '';
+  return `<div class="s-field"><div class="s-label">${label}</div><div class="s-value">${value}</div></div>`;
+}
+function dbgField(label, value) {
+  if (!value) return '';
+  return `<div class="dbg-field"><div class="dbg-label">${esc(label)}</div><div class="dbg-value">${esc(value)}</div></div>`;
 }
 </script>
 </body>
 </html>"""
 
 
-# ── 入口 ──────────────────────────────────────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return _HTML
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8765, log_level="info")
+    uvicorn.run("anchor_ui:app", host="0.0.0.0", port=8765, reload=False)

@@ -24,6 +24,7 @@ from typing import List, Tuple
 
 SYSTEM = """\
 你是一名专业的逻辑分析师，擅长识别论证中的隐含前提（未说出但依赖的背景假设）。
+所有输出字段（summary、condition_text）必须使用中文。
 
 核心任务：
 对给定的每条逻辑推断（前提 → 结论），判断推断是否完备：

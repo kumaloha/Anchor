@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,30 @@ logging.basicConfig(
 logger = logging.getLogger("monitor")
 
 WATCHLIST_PATH = Path(__file__).parent / "watchlist.yaml"
+
+
+# ── 付费墙检测 ────────────────────────────────────────────────────────────────
+
+_PAYWALL_RE = re.compile(
+    r"subscribe\s+to\s+(?:\w+\s+to\s+)?(read|continue|access|unlock|the full)"
+    r"|subscriber[s']?\s+(only|to\s+(read|access|continue))"
+    r"|members?\s+only"
+    r"|sign\s+in\s+to\s+(read|access|continue|view)"
+    r"|log\s+in\s+to\s+(read|access|continue|view)"
+    r"|this\s+(content|article|story)\s+is\s+(only\s+)?for\s+(subscribers?|members?|premium)"
+    r"|you.ve\s+(reached|used)\s+\d+\s+(of\s+(your\s+)?\d+\s+)?(free\s+)?(article|story)"
+    r"|you\s+have\s+\d+\s+(free\s+)?(article|story)"
+    r"|register\s+to\s+(read|access|continue)"
+    r"|本文[为是]付费(内容|文章|阅读)"
+    r"|订阅后[查看阅读]全文"
+    r"|会员专属(内容|文章|阅读)"
+    r"|付费(阅读|查看)全文",
+    re.IGNORECASE,
+)
+
+
+def _is_paywalled(content: str) -> bool:
+    return bool(_PAYWALL_RE.search(content))
 
 
 # ── Watchlist 解析 ────────────────────────────────────────────────────────────
@@ -179,22 +204,25 @@ async def run_pipeline(url: str) -> str:
         logger.info(f"  [pipeline] content too short ({_content_chars} chars), skip: {url}")
         return "text_short"
 
+    if _is_paywalled(rp.content or ""):
+        logger.info(f"  [pipeline] paywall detected, skip: {url}")
+        return "paywall_skip"
+
     # Step 2: Chain 2
     try:
         async with AsyncSessionLocal() as s:
             pre = await run_chain2(rp.id, s)
         ct = pre.get("content_type", "")
-        content_mode = "policy" if ct in {"政策宣布", "政策解读"} else "standard"
+        content_mode = "policy" if ct == "政策解读" else "standard"
     except Exception as e:
         logger.error(f"  [pipeline] chain2 error: {e}")
         content_mode = "standard"
         pre = {}
         ct = ""
 
-    # 只处理市场类内容，其余跳过
-    _MARKET_TYPES = {"市场动向", "市场分析"}
-    if ct and ct not in _MARKET_TYPES:
-        logger.info(f"  [pipeline] content_type={ct!r} (non-market), skip: {url}")
+    # 只处理财经分析类内容，其余跳过
+    if ct and ct != "财经分析":
+        logger.info(f"  [pipeline] content_type={ct!r} (非财经分析), skip: {url}")
         return "non_market"
 
     # Step 3: Chain 1 提取
@@ -283,12 +311,13 @@ async def main(args: argparse.Namespace) -> None:
         if total_capped:
             lines.append(f"  限速截断（--limit）: {total_capped} 条未处理")
         _labels = {
-            "notion_skip": "类型未映射",
-            "non_market":  "非市场分析",
-            "text_short":  "文章过短",
-            "video_short": "视频过短",
-            "video_only":  "纯视频页",
-            "error":       "采集失败",
+            "notion_skip":   "类型未映射",
+            "non_market":    "非财经分析",
+            "text_short":    "文章过短",
+            "video_short":   "视频过短",
+            "video_only":    "纯视频页",
+            "paywall_skip":  "付费墙跳过",
+            "error":         "采集失败",
         }
         for key, label in _labels.items():
             if skip_counts[key]:

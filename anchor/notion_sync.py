@@ -15,6 +15,7 @@ import httpx
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from anchor.config import settings
 from anchor.models import (
     Assumption,
     Author,
@@ -32,20 +33,17 @@ from anchor.models import (
 
 logger = logging.getLogger(__name__)
 
-NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "")
+NOTION_API_KEY = settings.notion_api_key or os.environ.get("NOTION_API_KEY", "")
 NOTION_VERSION = "2022-06-28"
 
-# content_type → Notion Database ID
+# content_type → Notion Database ID（财经分析页面已改名为「财经分析」）
 NOTION_DB_MAP: dict[str, str] = {
-    "市场动向": "31ca7586-d273-80c9-98eb-dea5cec01133",
-    "市场分析": "31ca7586-d273-80c9-98eb-dea5cec01133",
-    "产业调研": "31ca7586-d273-80c9-98eb-dea5cec01133",
+    "财经分析": "31ca7586-d273-80c9-98eb-dea5cec01133",
+    "市场动向":  "31ca7586-d273-80c9-98eb-dea5cec01133",
     # 以下暂未启用（待补充 Database ID）
-    # "公司调研": "",
+    # "产业链研究": "",
     # "公司调研": "",
     # "技术论文": "",
-    # "教育科普": "",
-    # "政策宣布": "",
     # "政策解读": "",
 }
 
@@ -98,6 +96,50 @@ def _rt(text: str, max_len: int = 2000) -> list[dict]:
     """Notion rich_text 数组，单块最多 2000 字符。"""
     content = (text or "")[:max_len]
     return [{"type": "text", "text": {"content": content}}]
+
+
+_CONCLUSION_LINE_RE = re.compile(r"^C\d+")
+
+
+def _rt_conclusion(text: str) -> list[dict]:
+    """结论列专用 rich_text：以 C 开头的结论行用红色，其余行保持默认颜色。
+
+    Notion rich_text 是扁平数组，通过拼接相同颜色的连续行减少分段数量。
+    单段内容超过 1800 字符时自动切断，以满足 Notion 2000 字符/段的上限。
+    """
+    if not text:
+        return [{"type": "text", "text": {"content": ""}}]
+
+    def _flush(content: str, is_red: bool) -> dict:
+        block: dict = {"type": "text", "text": {"content": content[:2000]}}
+        if is_red:
+            block["annotations"] = {"color": "red"}
+        return block
+
+    result: list[dict] = []
+    lines = text.split("\n")
+    cur_content = ""
+    cur_red = False
+
+    for i, line in enumerate(lines):
+        is_red = bool(_CONCLUSION_LINE_RE.match(line))
+        segment = line + ("\n" if i < len(lines) - 1 else "")
+
+        if is_red != cur_red and cur_content:
+            result.append(_flush(cur_content, cur_red))
+            cur_content = ""
+
+        cur_red = is_red
+        cur_content += segment
+
+        if len(cur_content) >= 1800:
+            result.append(_flush(cur_content, cur_red))
+            cur_content = ""
+
+    if cur_content:
+        result.append(_flush(cur_content, cur_red))
+
+    return result or [{"type": "text", "text": {"content": ""}}]
 
 
 def _fmt_entity(e, etype: str, lbl: str) -> str:
@@ -470,8 +512,11 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
                    ])))},
         "已读":    {"checkbox": False},
         "核心总结": {"rich_text": _rt(post.content_summary or "")},
-        "结论":    {"rich_text": _rt(_conclusion_combined)},
+        "结论":    {"rich_text": _rt_conclusion(_conclusion_combined)},
     }
+    # 财经分析子分类 → "分类" 列（Select 类型）
+    if post.content_subtype:
+        properties["分类"] = {"select": {"name": post.content_subtype}}
 
     # ── 6. 生成封面图 ─────────────────────────────────────────────────────────
     payload: dict = {
@@ -508,6 +553,15 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
         logger.error("notion_sync: API error %s: %s", resp.status_code, resp.text[:400])
         return None
 
-    page_url = resp.json().get("url", "")
+    resp_data = resp.json()
+    page_url = resp_data.get("url", "")
+    page_id  = resp_data.get("id", "")
     logger.info("notion_sync: created page %s for post %s (type=%s)", page_url, post_id, ct)
+
+    # 将 Notion 页面 ID 写回 DB，便于后续更新
+    if page_id:
+        post.notion_page_id = page_id
+        session.add(post)
+        await session.flush()
+
     return page_url

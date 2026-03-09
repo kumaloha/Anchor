@@ -77,6 +77,13 @@ class Settings(BaseSettings):
     # 不填则 Layer3 事实核查仅使用 LLM 训练知识（无联网能力）
     tavily_api_key: str = ""
 
+    # ── Notion ────────────────────────────────────────────────────────────────
+    notion_api_key: str = ""
+
+    # ── 链路开关 ──────────────────────────────────────────────────────────────
+    # 设为 False 可暂停 Chain 3 验证（仅跑 Chain 1 + 2），调试时用
+    enable_chain3: bool = False
+
     # ── 宏观数据 API Keys（Layer3 事实核查用）──────────────────────────────────
     # FRED API Key（免费注册：https://fred.stlouisfed.org/docs/api/api_key.html）
     # 不填仍可使用，但请求次数受限（1000次/天 vs 无限制）

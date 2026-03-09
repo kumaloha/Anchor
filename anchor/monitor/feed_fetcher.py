@@ -19,11 +19,12 @@ from __future__ import annotations
 import re
 import time
 import logging
-from dataclasses import dataclass, field
+import html as _html
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urldefrag, urljoin, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +64,12 @@ def _parse_dt(val: str | None) -> Optional[datetime]:
     return None
 
 
+_RSS_UA = "Mozilla/5.0 (compatible; AnchorFeedBot/1.0; +https://github.com/anchor)"
+_GENERIC_UA = "Mozilla/5.0 (compatible; AnchorGenericBot/1.0; +https://github.com/anchor)"
+
+
 def fetch_rss(feed_url: str, since: Optional[datetime] = None) -> list[FetchedItem]:
-    """通用 RSS/Atom 抓取。"""
+    """通用 RSS/Atom 抓取（携带 User-Agent，避免 403）。"""
     try:
         import feedparser  # type: ignore
     except ImportError:
@@ -72,7 +77,24 @@ def fetch_rss(feed_url: str, since: Optional[datetime] = None) -> list[FetchedIt
         return []
 
     logger.info(f"[RSS] Fetching {feed_url}")
-    d = feedparser.parse(feed_url)
+
+    # 先用 httpx 下载（带 User-Agent），再交给 feedparser 解析
+    # 直接 feedparser.parse(url) 因无 UA 常被 403
+    try:
+        import httpx as _httpx
+        resp = _httpx.get(
+            feed_url, follow_redirects=True, timeout=20,
+            headers={"User-Agent": _RSS_UA, "Accept": "application/rss+xml, application/atom+xml, */*"},
+        )
+        if resp.status_code >= 400:
+            logger.warning(f"[RSS] HTTP {resp.status_code} for {feed_url}")
+            return []
+        d = feedparser.parse(resp.text)
+    except Exception as exc:
+        logger.warning(f"[RSS] Download failed for {feed_url}: {exc}")
+        # 回退：直接让 feedparser 尝试
+        d = feedparser.parse(feed_url)
+
     if d.get("bozo") and not d.get("entries"):
         logger.warning(f"[RSS] Feed parse error for {feed_url}: {d.get('bozo_exception')}")
         return []
@@ -94,6 +116,148 @@ def fetch_rss(feed_url: str, since: Optional[datetime] = None) -> list[FetchedIt
         items.append(FetchedItem(url=link, title=title, published_at=pub_dt, raw_id=raw_id))
 
     logger.info(f"[RSS] {len(items)} new items from {feed_url}")
+    return items
+
+
+# ── HTML 列表页兜底（无 RSS 时提取文章链接）────────────────────────────────────
+
+_A_TAG_RE = re.compile(
+    r"<a[^>]+href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+_SPACE_RE = re.compile(r"\s+")
+_DATE_IN_PATH_RE = re.compile(r"/20\d{2}(?:/|[-_])")
+_STATIC_EXT_RE = re.compile(
+    r"\.(?:css|js|png|jpg|jpeg|gif|webp|svg|ico|pdf|zip|mp3|mp4|woff2?|ttf)(?:$|\?)",
+    flags=re.IGNORECASE,
+)
+_NEGATIVE_HINTS = (
+    "/about", "/contact", "/privacy", "/terms", "/cookie", "/careers",
+    "/login", "/signin", "/signup", "/account", "/search", "/tag/",
+    "/tags/", "/category/", "/categories/", "/author/", "/authors/",
+    "/wp-json", "/cdn-cgi",
+)
+_POSITIVE_HINTS = (
+    "insight", "insights", "blog", "news", "article", "research",
+    "report", "speech", "commentary", "memo", "publication", "letter",
+    "letters", "opinion", "post", "interview", "viewpoint",
+)
+
+
+def _strip_html(text: str) -> str:
+    s = _TAG_RE.sub(" ", text or "")
+    s = _html.unescape(s)
+    return _SPACE_RE.sub(" ", s).strip()
+
+
+def _is_same_site(base_netloc: str, candidate_netloc: str) -> bool:
+    b = base_netloc.lower().lstrip("www.")
+    c = candidate_netloc.lower().lstrip("www.")
+    return c == b or c.endswith("." + b) or b.endswith("." + c)
+
+
+def _score_candidate(list_path: str, link_url: str, anchor_text: str) -> int:
+    p = urlparse(link_url)
+    path = p.path.lower()
+    score = 0
+
+    if _DATE_IN_PATH_RE.search(path):
+        score += 3
+    if any(k in path for k in _POSITIVE_HINTS):
+        score += 3
+    if "-" in path.rsplit("/", 1)[-1]:
+        score += 2
+
+    segs = [s for s in path.split("/") if s]
+    if len(segs) >= 2:
+        score += 1
+    if segs and len(segs[-1]) >= 8:
+        score += 1
+
+    if any(k in path for k in _NEGATIVE_HINTS):
+        score -= 4
+    if path.rstrip("/") == list_path.rstrip("/").lower():
+        score -= 3
+    if _STATIC_EXT_RE.search(path):
+        score -= 5
+
+    at = (anchor_text or "").lower()
+    if len(anchor_text) >= 8:
+        score += 1
+    if any(k in at for k in ("read more", "learn more", "more")):
+        score -= 1
+
+    return score
+
+
+def fetch_generic_links(page_url: str, since: Optional[datetime] = None,
+                        max_results: int = 20) -> list[FetchedItem]:
+    """从非 RSS 列表页抽取可能的文章链接。"""
+    del since  # HTML 列表页通常缺失发布时间，无法按 since 过滤
+    try:
+        import httpx  # type: ignore
+    except ImportError:
+        logger.warning("httpx not installed; skipping generic fetch")
+        return []
+
+    logger.info(f"[Generic] Fetching {page_url}")
+    try:
+        resp = httpx.get(
+            page_url,
+            follow_redirects=True,
+            timeout=20,
+            headers={"User-Agent": _GENERIC_UA, "Accept": "text/html,application/xhtml+xml,*/*"},
+        )
+    except Exception as exc:
+        logger.warning(f"[Generic] Download failed for {page_url}: {exc}")
+        return []
+
+    if resp.status_code >= 400:
+        logger.warning(f"[Generic] HTTP {resp.status_code} for {page_url}")
+        return []
+
+    base_url = str(resp.url)
+    base = urlparse(base_url)
+    html = resp.text or ""
+    if not html.strip():
+        return []
+
+    candidates: list[tuple[int, str, str]] = []
+    for href, inner in _A_TAG_RE.findall(html):
+        h = (href or "").strip()
+        if not h:
+            continue
+        h_lower = h.lower()
+        if h_lower.startswith(("javascript:", "mailto:", "tel:", "#")):
+            continue
+
+        abs_url = urljoin(base_url, h)
+        abs_url, _ = urldefrag(abs_url)
+        p = urlparse(abs_url)
+        if p.scheme not in ("http", "https"):
+            continue
+        if not _is_same_site(base.netloc, p.netloc):
+            continue
+
+        anchor_text = _strip_html(inner)
+        score = _score_candidate(base.path, abs_url, anchor_text)
+        if score < 3:
+            continue
+        candidates.append((score, abs_url, anchor_text))
+
+    seen: set[str] = set()
+    items: list[FetchedItem] = []
+    for score, link_url, anchor_text in sorted(candidates, key=lambda x: (-x[0], x[1])):
+        if link_url in seen:
+            continue
+        seen.add(link_url)
+        title = anchor_text[:180] if anchor_text else ""
+        items.append(FetchedItem(url=link_url, title=title, published_at=None, raw_id=link_url))
+        if len(items) >= max_results:
+            break
+
+    logger.info(f"[Generic] {len(items)} candidate links from {page_url}")
     return items
 
 
@@ -253,7 +417,7 @@ def fetch_weibo_user(profile_url: str, since: Optional[datetime] = None,
         return []
 
     # 从 profile URL 提取 uid
-    uid_match = re.search(r"weibo\.com/(\d+)", profile_url)
+    uid_match = re.search(r"weibo\.com/(?:u/)?(\d+)(?:/|$)", profile_url)
     if not uid_match:
         logger.warning(f"[Weibo] Cannot extract uid from {profile_url}")
         return []
@@ -362,7 +526,8 @@ def fetch_source(platform_hint: str, url: str,
     # ── 子平台精确路由 ────────────────────────────────────────────────────────
     if hint in ("substack",):
         rss_url = substack_rss_url(url)
-        return fetch_rss(rss_url, since=since)
+        items = fetch_rss(rss_url, since=since)
+        return items if items else fetch_generic_links(url, since=since)
 
     if hint in ("youtube",):
         return fetch_youtube_channel(url, since=since)
@@ -384,7 +549,8 @@ def fetch_source(platform_hint: str, url: str,
 
     # ── RSS 提示或通用域名匹配 ────────────────────────────────────────────────
     if hint in ("rss", "atom", "feed"):
-        return fetch_rss(url, since=since)
+        items = fetch_rss(url, since=since)
+        return items if items else fetch_generic_links(url, since=since)
 
     # ── 通用：尝试从域名判断 ──────────────────────────────────────────────────
     detected = _detect_platform(url)
@@ -401,8 +567,10 @@ def fetch_source(platform_hint: str, url: str,
             if items:
                 return items
             # 原 URL 本身可能就是 RSS
-            return fetch_rss(url, since=since)
+            items = fetch_rss(url, since=since)
+            return items if items else fetch_generic_links(url, since=since)
 
-    # 最终兜底：直接尝试原 URL 作为 RSS feed
+    # 最终兜底：先尝试 RSS，再尝试通用 HTML 列表页
     logger.info(f"[Monitor] Generic fetch attempt for {url}")
-    return fetch_rss(url, since=since)
+    items = fetch_rss(url, since=since)
+    return items if items else fetch_generic_links(url, since=since)

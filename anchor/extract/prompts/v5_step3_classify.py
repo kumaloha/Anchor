@@ -24,6 +24,7 @@ from anchor.extract.schemas import RawClaim, RawEdge
 
 SYSTEM = """\
 你是一名专业的内容分析师，擅长在论证 DAG（有向无环图）上下文中对声明进行精确分类。
+verifiable_statement 字段必须使用中文。
 
 【核心分类原则：作者是在"引用现实"还是在"做出判断"？】
 

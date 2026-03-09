@@ -15,12 +15,30 @@ import asyncio
 import hashlib
 import json as _json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./anchor_ui.db")
+
+_PAYWALL_RE = re.compile(
+    r"subscribe\s+to\s+(?:\w+\s+to\s+)?(read|continue|access|unlock|the full)"
+    r"|subscriber[s']?\s+(only|to\s+(read|access|continue))"
+    r"|members?\s+only"
+    r"|sign\s+in\s+to\s+(read|access|continue|view)"
+    r"|log\s+in\s+to\s+(read|access|continue|view)"
+    r"|this\s+(content|article|story)\s+is\s+(only\s+)?for\s+(subscribers?|members?|premium)"
+    r"|you.ve\s+(reached|used)\s+\d+\s+(of\s+(your\s+)?\d+\s+)?(free\s+)?(article|story)"
+    r"|you\s+have\s+\d+\s+(free\s+)?(article|story)"
+    r"|register\s+to\s+(read|access|continue)"
+    r"|本文[为是]付费(内容|文章|阅读)"
+    r"|订阅后[查看阅读]全文"
+    r"|会员专属(内容|文章|阅读)"
+    r"|付费(阅读|查看)全文",
+    re.IGNORECASE,
+)
 
 
 # ── 本地文件读取 ──────────────────────────────────────────────────────────────
@@ -159,13 +177,18 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
         print(f"  跳过：文章内容过短（{_content_chars} 字 < 200 字）")
         return
 
+    if _PAYWALL_RE.search(rp.content or ""):
+        print(f"  跳过：检测到付费墙")
+        return
+
     # ── Step 2: Chain 2 ───────────────────────────────────────────────────────
     print(f"\n[2/4] Chain 2  内容分类 + 作者分析")
     async with AsyncSessionLocal() as s:
         pre = await run_chain2(raw_post_id, s)
     ct = pre.get("content_type", "")
-    content_mode = "policy" if ct in {"政策宣布", "政策解读"} else "standard"
-    print(f"      content_type={ct!r}  intent={pre.get('author_intent')!r}")
+    content_mode = "policy" if ct == "政策解读" else "standard"
+    subtype_str = f"  subtype={pre.get('content_subtype')!r}" if pre.get("content_subtype") else ""
+    print(f"      content_type={ct!r}{subtype_str}  intent={pre.get('author_intent')!r}")
     print(f"      mode={content_mode}")
 
     # ── Step 3: Chain 1 ───────────────────────────────────────────────────────

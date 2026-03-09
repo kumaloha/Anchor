@@ -39,8 +39,12 @@ _MAX_POSTS_FOR_STANCE = 10
 _MAX_POST_CHARS = 400
 
 _VALID_CONTENT_TYPES = {
-    "市场动向", "市场分析", "产业调研", "公司调研",
-    "技术论文", "教育科普", "政策宣布", "政策解读",
+    "财经分析", "市场动向", "产业链研究", "公司调研",
+    "技术论文", "政策解读",
+}
+
+_VALID_SUBTYPES = {
+    "市场分析", "地缘分析", "政策分析", "技术影响", "混合分析",
 }
 
 _VALID_INTENTS: set[str] = set()  # 开放式文本，不做枚举校验
@@ -133,6 +137,9 @@ async def classify_post(post: RawPost, session: AsyncSession) -> dict:
             post.content_type_secondary = ct2 if ct2 != ct else None
             post.content_topic = _safe_str(post_analysis.get("content_topic"))
             post.author_intent = intent
+            # 财经分析子分类
+            subtype = _safe_str(post_analysis.get("content_subtype"))
+            post.content_subtype = subtype if subtype in _VALID_SUBTYPES else None
             # 实际发言人（个人品牌账号）
             real_name = _safe_str(post_analysis.get("real_author_name"))
             if real_name and real_name != author.name:
@@ -146,8 +153,8 @@ async def classify_post(post: RawPost, session: AsyncSession) -> dict:
                 author.expertise_areas = None
                 author.profile_note = None
                 session.add(author)
-            # 发文机关（仅政策类内容）
-            if ct in {"政策宣布", "政策解读"}:
+            # 发文机关（仅政策解读类内容）
+            if ct == "政策解读":
                 ia = _safe_str(post_analysis.get("issuing_authority"))
                 al = _safe_str(post_analysis.get("authority_level"))
                 if ia:
@@ -167,6 +174,7 @@ async def classify_post(post: RawPost, session: AsyncSession) -> dict:
 
     return {
         "content_type": post.content_type,
+        "content_subtype": post.content_subtype,
         "content_type_secondary": post.content_type_secondary,
         "content_topic": post.content_topic,
         "author_intent": post.author_intent,
@@ -228,6 +236,9 @@ async def run_chain2(post_id: int, session: AsyncSession) -> dict:
             post.content_type_secondary = ct2 if ct2 != ct else None
             post.content_topic = _safe_str(post_analysis.get("content_topic"))
             post.author_intent = intent
+            # 财经分析子分类
+            subtype = _safe_str(post_analysis.get("content_subtype"))
+            post.content_subtype = subtype if subtype in _VALID_SUBTYPES else None
             # 实际发言人（个人品牌账号）
             real_name = _safe_str(post_analysis.get("real_author_name"))
             if real_name and real_name != author.name:
@@ -240,8 +251,8 @@ async def run_chain2(post_id: int, session: AsyncSession) -> dict:
                 author.expertise_areas = None
                 author.profile_note = None
                 session.add(author)
-            # 发文机关（仅政策类内容）
-            if ct in {"政策宣布", "政策解读"}:
+            # 发文机关（仅政策解读类内容）
+            if ct == "政策解读":
                 ia = _safe_str(post_analysis.get("issuing_authority"))
                 al = _safe_str(post_analysis.get("authority_level"))
                 if ia:
@@ -438,6 +449,7 @@ def _build_result(post: RawPost, author: Author, stance_parsed: dict | None) -> 
     return {
         "post_id": post.id,
         "content_type": post.content_type,
+        "content_subtype": post.content_subtype,
         "content_type_secondary": post.content_type_secondary,
         "content_topic": post.content_topic,
         "author_intent": post.author_intent,

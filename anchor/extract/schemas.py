@@ -130,9 +130,10 @@ class Step1Result(BaseModel):
 
 class MergeGroup(BaseModel):
     """Step 2 输出：同义节点合并组"""
-    keep: int           # 保留的 claim id
-    discard: List[int]  # 废弃的 claim ids
-    merged_summary: str # 合并后摘要（≤15字）
+    keep: int                        # 保留的 claim id（作为合并后节点的 id）
+    discard: List[int]               # 废弃的 claim ids
+    merged_text: str                 # 合并后新文本（≤120字，综合所有被合并节点的内容）
+    merged_summary: str              # 合并后摘要（≤15字）
 
 
 class Step2Result(BaseModel):
@@ -217,3 +218,42 @@ class PolicyComparisonResult(BaseModel):
     """比对步骤完整输出"""
     annotations: List[PolicyChangeAnnotation] = Field(default_factory=list)
     deleted_summaries: List[str] = Field(default_factory=list)  # 上年有、今年删除的政策摘要
+
+
+# ---------------------------------------------------------------------------
+# Policy v3 — 六维属性 + 手段子条目 Schema
+# ---------------------------------------------------------------------------
+
+
+class PolicyMeasureSchema(BaseModel):
+    """手段子条目（每条具体措施一条）"""
+    summary: str                                     # ≤15字摘要
+    measure_text: str                                # 具体措施 ≤150字
+    trend: str                                       # 升级|降级|延续|新增|删除
+    trend_note: Optional[str] = None                 # 变化说明 ≤30字
+
+
+class PolicySchema(BaseModel):
+    """政策主旨（六维属性 + 手段列表）"""
+    theme: str                                       # 主旨 ≤8字
+    change_summary: Optional[str] = None             # 一句话变化总结 ≤50字
+    target: Optional[str] = None                    # 当年目标
+    target_prev: Optional[str] = None               # 上年目标
+    intensity: str                                   # strong|moderate|weak
+    intensity_prev: Optional[str] = None             # 上年 intensity
+    intensity_note: Optional[str] = None             # 当年力度说明 ≤60字
+    intensity_note_prev: Optional[str] = None        # 上年力度说明 ≤60字
+    background: Optional[str] = None                # 当年背景
+    background_prev: Optional[str] = None           # 上年背景
+    organization: Optional[str] = None              # 当年组织保障
+    organization_prev: Optional[str] = None         # 上年组织保障
+    measures: List[PolicyMeasureSchema] = Field(default_factory=list)
+
+
+class PolicyExtractionResult(BaseModel):
+    """Policy v3 完整提取结果"""
+    is_relevant_content: bool = True
+    skip_reason: Optional[str] = None
+    policies: List[PolicySchema] = Field(default_factory=list)
+    facts: List[RawClaim] = Field(default_factory=list)
+    conclusions: List[RawClaim] = Field(default_factory=list)

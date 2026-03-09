@@ -53,6 +53,9 @@ _WEIBO_PROFILE = re.compile(
 _YOUTUBE_VIDEO = re.compile(
     r"(?:youtube\.com/watch\?(?:.*&)?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})"
 )
+_BILIBILI_VIDEO = re.compile(
+    r"bilibili\.com/video/(BV[\w]+)"
+)
 _TRUTHSOCIAL_POST = re.compile(
     r"truthsocial\.com/@[\w.]+/posts/(\d+)"
 )
@@ -99,6 +102,15 @@ def parse_url(url: str) -> ParsedURL:
             return ParsedURL(
                 "youtube", SourceType.POST, video_id,
                 f"https://www.youtube.com/watch?v={video_id}"
+            )
+
+    # --- Bilibili ---
+    if "bilibili.com" in host:
+        if m := _BILIBILI_VIDEO.search(url):
+            bv_id = m.group(1)
+            return ParsedURL(
+                "bilibili", SourceType.POST, bv_id,
+                f"https://www.bilibili.com/video/{bv_id}"
             )
 
     # --- Truth Social ---
@@ -156,12 +168,33 @@ async def process_url(url: str, session: AsyncSession) -> InputResult:
     existing_source = existing.first()
 
     if existing_source:
-        logger.info(f"MonitoredSource already exists (id={existing_source.id}), skipping registration")
+        logger.info(f"MonitoredSource already exists (id={existing_source.id})")
         author = await session.get(Author, existing_source.author_id)
+        # 返回该 source 下已有的帖子，pipeline 可直接使用
+        existing_posts = list((await session.exec(
+            select(RawPost)
+            .where(RawPost.monitored_source_id == existing_source.id)
+            .order_by(RawPost.id.desc())
+        )).all())
+        if existing_posts:
+            return InputResult(
+                monitored_source=existing_source,
+                author=author,
+                raw_posts=existing_posts,
+                is_new_source=False,
+            )
+        # source 存在但帖子被删了 → 重新抓取
+        logger.info(f"No posts found for existing source, re-fetching")
+        fetcher = _get_fetcher(existing_source.platform)
+        if hasattr(fetcher, "set_url"):
+            fetcher.set_url(existing_source.url)
+        raw_posts_data = await fetcher.fetch_post(existing_source.platform_id)
+        saved_posts = await _save_raw_posts(session, raw_posts_data, existing_source.id)
+        await session.commit()
         return InputResult(
             monitored_source=existing_source,
             author=author,
-            raw_posts=[],
+            raw_posts=saved_posts,
             is_new_source=False,
         )
 
@@ -284,6 +317,9 @@ def _get_fetcher(platform: str):
     if platform == "truthsocial":
         from anchor.collect.truthsocial import TruthSocialCollector
         return _TruthSocialFetchAdapter(TruthSocialCollector())
+    if platform == "bilibili":
+        from anchor.collect.bilibili import BilibiliCollector
+        return _BilibiliFetchAdapter(BilibiliCollector())
     if platform == "web":
         from anchor.collect.web import WebCollector
         return _WebFetchAdapter(WebCollector())
@@ -459,6 +495,23 @@ class _WebFetchAdapter:
         return [post] if post else []
 
     async def fetch_post_updates(self, post_id: str, since: datetime | None) -> list[RawPostData]:
+        return []
+
+    async def fetch_profile(self, uid: str, since: datetime) -> list[RawPostData]:
+        return []
+
+    async def fetch_profile_since(self, uid: str, since: datetime | None) -> list[RawPostData]:
+        return []
+
+
+class _BilibiliFetchAdapter:
+    def __init__(self, collector) -> None:
+        self._c = collector
+
+    async def fetch_post(self, bv_id: str) -> list[RawPostData]:
+        return await self._c.collect_by_ids([bv_id])
+
+    async def fetch_post_updates(self, bv_id: str, since: datetime | None) -> list[RawPostData]:
         return []
 
     async def fetch_profile(self, uid: str, since: datetime) -> list[RawPostData]:

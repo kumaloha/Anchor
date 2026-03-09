@@ -157,24 +157,61 @@ def _parse_article(text: str, url: str) -> RawPostData:
     )
 
 
+# 域名 → 规范机构名（当文章未标明作者时用域名推断机构）
+_DOMAIN_TO_INSTITUTION: dict[str, str] = {
+    "goldmansachs":   "Goldman Sachs",
+    "morganstanley":  "Morgan Stanley",
+    "blackrock":      "BlackRock",
+    "blackstone":     "Blackstone",
+    "bridgewater":    "Bridgewater Associates",
+    "imf":            "IMF",
+    "federalreserve": "Federal Reserve",
+    "ecb":            "ECB",
+    "bankofengland":  "Bank of England",
+    "boj":            "Bank of Japan",
+    "pbc":            "People's Bank of China",
+    "bis":            "BIS",
+    "oaktreecapital": "Oaktree Capital",
+    "doubleline":     "DoubleLine Capital",
+    "citadel":        "Citadel",
+    "piie":           "PIIE",
+    "brookings":      "Brookings Institution",
+    "nber":           "NBER",
+    "hoover":         "Hoover Institution",
+    "apolloacademy":  "Apollo Global Management",
+    "nri":            "Nomura Research Institute",
+    "rieti":          "RIETI",
+}
+
+
 def _extract_author(text: str, url: str) -> str:
-    """从文章文本或 URL 提取作者/来源机构。"""
+    """从文章文本或 URL 提取作者/来源机构。
+
+    优先级：
+      1. 中文「作者/来源」字段
+      2. 英文「By/Author/Written by/Published by」（含机构名，不限于人名）
+      3. 「Source:」字段
+      4. 域名 → 规范机构名映射
+      5. 域名第一段（兜底）
+    """
     for pattern in [
-        r"来源[：:]\s*([^\n\r，,]+)",
-        r"作者[：:]\s*([^\n\r，,]+)",
-        r"By\s+([A-Z][a-z]+(?: [A-Z][a-z]+){1,3})",
-        r"Source[：:]\s*([^\n\r]+)",
+        r"作者[：:]\s*([^\n\r，,]{2,40})",
+        r"来源[：:]\s*([^\n\r，,]{2,40})",
+        # 英文作者/机构：支持人名和机构名（1-6 个首字母大写的词）
+        r"(?:By|Authors?|Written by|Published by)[：:\s]+"
+        r"((?:[A-Z][A-Za-z0-9&'.,-]+)(?:\s+(?:[A-Z][A-Za-z0-9&'.,-]+)){0,5})",
+        r"Source[：:]\s*([^\n\r]{2,60})",
     ]:
         if m := re.search(pattern, text):
             name = m.group(1).strip()
-            # 去除多余尾缀（如 " 分享到：" 等）
-            name = re.split(r"\s{2,}|分享|【", name)[0].strip()
-            # 跳过：匹配到 URL（Jina 有时把原始链接放在 Source: 行）
+            name = re.split(r"\s{2,}|分享|【|\|", name)[0].strip()
             if name and not name.startswith(("http://", "https://", "www.")):
                 return name
-    # 降级：使用域名（如 "doubleline"、"goldmansachs" 等）
-    domain = urlparse(url).netloc
-    return domain.replace("www.", "").split(".")[0]
+
+    # 域名 → 规范机构名
+    domain = urlparse(url).netloc.lower().replace("www.", "")
+    domain_key = domain.split(".")[0]
+    return _DOMAIN_TO_INSTITUTION.get(domain_key, domain_key)
 
 
 def _extract_images(raw: str, source_url: str = "") -> list[dict]:

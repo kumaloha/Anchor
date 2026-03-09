@@ -160,8 +160,10 @@ class RawPost(SQLModel, table=True):
     authority_level: Optional[str] = None       # 顶层设计|部委联合|部委独立
 
     # Chain 2 — 内容分类与作者意图
-    content_type: Optional[str] = None          # 市场动向|市场分析|产业调研|公司调研|技术论文|教育科普|政策宣布|政策解读
+    notion_page_id: Optional[str] = None        # Notion 页面 ID（同步后写回）
+    content_type: Optional[str] = None          # 财经分析|市场动向|产业链研究|公司调研|技术论文|政策解读
     content_type_secondary: Optional[str] = None  # 次分类（可选）
+    content_subtype: Optional[str] = None       # 财经分析子分类：市场分析|地缘分析|政策分析|技术影响|混合分析
     content_topic: Optional[str] = None         # 具体主题（≤30字）
     author_intent: Optional[str] = None         # 传递信息|影响观点|警示风险|推荐行动|教育科普|引发讨论|推广宣传|政治动员
     intent_note: Optional[str] = None           # 意图说明（≤100字）
@@ -378,6 +380,47 @@ class PolicyItem(SQLModel, table=True):
     # Chain 3 执行追踪
     execution_status: Optional[str] = None      # implemented|in_progress|stalled|not_started|unknown
     execution_note: Optional[str] = None        # ≤80字执行情况说明（含来源依据）
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class Policy(SQLModel, table=True):
+    """政策（v3）— 六维属性政策主旨，含手段子条目 + 内嵌同比对比"""
+
+    __tablename__ = "policies"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    raw_post_id: int = Field(foreign_key="raw_posts.id", index=True)
+
+    theme: str                               # 主旨 ≤8字（如"绿色低碳"）
+    change_summary: Optional[str] = None    # 一句话变化总结 ≤50字
+    target: Optional[str] = None            # 当年目标
+    target_prev: Optional[str] = None       # 上年目标
+    intensity: Optional[str] = None         # strong|moderate|weak
+    intensity_prev: Optional[str] = None    # 上年 intensity
+    intensity_note: Optional[str] = None    # 当年力度说明 ≤60字
+    intensity_note_prev: Optional[str] = None  # 上年力度说明 ≤60字
+    background: Optional[str] = None        # 当年背景 ≤200字
+    background_prev: Optional[str] = None   # 上年背景 ≤200字
+    organization: Optional[str] = None      # 当年组织保障 ≤100字
+    organization_prev: Optional[str] = None # 上年组织保障 ≤100字
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class PolicyMeasure(SQLModel, table=True):
+    """政策手段（v3）— Policy 下的具体措施子条目"""
+
+    __tablename__ = "policy_measures"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    policy_id: int = Field(foreign_key="policies.id", index=True)
+    raw_post_id: int = Field(foreign_key="raw_posts.id", index=True)
+
+    summary: str                             # ≤15字摘要
+    measure_text: str                        # 具体措施 ≤150字
+    trend: Optional[str] = None             # 升级|降级|延续|新增|删除
+    trend_note: Optional[str] = None        # 变化说明 ≤30字
 
     created_at: datetime = Field(default_factory=_utcnow)
 
