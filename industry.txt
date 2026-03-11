@@ -1,0 +1,109 @@
+# 2025年AI行业研究报告汇总（50篇）
+
+> 整理时间：2026年3月 | 报告时间范围：2025年1月至2026年初
+
+---
+
+## 一、综合性AI行业报告
+
+| # | 报告名称 | 发布机构 | 时间 | 链接 |
+|---|---------|---------|------|------|
+| 1 | **AI Index Report 2025** | Stanford HAI | 2025.04 | https://hai.stanford.edu/ai-index/2025-ai-index-report |
+| 2 | **State of AI Report 2025** | Air Street Capital | 2025.10 | https://www.stateof.ai/ |
+| 3 | **The State of AI 2025: Agents, Innovation, and Transformation** | McKinsey & Company | 2025.11 | https://www.mckinsey.com/capabilities/quantumblack/our-insights/the-state-of-ai |
+| 4 | **The State of AI (March 2025): How Organizations Are Rewiring to Capture Value** | McKinsey & Company | 2025.03 | https://www.mckinsey.com/~/media/mckinsey/business%20functions/quantumblack/our%20insights/the%20state%20of%20ai/2025/ |
+| 5 | **The State of Enterprise AI 2025** | OpenAI | 2025 | https://cdn.openai.com/pdf/7ef17d82-96bf-4dd1-9df2-228f7f377a29/the-state-of-enterprise-ai_2025-report.pdf |
+| 6 | **Global AI Adoption in 2025** | Microsoft AI Economy Institute | 2026.01 | https://www.microsoft.com/en-us/corporate-responsibility/topics/ai-economy-institute/reports/global-ai-adoption-2025/ |
+| 7 | **Global Artificial Intelligence Report 2025** | IDCA | 2025 | https://www.idc-a.org/insights/0bKr4NJQdK5sYcAQaGZD |
+| 8 | **AI Industry Landscape Report 2025** | Aurora Mobile / CEIBS | 2025 | https://repository.ceibs.edu/files/59116885/AI_Industry_landscape_report_2025.pdf |
+| 9 | **State of AI in Business 2025: The GenAI Divide** | MIT | 2025 | https://mlq.ai/media/quarterly_decks/v0.1_State_of_AI_in_Business_2025_Report.pdf |
+| 10 | **Artificial Power: 2025 Landscape Report** | AI Now Institute | 2025.06 | https://ainowinstitute.org/publications/research/ai-now-2025-landscape-report |
+
+---
+
+## 二、咨询公司专题报告
+
+| # | 报告名称 | 发布机构 | 时间 | 链接 |
+|---|---------|---------|------|------|
+| 11 | **From Potential to Profit: Closing the AI Impact Gap** | BCG | 2025.01 | https://www.bcg.com/publications/2025/closing-the-ai-impact-gap |
+| 12 | **The Widening AI Value Gap: Build for the Future 2025** | BCG | 2025.09 | https://media-publications.bcg.com/The-Widening-AI-Value-Gap-Sept-2025.pdf |
+| 13 | **Are You Generating Value from AI? The Widening Gap** | BCG | 2025.10 | https://www.bcg.com/publications/2025/are-you-generating-value-from-ai-the-widening-gap |
+| 14 | **State of AI in the Enterprise 2026 (基于2025年调研)** | Deloitte AI Institute | 2026.01 | https://www.deloitte.com/us/en/what-we-do/capabilities/applied-artificial-intelligence/content/state-of-generative-ai-in-enterprise.html |
+| 15 | **Deloitte Connected Consumer Survey 2025: GenAI Goes Mainstream** | Deloitte | 2025.09 | https://www.deloitte.com/us/en/about/press-room/connectivity-mobile-trends-survey.html |
+| 16 | **TMT 2025 Predictions: GenAI Paving the Way** | Deloitte Global | 2025 | https://www.deloitte.com/global/en/about/press-room/deloitte-globals-2025-predictions-report.html |
+| 17 | **Autonomous Generative AI Agents** | Deloitte Insights | 2025 | https://www.deloitte.com/us/en/insights/industry/technology/technology-media-and-telecom-predictions/2025/autonomous-generative-ai-agents-still-under-development.html |
+| 18 | **Technology Trends Outlook 2025** | McKinsey Global Institute | 2025.07 | https://www.mckinsey.com/~/media/mckinsey/business%20functions/mckinsey%20digital/our%20insights/the%20top%20trends%20in%20tech%202025/ |
+| 19 | **AI Agents in Enterprise: Market Survey** | Klover.ai (综合McKinsey/PwC/Deloitte/Gartner/Forrester) | 2025.07 | https://www.klover.ai/ai-agents-in-enterprise-market-survey-mckinsey-pwc-deloitte-gartner/ |
+| 20 | **Rise of Agentic AI: How Trust Is the Key** | Capgemini Research Institute | 2025.07 | https://www.capgemini.com/insights/research-library/ai-agents/ |
+
+---
+
+## 三、市场预测与投资报告
+
+| # | 报告名称 | 发布机构 | 时间 | 链接 |
+|---|---------|---------|------|------|
+| 21 | **Why AI Companies May Invest More than $500 Billion in 2026** | Goldman Sachs Research | 2025.12 | https://www.goldmansachs.com/insights/articles/why-ai-companies-may-invest-more-than-500-billion-in-2026 |
+| 22 | **IDC FutureScape 2026: Rise of Agentic AI** | IDC | 2025.10 | https://my.idc.com/getdoc.jsp?containerId=prUS53883425 |
+| 23 | **IDC FutureScape: AI & GenAI Predictions 2025 and Beyond** | IDC | 2025 | https://info.idc.com/futurescape-generative-ai-2025-predictions.html |
+| 24 | **AI Consulting and Support Services Analysis Report 2025-2032** | ResearchAndMarkets | 2025.11 | https://www.businesswire.com/news/home/20251124215144/en/ |
+| 25 | **AI Chips for Data Centers and Cloud 2025-2035** | IDTechEx | 2025.04 | https://www.idtechex.com/en/research-report/ai-chips-for-data-centers-and-cloud/1095 |
+
+---
+
+## 四、半导体与基础设施报告
+
+| # | 报告名称 | 发布机构 | 时间 | 链接 |
+|---|---------|---------|------|------|
+| 26 | **2026 Semiconductor Industry Outlook** | Deloitte Insights | 2026.02 | https://www.deloitte.com/us/en/insights/industry/technology/technology-media-telecom-outlooks/semiconductor-industry-outlook.html |
+| 27 | **Worldwide Semiconductor Revenue Forecast 2025** | IDC | 2025.09 | https://my.idc.com/getdoc.jsp?containerId=prUS53791725 |
+| 28 | **Data Center Semiconductor Trends 2025** | Yole Group | 2025.08 | https://www.yolegroup.com/press-release/data-center-semiconductor-trends-2025-artificial-intelligence-reshapes-compute-and-memory-markets/ |
+| 29 | **Data Center Equipment & Infrastructure Market Report 2025-2030** | IoT Analytics | 2025.11 | https://iot-analytics.com/data-center-infrastructure-market/ |
+| 30 | **Data Center AI Processor Chips and Accelerators: 2025 Q1 Update** | TechInsights | 2025 | https://www.techinsights.com/blog/data-center-ai-processor-chips-and-accelerators-2025-q1-update |
+
+---
+
+## 五、AI安全、治理与政策报告
+
+| # | 报告名称 | 发布机构 | 时间 | 链接 |
+|---|---------|---------|------|------|
+| 31 | **AI Index 2025 — Policy and Governance Chapter** | Stanford HAI | 2025.04 | https://hai.stanford.edu/ai-index/2025-ai-index-report/policy-and-governance |
+| 32 | **Interoperability in AI Safety Governance: Ethics, Regulations, and Standards** | 联合国大学 (UNU Macau) | 2025.10 | https://unu.edu/macau/news/new-policy-report-interoperability-ai-safety-governance-ethics-regulations-and-standards |
+| 33 | **AI Regulations around the World 2025-2026** | Mind Foundry | 2025-2026 | https://www.mindfoundry.ai/blog/ai-regulations-around-the-world |
+| 34 | **Regulating AI: U.S. and International Approaches** | U.S. Congressional Research Service | 2025 | https://www.congress.gov/crs-product/R48555 |
+| 35 | **EU AI Act Implementation Updates 2025** | European Commission | 2025 | https://digital-strategy.ec.europa.eu/en/policies/regulatory-framework-ai |
+| 36 | **Frontier AI Trends Report** | UK AI Security Institute (AISI) | 2025.12 | 参见UK AISI官网 |
+| 37 | **Executive Order on National AI Policy Framework** | 美国白宫 | 2025.12 | https://www.whitehouse.gov/presidential-actions/2025/12/eliminating-state-law-obstruction-of-national-artificial-intelligence-policy/ |
+| 38 | **New York RAISE Act (AI Safety & Transparency)** | 纽约州政府 | 2025.12 | https://www.nysenate.gov/newsroom/press-releases/2025/andrew-gounardes/landmark-ai-safety-bill-signed-law |
+
+---
+
+## 六、行业垂直领域AI应用报告
+
+| # | 报告名称 | 发布机构 | 时间 | 链接 |
+|---|---------|---------|------|------|
+| 39 | **AI Adoption and Sectoral Transformation: Health Care, Financial Services, Climate/Energy, Transportation** | RAND Corporation | 2025 | https://www.rand.org/pubs/research_reports/RRA3888-1.html |
+| 40 | **AI Adoption in Financial Services 2025** | Caspian One | 2025 | https://www.caspianone.com/ai-in-financial-services-report |
+| 41 | **Artificial Intelligence in Financial Services 2025** | World Economic Forum | 2025 | 参见WEF官网 |
+| 42 | **AI in Healthcare: Trends 2025** | Healthcare Finance News / Bain & KLAS Research | 2025 | https://www.healthcarefinancenews.com/news/trends-2025-ai-healthcare-progressing-despite-reimbursement-hurdles |
+
+---
+
+## 七、AI劳动力、技能与生产力报告
+
+| # | 报告名称 | 发布机构 | 时间 | 链接 |
+|---|---------|---------|------|------|
+| 43 | **AI Statistics 2025: Key Market Data and Trends** | Mission Cloud | 2025.08 | https://www.missioncloud.com/blog/ai-statistics-2025-key-market-data-and-trends |
+| 44 | **PwC AI Jobs Barometer 2025** (AI技能薪资溢价56%) | PwC | 2025 | 参见PwC UK官网 |
+| 45 | **IBM Study: Businesses View AI Agents as Essential** | IBM | 2025.06 | https://newsroom.ibm.com/2025-06-10-IBM-Study-Businesses-View-AI-Agents-as-Essential,-Not-Just-Experimental |
+| 46 | **EY AI Workforce Report 2025** | EY | 2025 | 参见EY官网 |
+| 47 | **Accenture Technology Vision 2025: New Age of AI** | Accenture | 2025 | 参见Accenture Newsroom |
+
+---
+
+## 八、开源AI与技术前沿报告
+
+| # | 报告名称 | 发布机构 | 时间 | 链接 |
+|---|---------|---------|------|------|
+| 48 | **AI Predictions for 2025** | Forrester | 2025 | https://www.forrester.com/predictions/ |
+| 49 | **Gartner Top 10 Strategic Technology Trends 2025** | Gartner | 2025 | 参见Gartner官网 |
+| 50 | **Deloitte State of Generative AI in the Enterprise Q4 Report** | Deloitte | 2025.01 | https://www.markt-kom.com/wp-content/uploads/2025/01/Download-Deloitte-Report-State-of-Generative-AI-Englisch.pdf |

@@ -3,6 +3,7 @@ from collections.abc import AsyncGenerator
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy import event
 
 from anchor.config import settings
 
@@ -14,6 +15,15 @@ engine = create_async_engine(
     echo=False,
     future=True,
 )
+
+
+# SQLite 并发优化：WAL 模式 + busy_timeout
+@event.listens_for(engine.sync_engine, "connect")
+def _set_sqlite_pragma(dbapi_conn, connection_record):
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=30000")  # 30 秒等待锁
+    cursor.close()
 
 AsyncSessionLocal = async_sessionmaker(
     engine,

@@ -9,6 +9,11 @@ from anchor.extract.prompts import v5_step1_claims
 from anchor.extract.prompts import v5_step2_merge
 from anchor.extract.prompts import v5_step3_classify
 from anchor.extract.prompts import v5_step4_implicit
+from anchor.extract.prompts import v6_step1_anchors
+from anchor.extract.prompts import v6_step2_supporting
+from anchor.extract.prompts import v6_step3_abstract
+from anchor.extract.prompts import v6_step4_merge
+from anchor.extract.prompts import v6_step5_relationships
 
 PROMPT_REGISTRY: dict[str, BasePrompt] = {
     "v1_identify": PromptV1Identify(),
@@ -19,9 +24,9 @@ PROMPT_REGISTRY: dict[str, BasePrompt] = {
     "v4_sixentity": PromptV4SixEntity(),
 }
 
-# v5 多步流水线使用独立步骤提示词模块，不注册到 PROMPT_REGISTRY
+# v5/v6 多步流水线使用独立步骤提示词模块，不注册到 PROMPT_REGISTRY
 # 直接通过 extractor.py 内部 import 调用
-DEFAULT_PROMPT_VERSION = "v5"
+DEFAULT_PROMPT_VERSION = "v6"
 
 __all__ = [
     "BasePrompt",
@@ -35,6 +40,11 @@ __all__ = [
     "v5_step2_merge",
     "v5_step3_classify",
     "v5_step4_implicit",
+    "v6_step1_anchors",
+    "v6_step2_supporting",
+    "v6_step3_abstract",
+    "v6_step4_merge",
+    "v6_step5_relationships",
     "PROMPT_REGISTRY",
     "DEFAULT_PROMPT_VERSION",
 ]

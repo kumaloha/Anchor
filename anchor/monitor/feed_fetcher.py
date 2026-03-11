@@ -16,6 +16,7 @@ anchor/monitor/feed_fetcher.py
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 import logging
@@ -129,7 +130,7 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
 _DATE_IN_PATH_RE = re.compile(r"/20\d{2}(?:/|[-_])")
 _STATIC_EXT_RE = re.compile(
-    r"\.(?:css|js|png|jpg|jpeg|gif|webp|svg|ico|pdf|zip|mp3|mp4|woff2?|ttf)(?:$|\?)",
+    r"\.(?:css|js|png|jpg|jpeg|gif|webp|svg|ico|zip|mp3|mp4|woff2?|ttf)(?:$|\?)",
     flags=re.IGNORECASE,
 )
 _NEGATIVE_HINTS = (
@@ -192,7 +193,7 @@ def _score_candidate(list_path: str, link_url: str, anchor_text: str) -> int:
 
 
 def fetch_generic_links(page_url: str, since: Optional[datetime] = None,
-                        max_results: int = 20) -> list[FetchedItem]:
+                        max_results: int = 200) -> list[FetchedItem]:
     """从非 RSS 列表页抽取可能的文章链接。"""
     del since  # HTML 列表页通常缺失发布时间，无法按 since 过滤
     try:
@@ -282,9 +283,9 @@ def fetch_youtube_channel(channel_url: str, since: Optional[datetime] = None,
         logger.warning("yt-dlp not installed; skipping YouTube fetch")
         return []
 
-    # 确保 URL 指向视频列表
+    # 播放列表 URL 直接使用；频道 URL 加 /videos
     url = channel_url.rstrip("/")
-    if not url.endswith("/videos"):
+    if "playlist?list=" not in url and not url.endswith("/videos"):
         url += "/videos"
 
     ydl_opts = {
@@ -347,34 +348,127 @@ def fetch_youtube_channel(channel_url: str, since: Optional[datetime] = None,
     return items
 
 
-# ── Bilibili（官方开放 API）───────────────────────────────────────────────────
+# ── Bilibili（wbi 签名 API）───────────────────────────────────────────────────
+
+_BILI_MIXIN_KEY_ENC_TAB = [
+    46, 47, 18,  2, 53,  8, 23, 32, 15, 50, 10, 31, 58,  3, 45, 35,
+    27, 43,  5, 49, 33,  9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48,  7, 16, 24, 55, 40, 61, 26, 17,  0,  1, 60, 51, 30,  4,
+    22, 25, 54, 21, 56, 59,  6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+]
+_bili_wbi_cache: dict = {}
+
+
+def _bili_get_mixin_key(orig: str) -> str:
+    from functools import reduce
+    return reduce(lambda s, i: s + orig[i], _BILI_MIXIN_KEY_ENC_TAB, "")[:32]
+
+
+def _bili_get_wbi_keys() -> tuple[str, str]:
+    """从 nav API 获取 wbi img_key + sub_key（缓存 24h）。"""
+    import httpx as _httpx
+    now = time.time()
+    if _bili_wbi_cache and now - _bili_wbi_cache.get("ts", 0) < 86400:
+        return _bili_wbi_cache["img_key"], _bili_wbi_cache["sub_key"]
+
+    resp = _httpx.get(
+        "https://api.bilibili.com/x/web-interface/nav",
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.bilibili.com/",
+        },
+        timeout=10,
+    )
+    data = resp.json()["data"]["wbi_img"]
+    img_key = data["img_url"].rsplit("/", 1)[1].split(".")[0]
+    sub_key = data["sub_url"].rsplit("/", 1)[1].split(".")[0]
+    _bili_wbi_cache.update(img_key=img_key, sub_key=sub_key, ts=now)
+    return img_key, sub_key
+
+
+def _bili_sign_wbi(params: dict) -> dict:
+    """对请求参数进行 wbi 签名，返回带 wts + w_rid 的新参数字典。"""
+    from hashlib import md5
+    from urllib.parse import urlencode
+
+    img_key, sub_key = _bili_get_wbi_keys()
+    mixin_key = _bili_get_mixin_key(img_key + sub_key)
+
+    params["wts"] = round(time.time())
+    params = dict(sorted(params.items()))
+    params = {
+        k: "".join(c for c in str(v) if c not in "!'()*")
+        for k, v in params.items()
+    }
+    query = urlencode(params)
+    params["w_rid"] = md5((query + mixin_key).encode()).hexdigest()
+    return params
+
+
+def _get_bilibili_cookies() -> dict[str, str]:
+    """从环境变量 BILIBILI_COOKIE 获取 B 站 cookies。
+
+    格式：BILIBILI_COOKIE="SESSDATA=xxx; bili_jct=yyy; buvid3=zzz; buvid_fp=www"
+    从浏览器 DevTools → Application → Cookies → bilibili.com 复制。
+    """
+    if hasattr(_get_bilibili_cookies, "_cache"):
+        return _get_bilibili_cookies._cache
+
+    cookie_dict: dict[str, str] = {}
+    raw_cookie = os.environ.get("BILIBILI_COOKIE", "")
+    if raw_cookie:
+        cookie_dict = _parse_cookie_string(raw_cookie)
+        if cookie_dict.get("SESSDATA"):
+            logger.info(f"[Bilibili] Loaded cookies from BILIBILI_COOKIE env ({len(cookie_dict)} keys)")
+        elif cookie_dict:
+            logger.warning("[Bilibili] BILIBILI_COOKIE missing SESSDATA — API may be rate-limited")
+    else:
+        logger.debug("[Bilibili] No BILIBILI_COOKIE env — API calls may be rate-limited")
+
+    _get_bilibili_cookies._cache = cookie_dict
+    return cookie_dict
+
 
 def fetch_bilibili_space(uid: str, since: Optional[datetime] = None,
                          max_results: int = 20) -> list[FetchedItem]:
-    """通过 B 站公开 API 获取 UP 主最新投稿。"""
+    """通过 B 站 wbi 签名 API 获取 UP 主最新投稿。"""
     try:
         import httpx  # type: ignore
     except ImportError:
         logger.warning("httpx not installed; skipping Bilibili fetch")
         return []
 
-    api_url = (
-        f"https://api.bilibili.com/x/space/arc/search"
-        f"?mid={uid}&ps={max_results}&pn=1&order=pubdate"
-    )
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://space.bilibili.com/",
     }
+    cookies = _get_bilibili_cookies()
 
     logger.info(f"[Bilibili] Fetching uid={uid}")
     items: list[FetchedItem] = []
     try:
-        resp = httpx.get(api_url, headers=headers, timeout=15)
-        resp.raise_for_status()
+        params = _bili_sign_wbi({
+            "mid": uid,
+            "ps": max_results,
+            "pn": 1,
+            "order": "pubdate",
+            "dm_img_list": "[]",
+            "dm_img_str": "V2ViR0wgMS",
+            "dm_cover_img_str": "QU5HTEUgKE",
+        })
+        resp = httpx.get(
+            "https://api.bilibili.com/x/space/wbi/arc/search",
+            params=params, headers=headers, cookies=cookies, timeout=15,
+        )
         data = resp.json()
+        code = data.get("code", -1)
+        if code != 0:
+            logger.warning(f"[Bilibili] API error code={code}: {data.get('message', '')}")
+            return []
+
         vlist = data.get("data", {}).get("list", {}).get("vlist", [])
         for v in vlist:
             bvid = v.get("bvid", "")
@@ -403,12 +497,94 @@ def fetch_bilibili_space(uid: str, since: Optional[datetime] = None,
 
 # ── Weibo（公开帖子，轻量 HTML 抓取）─────────────────────────────────────────
 
+def _parse_cookie_string(raw: str) -> dict[str, str]:
+    """Parse 'key1=val1; key2=val2' into dict."""
+    d: dict[str, str] = {}
+    for part in raw.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            d[k.strip()] = v.strip()
+    return d
+
+
+def _get_weibo_cookies() -> dict[str, str]:
+    """从环境变量 WEIBO_COOKIE 获取微博登录 cookie。
+
+    格式：WEIBO_COOKIE="SUB=xxx; SUBP=yyy; XSRF-TOKEN=zzz"
+    从浏览器 DevTools → Application → Cookies → weibo.com 复制完整 cookie 字符串。
+    """
+    if hasattr(_get_weibo_cookies, "_cache"):
+        return _get_weibo_cookies._cache
+
+    cookie_dict: dict[str, str] = {}
+    raw_cookie = os.environ.get("WEIBO_COOKIE", "")
+    if raw_cookie:
+        cookie_dict = _parse_cookie_string(raw_cookie)
+        if cookie_dict.get("SUB") and cookie_dict.get("XSRF-TOKEN"):
+            logger.info(f"[Weibo] Loaded login cookies from WEIBO_COOKIE env ({len(cookie_dict)} keys)")
+        elif cookie_dict:
+            logger.warning("[Weibo] WEIBO_COOKIE missing SUB or XSRF-TOKEN — may fail auth")
+        else:
+            logger.warning("[Weibo] WEIBO_COOKIE env is set but could not parse any cookies")
+    else:
+        logger.warning("[Weibo] Set WEIBO_COOKIE env to enable Weibo monitoring")
+
+    _get_weibo_cookies._cache = cookie_dict
+    return cookie_dict
+
+
+def fetch_nifd_research(page_url: str, since: Optional[datetime] = None,
+                        max_results: int = 12) -> list[FetchedItem]:
+    """从 NIFD 研究列表页抓取文章链接（直接解析 SeriesReportList API 端点）。"""
+    try:
+        import httpx  # type: ignore
+    except ImportError:
+        logger.warning("httpx not installed; skipping NIFD fetch")
+        return []
+
+    api_url = "http://www.nifd.cn/SeriesReport/SeriesReportList?pageSize=12&pageIndex=1&type=RC"
+    logger.info(f"[NIFD] Fetching {api_url}")
+    try:
+        resp = httpx.get(api_url, follow_redirects=True, timeout=20,
+                         headers={"User-Agent": _GENERIC_UA})
+    except Exception as exc:
+        logger.warning(f"[NIFD] Fetch failed: {exc}")
+        return []
+
+    if resp.status_code >= 400:
+        logger.warning(f"[NIFD] HTTP {resp.status_code}")
+        return []
+
+    html = resp.text or ""
+    # 解析 <a href="/SeriesReport/Details/4873">标题</a> + [2026年03月09日]
+    _item_re = re.compile(
+        r'href="(/SeriesReport/Details/\d+)"[^>]*>([^<]+)</a>'
+        r'.*?\[(\d{4})年(\d{2})月(\d{2})日\]',
+        re.DOTALL,
+    )
+    items: list[FetchedItem] = []
+    for m in _item_re.finditer(html):
+        path, title, y, mo, d = m.group(1), m.group(2).strip(), m.group(3), m.group(4), m.group(5)
+        pub_at = datetime(int(y), int(mo), int(d), tzinfo=timezone.utc)
+        if since and pub_at < since:
+            continue
+        full_url = f"http://www.nifd.cn{path}"
+        items.append(FetchedItem(
+            url=full_url,
+            title=title,
+            published_at=pub_at,
+            raw_id=path,
+        ))
+    logger.info(f"[NIFD] Found {len(items)} items")
+    return items[:max_results]
+
+
 def fetch_weibo_user(profile_url: str, since: Optional[datetime] = None,
                      max_results: int = 10) -> list[FetchedItem]:
     """
     从微博用户主页抓取最新微博 URL。
-    仅抓取公开内容，速率严格控制。
-    注意：微博反爬较强，这里用简单方式尝试；如被封锁会返回空列表。
+    自动从浏览器提取登录 cookie（需先在 Chrome/Safari 登录微博）。
     """
     try:
         import httpx  # type: ignore
@@ -423,7 +599,10 @@ def fetch_weibo_user(profile_url: str, since: Optional[datetime] = None,
         return []
     uid = uid_match.group(1)
 
-    # 微博开放 API（无需登录的基本信息）
+    cookies = _get_weibo_cookies()
+    if not cookies:
+        return []
+
     api_url = f"https://weibo.com/ajax/statuses/mymblog?uid={uid}&page=1&feature=0"
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -432,22 +611,39 @@ def fetch_weibo_user(profile_url: str, since: Optional[datetime] = None,
         "Referer": f"https://weibo.com/{uid}",
         "Accept": "application/json, text/plain, */*",
     }
+    # Weibo AJAX API 要求 X-XSRF-TOKEN header
+    xsrf = cookies.get("XSRF-TOKEN", "")
+    if xsrf:
+        headers["X-XSRF-TOKEN"] = xsrf
 
     logger.info(f"[Weibo] Fetching uid={uid}")
     items: list[FetchedItem] = []
     try:
-        resp = httpx.get(api_url, headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        resp = httpx.get(api_url, headers=headers, cookies=cookies, timeout=15)
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning(f"[Weibo] Non-JSON response (HTTP {resp.status_code})")
+            return []
+
+        if data.get("ok") != 1:
+            msg = data.get("message", "")
+            logger.warning(f"[Weibo] API error (ok={data.get('ok')}): {msg}")
+            if "登录" in msg or resp.status_code == 403:
+                logger.warning("[Weibo] Cookie 无效或过期 — 请在 Chrome 中打开 weibo.com 并登录")
+                _get_weibo_cookies._cache = {}
+            return []
+
         statuses = data.get("data", {}).get("list", [])
         for st in statuses[:max_results]:
             mid = st.get("id") or st.get("mid", "")
             if not mid:
                 continue
-            # 微博详情 URL
             bid = st.get("bid") or mid
             post_url = f"https://weibo.com/{uid}/{bid}"
-            title = (st.get("text") or "")[:80]  # 正文截断作为标题
+            # 优先用纯文本，去 HTML 标签
+            raw_text = st.get("text_raw") or st.get("text") or ""
+            title = re.sub(r"<[^>]+>", "", raw_text)[:80]
             created_at_str = st.get("created_at", "")
             pub_dt = _parse_dt(created_at_str) if created_at_str else None
 
@@ -455,11 +651,112 @@ def fetch_weibo_user(profile_url: str, since: Optional[datetime] = None,
                 continue
 
             items.append(FetchedItem(url=post_url, title=title, published_at=pub_dt, raw_id=str(mid)))
-            time.sleep(0.3)  # 礼貌延时
+            time.sleep(0.3)
     except Exception as e:
         logger.error(f"[Weibo] Error fetching uid={uid}: {e}")
 
     logger.info(f"[Weibo] {len(items)} new items for uid={uid}")
+    return items
+
+
+# ── Twitter/X（通过 RSSHub 或 TwitterAPI.io）────────────────────────────────
+
+def fetch_twitter_user(profile_url: str, since: Optional[datetime] = None,
+                       max_results: int = 20) -> list[FetchedItem]:
+    """
+    从 Twitter/X 用户主页抓取最新推文。
+
+    支持两种方式（按优先级）：
+      1. RSSHUB_URL 环境变量 — 自部署 RSSHub 实例，走 /twitter/user/:id
+      2. TWITTER_API_KEY 环境变量 — TwitterAPI.io 等第三方 API
+
+    配置示例：
+      RSSHUB_URL=https://rsshub.example.com
+      # 或
+      TWITTER_API_KEY=your-api-key
+      TWITTER_API_BASE=https://api.twitterapi.io  （可选，默认 TwitterAPI.io）
+    """
+    # 提取用户名
+    m = re.search(r"(?:twitter|x)\.com/(\w+)(?:/|$)", profile_url)
+    if not m:
+        logger.warning(f"[Twitter] Cannot extract username from {profile_url}")
+        return []
+    username = m.group(1)
+
+    # 方式 1：RSSHub
+    rsshub_url = os.environ.get("RSSHUB_URL", "").rstrip("/")
+    if rsshub_url:
+        rss_url = f"{rsshub_url}/twitter/user/{username}"
+        logger.info(f"[Twitter] Fetching via RSSHub: {rss_url}")
+        items = fetch_rss(rss_url, since=since)
+        if items:
+            logger.info(f"[Twitter] {len(items)} items via RSSHub for @{username}")
+            return items[:max_results]
+        logger.warning(f"[Twitter] RSSHub returned no items for @{username}")
+
+    # 方式 2：TwitterAPI.io 兼容 API
+    api_key = os.environ.get("TWITTER_API_KEY", "")
+    if api_key:
+        return _fetch_twitter_via_api(username, api_key, since, max_results)
+
+    logger.info(
+        f"[Twitter] No RSSHUB_URL or TWITTER_API_KEY configured; "
+        f"skip @{username}. See docs for setup."
+    )
+    return []
+
+
+def _fetch_twitter_via_api(
+    username: str, api_key: str,
+    since: Optional[datetime] = None, max_results: int = 20,
+) -> list[FetchedItem]:
+    """通过 TwitterAPI.io 兼容接口获取用户推文。"""
+    try:
+        import httpx
+    except ImportError:
+        logger.warning("httpx not installed; skipping Twitter fetch")
+        return []
+
+    base = os.environ.get("TWITTER_API_BASE", "https://api.twitterapi.io").rstrip("/")
+    url = f"{base}/twitter/user/last_tweets/{username}"
+    headers = {"X-API-Key": api_key}
+
+    logger.info(f"[Twitter] Fetching @{username} via API: {url}")
+    items: list[FetchedItem] = []
+    try:
+        resp = httpx.get(url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            logger.warning(f"[Twitter] API HTTP {resp.status_code}: {resp.text[:200]}")
+            return []
+        data = resp.json()
+        tweets = data.get("tweets", data.get("data", []))
+        if not isinstance(tweets, list):
+            logger.warning(f"[Twitter] Unexpected API response shape")
+            return []
+
+        for tw in tweets[:max_results]:
+            tweet_id = tw.get("id", "")
+            text = tw.get("text", "")
+            author = tw.get("author", {})
+            screen_name = author.get("userName", username) if isinstance(author, dict) else username
+            tweet_url = f"https://x.com/{screen_name}/status/{tweet_id}"
+            title = re.sub(r"\s+", " ", text)[:120]
+
+            pub_dt: Optional[datetime] = None
+            created_str = tw.get("createdAt") or tw.get("created_at", "")
+            if created_str:
+                pub_dt = _parse_dt(created_str)
+            if since and pub_dt and _as_utc(pub_dt) <= _as_utc(since):
+                continue
+
+            items.append(FetchedItem(
+                url=tweet_url, title=title, published_at=pub_dt,
+                raw_id=str(tweet_id),
+            ))
+    except Exception as e:
+        logger.error(f"[Twitter] API error for @{username}: {e}")
+
+    logger.info(f"[Twitter] {len(items)} items via API for @{username}")
     return items
 
 
@@ -543,7 +840,10 @@ def fetch_source(platform_hint: str, url: str,
     if hint in ("weibo",):
         return fetch_weibo_user(url, since=since)
 
-    if hint in ("linkedin", "twitter", "x"):
+    if hint in ("twitter", "x"):
+        return fetch_twitter_user(url, since=since)
+
+    if hint in ("linkedin",):
         logger.info(f"[Monitor] Platform '{hint}' does not support auto-fetch; skip")
         return []
 
@@ -551,6 +851,10 @@ def fetch_source(platform_hint: str, url: str,
     if hint in ("rss", "atom", "feed"):
         items = fetch_rss(url, since=since)
         return items if items else fetch_generic_links(url, since=since)
+
+    # ── NIFD 专用路由 ────────────────────────────────────────────────────────
+    if "nifd.cn" in url:
+        return fetch_nifd_research(url, since=since)
 
     # ── 通用：尝试从域名判断 ──────────────────────────────────────────────────
     detected = _detect_platform(url)

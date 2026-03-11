@@ -68,6 +68,8 @@ authors:
       - platform: Vanguard Investing Insights
         url: https://corporate.vanguard.com/content/corporatesite/us/en/corp/what-we-think/investing-insights/index.html
         accessible: true
+        crawl_depth: 1
+        note: JS渲染目录页，generic fetch仅提取4条导航链接；需 Jina Reader
 
   - name: Ronald O'Hanley
     institution: 道富集团 (State Street) 董事长 / CEO
@@ -77,6 +79,8 @@ authors:
       - platform: State Street Global Advisors Insights
         url: https://www.ssga.com/us/en/institutional/ic/insights
         accessible: true
+        crawl_depth: 1
+        note: JS渲染目录页，generic fetch仅提取1条链接；需 Jina Reader
 
   - name: Nir Bar Dea
     institution: 桥水基金 (Bridgewater Associates) CEO
@@ -186,8 +190,9 @@ authors:
         url: https://www.project-syndicate.org/columnist/daron-acemoglu
         accessible: false
       - platform: NBER Working Papers
-        url: https://www.nber.org/search?page=1&perPage=50&q=acemoglu
+        url: https://www.nber.org/people/daron_acemoglu
         accessible: true
+        crawl_depth: 1
 
   - name: Ben Bernanke
     institution: 布鲁金斯学会 (Brookings) 高级研究员 / 前美联储主席 (2022 诺贝尔奖)
@@ -195,8 +200,10 @@ authors:
     category: nobel_laureate
     sources:
       - platform: Brookings Institution
-        url: https://www.brookings.edu/experts/ben-s-bernanke/
+        url: https://www.brookings.edu/centers/the-hutchins-center-on-fiscal-and-monetary-policy/
         accessible: true
+        crawl_depth: 1
+        note: 专家页为JS渲染（不可爬），改为Hutchins Center静态列表页
 
   - name: Paul Krugman
     institution: 纽约城市大学 教授 / 前普林斯顿 (2008 诺贝尔奖)
@@ -227,8 +234,10 @@ authors:
     category: hedge_fund
     sources:
       - platform: Oaktree Capital Memos
-        url: https://www.oaktreecapital.com/insights
+        url: https://www.oaktreecapital.com/insights/memos
         accessible: true
+        crawl_depth: 1
+        note: Howard Marks 备忘录目录页；需 Jina+LLM 分类
 
   - name: Bill Ackman
     institution: Pershing Square Capital Management CEO
@@ -294,9 +303,10 @@ authors:
     tier: 2
     category: chief_economist
     sources:
-      - platform: Goldman Sachs Insights
-        url: https://www.goldmansachs.com/intelligence/
+      - platform: YouTube
+        url: https://www.youtube.com/playlist?list=PLIyiGQywEp66lKvfhiDbiuZnCboYneuX2
         accessible: true
+        note: Exchanges at Goldman Sachs 专属播放列表（intelligence/页面JS渲染不可爬）
 
   - name: Seth Carpenter
     institution: 摩根士丹利 (Morgan Stanley) 首席经济学家
@@ -419,7 +429,7 @@ authors:
     sources:
       - platform: 微博
         url: https://weibo.com/1182426800
-        accessible: false
+        accessible: true
 
   - name: 付鹏 (Fu Peng)
     institution: 东北证券首席经济学家
@@ -428,6 +438,15 @@ authors:
     sources:
       - platform: YouTube「付鹏的财经世界」
         url: https://www.youtube.com/@%E4%BB%98%E9%B9%8F%E7%9A%84%E8%B4%A2%E7%BB%8F%E4%B8%96%E7%95%8C
+        accessible: true
+
+  - name: 翟东升 (Zhai Dongsheng)
+    institution: 中国人民大学国际关系学院教授
+    tier: 2
+    category: china_analyst
+    sources:
+      - platform: Bilibili
+        url: https://space.bilibili.com/596299260
         accessible: true
 
   # ── 新补充：美国首席经济学家 ──────────────────────────────────────────────
@@ -460,6 +479,8 @@ authors:
       - platform: BlackRock Investment Institute
         url: https://www.blackrock.com/corporate/insights/blackrock-investment-institute
         accessible: true
+        crawl_depth: 1
+        note: generic fetch提取全站导航(UK Gender Pay等)而非研究报告；需 Jina+LLM 分类
 
   - name: Joseph Stiglitz
     institution: 哥伦比亚大学经济学教授 (诺贝尔经济学奖 2001)
@@ -480,7 +501,13 @@ authors:
       - platform: 野村综合研究所评论 (NRI)
         url: https://www.nri.com/en/knowledge/report
         accessible: true
-        note: 提出"资产负债表衰退"理论；报告需在 NRI 官网查阅
+        crawl_depth: 1
+        note: 提出"资产负债表衰退"理论；generic fetch提取旧/无关链接，需 Jina+LLM 分类
+      - platform: NRI Publications (目录页)
+        url: https://www.nri.com/en/knowledge/publications.html
+        accessible: true
+        crawl_depth: 1
+        note: lakyara月刊 + Asset Management年报 + Special Reports；目录页需 Jina+LLM 分类
 
   - name: 後藤達也 (Tatsuya Goto)
     institution: 前日本经济新闻资深记者 / 独立金融评论员
@@ -489,7 +516,8 @@ authors:
     sources:
       - platform: RSS（note.com，每日市场分析，日文）
         url: https://note.com/goto_finance/rss
-        accessible: true
+        accessible: false
+        note: 文章为付费全文，免费部分无法获取完整内容
 
   # ── 新补充：中国政策圈 ────────────────────────────────────────────────────
 
@@ -568,7 +596,18 @@ channels:
     platform: generic
     url: https://group30.org/publications
     accessible: true
-    note: 无 RSS；通过 publications 列表页抓取最新报告链接
+    crawl_depth: 1
+    note: 无 RSS；generic fetch提取表格标题而非报告链接；需 Jina+LLM 分类
+
+  # ── 金融机构 Podcast RSS ──────────────────────────────────────────────────
+
+  - name: Goldman Sachs Talks at GS
+    institution: 高盛
+    tier: 2
+    platform: YouTube
+    url: https://www.youtube.com/playlist?list=PLIyiGQywEp64t14dcTeMLe0mX5KoWHOFX
+    accessible: true
+    note: talks-at-gs页面JS渲染不可爬；改用YouTube Talks at GS专属播放列表
 
   # ── 美国智库与学术机构 ───────────────────────────────────────────────────
 
@@ -583,10 +622,11 @@ channels:
   - name: Brookings Institution (Economics)
     institution: 布鲁金斯学会
     tier: 1
-    platform: RSS
-    url: https://www.brookings.edu/feed/
+    platform: web
+    url: https://www.brookings.edu/centers/the-hutchins-center-on-fiscal-and-monetary-policy/
     accessible: true
-    note: RSS 链接会跳转首页；改为列表页抓取（HTML fallback）
+    crawl_depth: 1
+    note: RSS跳转首页、topic页JS渲染均不可用；改为Hutchins Center静态页（每次约5条最新文章）
 
   - name: NBER Working Papers
     institution: 美国国家经济研究局
@@ -645,14 +685,15 @@ channels:
     institution: 中国金融四十人论坛 (周小川、易纲等前官员主导)
     tier: 1
     platform: generic
-    url: https://www.cf40.org.cn/
+    url: https://www.cf40.org.cn/achievement?page=1&cid=9999
     accessible: true
-    note: 无 RSS；通过站点列表页抓取文章链接
+    crawl_depth: 1
+    note: 成果列表页，crawl_depth=1 自动提取文章链接
 
   - name: 上海金融与发展实验室 (NIFD)
     institution: 陆家嘴金融研究院
     tier: 2
     platform: generic
-    url: http://www.nifd.cn/
-    accessible: false
-    note: 无 RSS，报告需人工下载
+    url: http://www.nifd.cn/Research
+    accessible: true
+    note: 通过 SeriesReportList API 直接解析文章列表

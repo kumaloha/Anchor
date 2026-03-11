@@ -167,6 +167,13 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
     except Exception:
         pass
 
+    # YouTube 重定向优先（视频包装页 / 注册墙包装页）
+    yt_redirect = _meta.get("youtube_redirect")
+    if yt_redirect:
+        print(f"  检测到 YouTube 嵌入，改抓: {yt_redirect}")
+        await main(yt_redirect)
+        return
+
     _duration_s = _meta.get("duration_s") or 0
     if _duration_s and _duration_s < 180:
         print(f"  跳过：视频过短（{_duration_s}s < 180s）")
@@ -186,7 +193,12 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
     async with AsyncSessionLocal() as s:
         pre = await run_chain2(raw_post_id, s)
     ct = pre.get("content_type", "")
-    content_mode = "policy" if ct == "政策解读" else "standard"
+    if ct == "政策解读":
+        content_mode = "policy"
+    elif ct in ("产业链研究", "财经分析"):
+        content_mode = "industry"
+    else:
+        content_mode = "standard"
     subtype_str = f"  subtype={pre.get('content_subtype')!r}" if pre.get("content_subtype") else ""
     print(f"      content_type={ct!r}{subtype_str}  intent={pre.get('author_intent')!r}")
     print(f"      mode={content_mode}")
@@ -208,8 +220,9 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
         c = len(result3.conclusions) if result3.conclusions else 0
         p = len(result3.predictions) if result3.predictions else 0
         s_ = len(result3.solutions) if result3.solutions else 0
+        t = len(result3.theories) if result3.theories else 0
         r = len(result3.relationships) if result3.relationships else 0
-        print(f"      {f}F  {a}A  {i}I  {c}C  {p}P  {s_}S  {r} edges")
+        print(f"      {f}F  {a}A  {i}I  {c}C  {p}P  {s_}S  {t}T  {r} edges")
         if result3.article_summary:
             print(f"      摘要: {result3.article_summary}")
         if not result3.is_relevant_content:
@@ -223,10 +236,11 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
         from anchor.notion_sync import sync_post_to_notion
         async with AsyncSessionLocal() as s:
             notion_url = await sync_post_to_notion(raw_post_id, s)
+            await s.commit()
         if notion_url:
             print(f"      {notion_url}")
         else:
-            print(f"      跳过（content_type 未映射）")
+            print(f"      跳过（content_type 未映射，或 Notion API 错误）")
     except Exception as e:
         import traceback
         print(f"      ERROR: {e}")
@@ -234,6 +248,49 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
 
 
 # ── URL 入口 ──────────────────────────────────────────────────────────────────
+
+async def _refetch_and_update(raw_post_id: int, url: str) -> None:
+    """重新抓取 URL 内容，更新 RawPost 并清除旧实体数据。"""
+    from anchor.database.session import AsyncSessionLocal
+    from anchor.collect.input_handler import parse_url, _get_fetcher
+    from anchor.models import (
+        Assumption, Conclusion, EntityRelationship, Fact,
+        ImplicitCondition, Prediction, RawPost, Solution, Theory,
+        PostQualityAssessment,
+    )
+    from sqlmodel import select, delete
+
+    parsed = parse_url(url)
+    fetcher = _get_fetcher(parsed.platform)
+    if hasattr(fetcher, "set_url"):
+        fetcher.set_url(parsed.canonical_url)
+    raw_posts_data = await fetcher.fetch_post(parsed.platform_id)
+    if not raw_posts_data:
+        print("  WARNING: 重新抓取失败，使用已有内容")
+        return
+
+    new_data = raw_posts_data[0]
+    async with AsyncSessionLocal() as s:
+        rp = (await s.exec(select(RawPost).where(RawPost.id == raw_post_id))).first()
+
+        # 更新 RawPost 字段
+        rp.content = new_data.content
+        rp.posted_at = new_data.posted_at
+        rp.author_name = new_data.author_name
+        rp.raw_metadata = _json.dumps(new_data.metadata, ensure_ascii=False) if new_data.metadata else rp.raw_metadata
+        rp.media_json = _json.dumps(new_data.media_items, ensure_ascii=False) if new_data.media_items else None
+        rp.collected_at = datetime.utcnow()
+        s.add(rp)
+
+        # 清除旧实体
+        for model in (Fact, Assumption, ImplicitCondition, Conclusion,
+                      Prediction, Solution, Theory, EntityRelationship,
+                      PostQualityAssessment):
+            await s.exec(delete(model).where(model.raw_post_id == raw_post_id))
+
+        await s.commit()
+        print(f"  已更新内容 + 清除旧实体  posted_at={rp.posted_at}")
+
 
 async def main(url: str) -> None:
     from anchor.database.session import AsyncSessionLocal
@@ -246,6 +303,12 @@ async def main(url: str) -> None:
         print("  ERROR: 采集失败")
         sys.exit(1)
     rp = result.raw_posts[0]
+
+    # 已有记录 → 重新抓取内容并清除旧实体
+    if not result.is_new_source:
+        print(f"  已有记录 (id={rp.id})，重新抓取并覆盖")
+        await _refetch_and_update(rp.id, url)
+
     await _run_pipeline(rp.id, url)
 
 

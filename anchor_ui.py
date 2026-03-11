@@ -35,6 +35,7 @@ from anchor.models import (
     Prediction,
     RawPost,
     Solution,
+    Theory,
 )
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -310,6 +311,18 @@ async def api_post_detail(post_id: int):
                     "action_target": s.action_target or "",
                 }
                 for s in sols
+            ]
+
+            theos = list((await s.exec(
+                select(Theory).where(Theory.raw_post_id == post_id)
+            )).all())
+            result["theories"] = [
+                {
+                    "id": t.id,
+                    "summary": t.summary or "",
+                    "claim": t.claim or "",
+                }
+                for t in theos
             ]
 
             edges = list((await s.exec(
@@ -1263,6 +1276,7 @@ function renderStandard(data) {
   const conclusions = data.conclusions || [];
   const predictions = data.predictions || [];
   const solutions = data.solutions || [];
+  const theories = data.theories || [];
 
   let h = '';
 
@@ -1297,7 +1311,7 @@ function renderStandard(data) {
 
   const hasGraph = conclusions.length && data.edges && data.edges.length;
   if (hasGraph) {
-    const total = facts.length + assumptions.length + implicits.length + conclusions.length + predictions.length;
+    const total = facts.length + assumptions.length + implicits.length + conclusions.length + predictions.length + theories.length;
     h += `<div class="sec">
       <div class="sec-title">论证图谱 <span class="cnt">${total} 节点 · ${data.edges.length} 边</span></div>
       <div id="dag-wrap"></div>
@@ -1319,6 +1333,10 @@ function renderStandard(data) {
   if (conclusions.length) {
     h += `<div class="sec"><div class="sec-title">结论 <span class="cnt">${conclusions.length}</span></div>
       <div class="eg">${conclusions.map(c => renderConcCard(c)).join('')}</div></div>`;
+  }
+  if (theories.length) {
+    h += `<div class="sec"><div class="sec-title">理论框架 <span class="cnt">${theories.length}</span></div>
+      <div class="eg">${theories.map(t => renderTheoryCard(t)).join('')}</div></div>`;
   }
   if (predictions.length) {
     h += `<div class="sec"><div class="sec-title">预测 <span class="cnt">${predictions.length}</span></div>
@@ -1352,6 +1370,7 @@ function renderDAG(data) {
   const implicits = data.implicit_conditions || [];
   const conclusions = data.conclusions || [];
   const predictions = data.predictions || [];
+  const theories_dag = data.theories || [];
   const edges_raw = data.edges || [];
 
   const fvC={credible:'#3fb950',vague:'#d29922',unreliable:'#f85149',unavailable:'#4a5568'};
@@ -1389,6 +1408,11 @@ function renderDAG(data) {
     id:`prediction-${p.id}`, label:crop(p.summary||p.claim,28),
     shape:'box', color:{background:pvC[p.prediction_verdict]||'#58a6ff',border:'#30363d'},
     font:{color:'#0d1117',size:11}, title:`Prediction ${p.id} · ${p.prediction_verdict||'待验证'}`
+  }));
+  theories_dag.forEach(t => nodes.push({
+    id:`theory-${t.id}`, label:crop(t.summary||t.claim,28),
+    shape:'hexagon', color:{background:'#e3b341',border:'#30363d'},
+    font:{color:'#0d1117',size:11}, title:`Theory ${t.id}`
   }));
 
   edges_raw.forEach((e, i) => {
@@ -1476,6 +1500,15 @@ function renderSolCard(s) {
     <div class="ec-id">${s.action_type||''}${s.action_target?' · '+esc(s.action_target):''} id=${s.id}</div>` : '';
   return `<div class="ec" style="border-left:3px solid var(--green)">
     <div class="ec-summary">${esc(txt)}</div>${debug}</div>`;
+}
+function renderTheoryCard(t) {
+  const txt = t.summary || t.claim || '';
+  const debug = debugMode ? `
+    <div class="ec-claim">${esc(t.claim)}</div>
+    <div class="ec-id">id=${t.id}</div>` : '';
+  return `<div class="ec" style="border-left:3px solid var(--orange)">
+    <div class="ec-summary">${esc(txt)}</div>
+    <div class="ec-footer"><span class="bd bd-orange">理论框架</span></div>${debug}</div>`;
 }
 
 // ── Verdict badges ─────────────────────────────────────────────────────────────

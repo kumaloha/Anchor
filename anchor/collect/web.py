@@ -34,7 +34,17 @@ class WebCollector(BaseCollector):
         text = await _fetch_jina(url)
         if not text:
             return None
-        return _parse_article(text, url)
+        post = _parse_article(text, url)
+        # Jina 未检测到 YouTube embed → 回退抓原始 HTML 提取 YouTube ID
+        # 无条件尝试：Jina 返回的导航文本长度不稳定，is_video_only 判断不可靠
+        meta = post.metadata or {}
+        if not meta.get("youtube_redirect"):
+            yt_id = await _extract_youtube_id_from_raw_html(url)
+            if yt_id:
+                meta["youtube_redirect"] = f"https://www.youtube.com/watch?v={yt_id}"
+                post.metadata = meta
+                logger.info(f"[WebCollector] YouTube ID found from raw HTML: {yt_id} for {url}")
+        return post
 
     async def collect(self, **kwargs) -> list[RawPostData]:
         if url := kwargs.get("url"):
@@ -84,15 +94,23 @@ def _parse_article(text: str, url: str) -> RawPostData:
         title = m.group(1).strip()
 
     # ── 发布时间 ──────────────────────────────────────────────────────────
-    posted_at = datetime.utcnow()
+    now = datetime.utcnow()
+    posted_at = now
     for pattern in [
         r"Published Time:\s*(.+)",
         r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})",
         r"(\d{4}年\d{1,2}月\d{1,2}日\s*\d{2}:\d{2})",
+        r"((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4})",
     ]:
         if m := re.search(pattern, text):
             posted_at = _parse_time(m.group(1).strip())
             break
+
+    # 兜底：若日期未成功提取（仍为当前时间），尝试从 URL 路径提取年份
+    if abs((posted_at - now).total_seconds()) < 60:
+        url_year = _extract_year_from_url(url)
+        if url_year:
+            posted_at = datetime(url_year, 1, 1)
 
     # ── 作者/来源 ─────────────────────────────────────────────────────────
     author_name = _extract_author(text, url)
@@ -352,6 +370,21 @@ def _clean_content(raw: str, title: str) -> str:
     return text
 
 
+def _extract_year_from_url(url: str) -> int | None:
+    """从 URL 路径中提取四位年份（1900-2099），用于归档类页面兜底。
+
+    例如：/letters/1980.html → 1980, /report/2024/overview → 2024
+    仅匹配合理年份范围，避免把端口号、ID 等误判为年份。
+    """
+    path = urlparse(url).path
+    m = re.search(r"(?:^|/)(\d{4})(?:[/.]|$)", path)
+    if m:
+        year = int(m.group(1))
+        if 1900 <= year <= 2099:
+            return year
+    return None
+
+
 def _parse_time(raw: str) -> datetime:
     if not raw:
         return datetime.utcnow()
@@ -369,8 +402,42 @@ def _parse_time(raw: str) -> datetime:
             return datetime.strptime(raw[:19], fmt)
         except Exception:
             pass
+    # "February 26, 1982" / "March 5, 2025"
+    for fmt in ["%B %d, %Y", "%b %d, %Y"]:
+        try:
+            return datetime.strptime(raw.strip(), fmt)
+        except Exception:
+            pass
     try:
         from email.utils import parsedate_to_datetime
         return parsedate_to_datetime(raw).replace(tzinfo=None)
     except Exception:
         return datetime.utcnow()
+
+
+# 从原始 HTML 提取 YouTube 视频 ID 的正则（支持 data-video-id 和 embed URL）
+_RAW_HTML_YT_RE = re.compile(
+    r'data-video-id=["\']([A-Za-z0-9_-]{11})["\']'
+    r'|youtube\.com/embed/([A-Za-z0-9_-]{11})'
+)
+
+
+async def _extract_youtube_id_from_raw_html(url: str) -> str | None:
+    """直接抓取原始 HTML，从 data-video-id 或 embed URL 中提取 YouTube 视频 ID。"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "-L",
+            "-A", "Mozilla/5.0",
+            "--max-time", "15",
+            url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        html = stdout.decode("utf-8", errors="replace")
+        m = _RAW_HTML_YT_RE.search(html)
+        if m:
+            return m.group(1) or m.group(2)
+    except Exception as exc:
+        logger.debug(f"[WebCollector] raw HTML YouTube extraction failed: {exc}")
+    return None

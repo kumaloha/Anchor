@@ -25,6 +25,35 @@ _WHISPER_MAX_BYTES = 24 * 1024 * 1024   # 24 MB
 
 _BV_RE = re.compile(r"BV[\w]+")
 
+# ── yt-dlp cookie 文件（从 BILIBILI_COOKIE 环境变量生成）──────────────────────
+
+_BILI_COOKIE_FILE: str | None = None
+
+
+def _get_bili_cookie_args() -> list[str]:
+    """返回 yt-dlp 的 cookie 参数（--cookies <file>），无 cookie 时返回空列表。"""
+    global _BILI_COOKIE_FILE
+
+    cookie_str = os.environ.get("BILIBILI_COOKIE", "")
+    if not cookie_str:
+        return []
+
+    if _BILI_COOKIE_FILE is None or not os.path.exists(_BILI_COOKIE_FILE):
+        import tempfile
+        fd, path = tempfile.mkstemp(prefix="bili_cookies_", suffix=".txt")
+        with os.fdopen(fd, "w") as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            for part in cookie_str.split(";"):
+                part = part.strip()
+                if "=" not in part:
+                    continue
+                key, _, val = part.partition("=")
+                f.write(f".bilibili.com\tTRUE\t/\tFALSE\t0\t{key.strip()}\t{val.strip()}\n")
+        _BILI_COOKIE_FILE = path
+        logger.info(f"[Bilibili] Wrote Netscape cookie file from BILIBILI_COOKIE env")
+
+    return ["--cookies", _BILI_COOKIE_FILE]
+
 
 class BilibiliCollector(BaseCollector):
     """Bilibili 视频采集器（yt-dlp + Whisper）。"""
@@ -109,6 +138,7 @@ async def _fetch_metadata(bv_id: str, video_url: str) -> tuple[str | None, str |
         proc = await asyncio.create_subprocess_exec(
             "yt-dlp", "--dump-json", "--no-playlist",
             "--socket-timeout", "20",
+            *_get_bili_cookie_args(),
             video_url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -177,6 +207,7 @@ async def _download_audio(bv_id: str, video_url: str, output_dir: str) -> str | 
             "-f", "bestaudio",
             "--no-playlist",
             "--socket-timeout", "30",
+            *_get_bili_cookie_args(),
             "-o", raw_path,
             "--quiet",
             video_url,
@@ -191,7 +222,7 @@ async def _download_audio(bv_id: str, video_url: str, output_dir: str) -> str | 
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
         if proc.returncode != 0:
-            logger.warning(f"[Bilibili] yt-dlp 下载失败: {stderr.decode()[:200]}")
+            logger.warning(f"[Bilibili] yt-dlp 下载失败 (rc={proc.returncode}): {stderr.decode()[:600]}")
             return None
     except Exception as exc:
         logger.warning(f"[Bilibili] yt-dlp 异常: {exc}")

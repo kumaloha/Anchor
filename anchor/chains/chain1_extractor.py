@@ -37,6 +37,7 @@ from anchor.models import (
 )
 
 _POLICY_TYPES = {"政策宣布", "政策解读"}
+_INDUSTRY_TYPES = {"产业链研究", "财经分析"}
 
 
 async def run_chain1(url: str, session: AsyncSession) -> dict:
@@ -98,9 +99,14 @@ async def run_chain1(url: str, session: AsyncSession) -> dict:
     # ── Step 3：内容路由 ───────────────────────────────────────────────────
     # 市场分析类 → standard（六实体流水线）
     # 政策宣布/解读 → policy（PolicyTheme + PolicyItem，change_type 由 compare_policies 单独填写）
-    content_mode = "policy" if content_type in _POLICY_TYPES else "standard"
-    if content_mode == "policy":
-        logger.info(f"[Chain1] Policy mode ({content_type})")
+    if content_type in _POLICY_TYPES:
+        content_mode = "policy"
+    elif content_type in _INDUSTRY_TYPES:
+        content_mode = "industry"
+    else:
+        content_mode = "standard"
+    if content_mode != "standard":
+        logger.info(f"[Chain1] {content_mode.capitalize()} mode ({content_type})")
 
     # ── Step 4：六实体提取 ────────────────────────────────────────────────
     extractor = Extractor()

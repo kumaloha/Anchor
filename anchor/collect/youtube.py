@@ -141,7 +141,7 @@ class YouTubeCollector(BaseCollector):
         video_url = f"https://www.youtube.com/watch?v={video_id}"
 
         # ── 元数据 ────────────────────────────────────────────────────
-        title, author_name, channel_id, duration_s = await self._fetch_metadata(
+        title, author_name, channel_id, duration_s, publish_date = await self._fetch_metadata(
             video_id, client
         )
         title        = title or video_id
@@ -177,6 +177,13 @@ class YouTubeCollector(BaseCollector):
             content = f"# {title}\n\n（无法获取视频内容）"
             method = "title_only"
 
+        # 发布时间：pytubefix publish_date → 回落到当前时间
+        if publish_date:
+            # publish_date 可能带时区也可能不带，统一为 naive UTC
+            posted_at = publish_date.replace(tzinfo=None) if publish_date.tzinfo else publish_date
+        else:
+            posted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
         return RawPostData(
             source="youtube",
             external_id=video_id,
@@ -184,12 +191,13 @@ class YouTubeCollector(BaseCollector):
             author_name=author_name,
             author_id=channel_id,
             url=video_url,
-            posted_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            posted_at=posted_at,
             metadata={
                 "title":             title,
                 "channel_name":      channel_name,
                 "channel_id":        channel_id,
                 "duration_s":        duration_s,
+                "upload_date":       publish_date.strftime("%Y-%m-%d") if publish_date else None,
                 "transcript_method": method,
                 "transcript_chars":  len(transcript) if transcript else 0,
             },
@@ -286,8 +294,8 @@ class YouTubeCollector(BaseCollector):
 
     async def _fetch_metadata(
         self, video_id: str, client: httpx.AsyncClient
-    ) -> tuple[str | None, str | None, str | None, int | None]:
-        """返回 (title, author_name, channel_id, duration_s)。"""
+    ) -> tuple[str | None, str | None, str | None, int | None, datetime | None]:
+        """返回 (title, author_name, channel_id, duration_s, publish_date)。"""
         # 先试 pytubefix（最准确，复用内部 API）
         try:
             import asyncio
@@ -295,11 +303,11 @@ class YouTubeCollector(BaseCollector):
 
             def _get_info():
                 yt = YouTube(f"https://www.youtube.com/watch?v={video_id}")
-                return yt.title, yt.author, yt.channel_id, yt.length
+                return yt.title, yt.author, yt.channel_id, yt.length, yt.publish_date
 
             loop = asyncio.get_event_loop()
-            title, author, channel_id, length = await loop.run_in_executor(None, _get_info)
-            return title, author, channel_id, length
+            title, author, channel_id, length, publish_date = await loop.run_in_executor(None, _get_info)
+            return title, author, channel_id, length, publish_date
         except Exception:
             pass
 
@@ -314,18 +322,26 @@ class YouTubeCollector(BaseCollector):
             author_m = re.search(r'"author"\s*:\s*"([^"]+)"', html)
             cid_m    = re.search(r'"channelId"\s*:\s*"([^"]+)"', html)
             dur_m    = re.search(r'"lengthSeconds"\s*:\s*"(\d+)"', html)
+            date_m   = re.search(r'"publishDate"\s*:\s*"(\d{4}-\d{2}-\d{2})"', html)
             title = title_m.group(1) if title_m else None
             if title:
                 title = title.replace("&amp;", "&").replace("&quot;", '"')
+            publish_date = None
+            if date_m:
+                try:
+                    publish_date = datetime.strptime(date_m.group(1), "%Y-%m-%d")
+                except ValueError:
+                    pass
             return (
                 title,
                 author_m.group(1) if author_m else None,
                 cid_m.group(1) if cid_m else video_id,
                 int(dur_m.group(1)) if dur_m else None,
+                publish_date,
             )
         except Exception as exc:
             logger.warning(f"[YouTube] 元数据获取失败: {exc}")
-            return None, None, video_id, None
+            return None, None, video_id, None, None
 
 
 # ---------------------------------------------------------------------------

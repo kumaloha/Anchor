@@ -34,6 +34,78 @@ from anchor.models import Author, AuthorStanceProfile, RawPost, _utcnow
 from anchor.verify.author_profiler import AuthorProfiler
 
 _STANCE_MAX_TOKENS = 1200
+
+
+# ---------------------------------------------------------------------------
+# watchlist 机构 → tier 映射（缓存）
+# ---------------------------------------------------------------------------
+
+_INSTITUTION_TIER_CACHE: dict[str, int] | None = None
+
+
+def _load_institution_tier_map() -> dict[str, int]:
+    """从 watchlist.yaml 构建 机构关键词 → tier 映射。
+
+    当作者名匹配某机构时，使用 watchlist 中该机构对应的 tier。
+    例如 institution="美联储 (Federal Reserve)" → 提取 "美联储"、"Federal Reserve"
+    """
+    global _INSTITUTION_TIER_CACHE
+    if _INSTITUTION_TIER_CACHE is not None:
+        return _INSTITUTION_TIER_CACHE
+
+    import yaml
+    from pathlib import Path
+
+    mapping: dict[str, int] = {}
+    wl_path = Path(__file__).parent.parent.parent / "watchlist.yaml"
+    if not wl_path.exists():
+        _INSTITUTION_TIER_CACHE = mapping
+        return mapping
+
+    try:
+        with open(wl_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        _INSTITUTION_TIER_CACHE = mapping
+        return mapping
+
+    _title_re = re.compile(
+        r"\s*(CEO|COO|CIO|主席|行长|总裁|创始人|联合创始人|院长|教授|所长|"
+        r"首席|董事长|总经理|官员|高级研究员|资深记者|评论员).*$"
+    )
+    _junk_re = re.compile(
+        r'^前|^已退休|^独立|诺贝尔|^AUM|^\d{4}\s|^[「\u201c"]'
+    )
+
+    for author in data.get("authors", []):
+        inst = author.get("institution", "")
+        tier = author.get("tier")
+        if not inst or not isinstance(tier, int):
+            continue
+        # 提取括号内外的关键词，也按逗号、顿号拆分
+        # "日本银行 (Bank of Japan, BOJ) 总裁" → ["日本银行", "Bank of Japan", "BOJ"]
+        parts = re.split(r"[()（）/,、]", inst)
+        for part in parts:
+            kw = _title_re.sub("", part.strip()).strip()
+            if len(kw) < 2 or _junk_re.search(kw):
+                continue
+            if kw not in mapping or tier < mapping[kw]:
+                mapping[kw] = tier
+
+    _INSTITUTION_TIER_CACHE = mapping
+    return mapping
+
+
+def _lookup_institution_tier(author_name: str) -> int | None:
+    """若作者名匹配 watchlist 中某机构，返回该机构的 tier，否则 None。"""
+    if not author_name:
+        return None
+    mapping = _load_institution_tier_map()
+    name_lower = author_name.lower()
+    for inst_kw, tier in mapping.items():
+        if inst_kw.lower() in name_lower or name_lower in inst_kw.lower():
+            return tier
+    return None
 _POST_ANALYSIS_MAX_TOKENS = 800
 _MAX_POSTS_FOR_STANCE = 10
 _MAX_POST_CHARS = 400
@@ -111,7 +183,11 @@ _STANCE_USER_TEMPLATE = """\
 # ---------------------------------------------------------------------------
 
 
-async def classify_post(post: RawPost, session: AsyncSession) -> dict:
+async def classify_post(
+    post: RawPost,
+    session: AsyncSession,
+    author_hint: str | None = None,
+) -> dict:
     """Chain 2 前两步：作者档案 + 内容分类，供 Chain 1 前置调用。
 
     不含立场分析（Step 3），不依赖 content_summary。
@@ -119,11 +195,19 @@ async def classify_post(post: RawPost, session: AsyncSession) -> dict:
     """
     author = await _get_or_create_author(post, session)
     await AuthorProfiler().profile(author, session)
+    # 机构作者 tier 覆盖：watchlist 机构 tier 优先于 LLM 判定
+    inst_tier = _lookup_institution_tier(author.name)
+    if inst_tier is not None and author.credibility_tier != inst_tier:
+        logger.info(
+            f"[Chain2] Institution tier override: {author.name!r} "
+            f"tier {author.credibility_tier} → {inst_tier}"
+        )
+        author.credibility_tier = inst_tier
     await session.flush()
     await session.refresh(author)
 
     if not post.chain2_analyzed:
-        post_analysis = await _analyze_post(post, author)
+        post_analysis = await _analyze_post(post, author, author_hint=author_hint)
         if post_analysis:
             ct = post_analysis.get("content_type")
             ct2 = post_analysis.get("content_type_secondary")
@@ -140,19 +224,13 @@ async def classify_post(post: RawPost, session: AsyncSession) -> dict:
             # 财经分析子分类
             subtype = _safe_str(post_analysis.get("content_subtype"))
             post.content_subtype = subtype if subtype in _VALID_SUBTYPES else None
-            # 实际发言人（个人品牌账号）
+            # ── 作者归因（三级优先：内容/标题 > watchlist hint > 上传者）──
             real_name = _safe_str(post_analysis.get("real_author_name"))
+            if not real_name and author_hint:
+                real_name = author_hint
+                logger.info(f"[Chain2] Using watchlist author hint: {author_hint!r}")
             if real_name and real_name != author.name:
-                logger.info(f"[Chain2] Real author identified: {author.name!r} → {real_name!r}")
-                author.name = real_name
-                post.author_name = real_name
-                # 名字变了，重置档案状态，让 AuthorProfiler 重新搜索真实作者
-                author.profile_fetched = False
-                author.credibility_tier = None
-                author.role = None
-                author.expertise_areas = None
-                author.profile_note = None
-                session.add(author)
+                author = await _reassign_author(post, author, real_name, session)
             # 发文机关（仅政策解读类内容）
             if ct == "政策解读":
                 ia = _safe_str(post_analysis.get("issuing_authority"))
@@ -189,12 +267,17 @@ async def classify_post(post: RawPost, session: AsyncSession) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def run_chain2(post_id: int, session: AsyncSession) -> dict:
+async def run_chain2(
+    post_id: int,
+    session: AsyncSession,
+    author_hint: str | None = None,
+) -> dict:
     """执行链路2：内容分类 + 作者档案 + 立场分析
 
     Args:
-        post_id:  raw_posts 表主键
-        session:  异步数据库 Session
+        post_id:      raw_posts 表主键
+        session:      异步数据库 Session
+        author_hint:  来自 watchlist 的真实作者姓名（可选，作为兜底参考）
 
     Returns:
         dict with keys:
@@ -215,13 +298,21 @@ async def run_chain2(post_id: int, session: AsyncSession) -> dict:
 
     # ── Step 1：作者档案分析 ──────────────────────────────────────────────
     await AuthorProfiler().profile(author, session)
+    # 机构作者 tier 覆盖：watchlist 机构 tier 优先于 LLM 判定
+    inst_tier = _lookup_institution_tier(author.name)
+    if inst_tier is not None and author.credibility_tier != inst_tier:
+        logger.info(
+            f"[Chain2] Institution tier override: {author.name!r} "
+            f"tier {author.credibility_tier} → {inst_tier}"
+        )
+        author.credibility_tier = inst_tier
     await session.flush()
     await session.refresh(author)
 
     # ── Step 2：内容分类 + 作者意图（per-post）────────────────────────────
     post_analysis: dict | None = None
     if not post.chain2_analyzed:
-        post_analysis = await _analyze_post(post, author)
+        post_analysis = await _analyze_post(post, author, author_hint=author_hint)
         if post_analysis:
             ct = post_analysis.get("content_type")
             ct2 = post_analysis.get("content_type_secondary")
@@ -239,18 +330,14 @@ async def run_chain2(post_id: int, session: AsyncSession) -> dict:
             # 财经分析子分类
             subtype = _safe_str(post_analysis.get("content_subtype"))
             post.content_subtype = subtype if subtype in _VALID_SUBTYPES else None
-            # 实际发言人（个人品牌账号）
+            # ── 作者归因（三级优先：内容/标题 > watchlist hint > 上传者）──
             real_name = _safe_str(post_analysis.get("real_author_name"))
+            if not real_name and author_hint:
+                # LLM 未检测到实际发言人，使用 watchlist 提供的作者名
+                real_name = author_hint
+                logger.info(f"[Chain2] Using watchlist author hint: {author_hint!r}")
             if real_name and real_name != author.name:
-                logger.info(f"[Chain2] Real author identified: {author.name!r} → {real_name!r}")
-                author.name = real_name
-                post.author_name = real_name
-                author.profile_fetched = False
-                author.credibility_tier = None
-                author.role = None
-                author.expertise_areas = None
-                author.profile_note = None
-                session.add(author)
+                author = await _reassign_author(post, author, real_name, session)
             # 发文机关（仅政策解读类内容）
             if ct == "政策解读":
                 ia = _safe_str(post_analysis.get("issuing_authority"))
@@ -303,7 +390,9 @@ async def run_chain2(post_id: int, session: AsyncSession) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def _analyze_post(post: RawPost, author: Author) -> dict | None:
+async def _analyze_post(
+    post: RawPost, author: Author, author_hint: str | None = None,
+) -> dict | None:
     """Step 2：内容分类 + 作者意图分析（per-post）。"""
     from anchor.chains.prompts.post_analysis import SYSTEM, build_user_message
 
@@ -315,6 +404,7 @@ async def _analyze_post(post: RawPost, author: Author) -> dict | None:
         author_expertise=author.expertise_areas,
         content_summary=post.content_summary,
         situation_note=author.situation_note,
+        author_hint=author_hint,
     )
     resp = await chat_completion(system=SYSTEM, user=user_msg, max_tokens=_POST_ANALYSIS_MAX_TOKENS)
     if resp is None:
@@ -362,6 +452,48 @@ async def _get_or_create_author(post: RawPost, session: AsyncSession) -> Author:
         await session.flush()
         await session.refresh(author)
     return author
+
+
+async def _reassign_author(
+    post: RawPost,
+    old_author: Author,
+    real_name: str,
+    session: AsyncSession,
+) -> Author:
+    """将帖子从共享 Author 重新指向真实作者的独立 Author 记录。
+
+    不修改原 Author（可能被其他帖子共享），而是查找或创建一个
+    platform_id=real_name 的新 Author 记录，并更新帖子的关联。
+    """
+    logger.info(f"[Chain2] Real author identified: {old_author.name!r} → {real_name!r}")
+
+    # 查找是否已有该真实作者的 Author 记录
+    result = await session.exec(
+        select(Author)
+        .where(Author.platform == post.source)
+        .where(Author.platform_id == real_name)
+    )
+    new_author = result.first()
+
+    if new_author is None:
+        new_author = Author(
+            name=real_name,
+            platform=post.source,
+            platform_id=real_name,
+        )
+        session.add(new_author)
+        await session.flush()
+        await session.refresh(new_author)
+        logger.info(f"[Chain2] Created new Author id={new_author.id} for {real_name!r}")
+    else:
+        logger.info(f"[Chain2] Found existing Author id={new_author.id} for {real_name!r}")
+
+    # 更新帖子指向新作者
+    post.author_name = real_name
+    post.author_platform_id = real_name
+    session.add(post)
+
+    return new_author
 
 
 async def _upsert_stance_profile(

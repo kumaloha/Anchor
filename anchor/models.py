@@ -1,13 +1,14 @@
 """
-Anchor 核心数据模型（v4 — 六实体 + 显式关系边表）
+Anchor 核心数据模型（v5 — 七实体 + 显式关系边表）
 =================================================
-六实体：
+七实体：
   Fact（事实依据）       — fact_verdict: credible|vague|unreliable|unavailable
   Assumption（假设条件） — assumption_verdict: high_probability|medium_probability|low_probability|unavailable
   ImplicitCondition     — implicit_verdict: consensus|contested|false
   Conclusion（结论）     — conclusion_verdict: confirmed|refuted|partial|unverifiable|pending
   Prediction（预测）     — prediction_verdict: pending|accurate|directional|off_target|wrong
   Solution（解决方案）   — 不验证
+  Theory（理论框架）     — 不验证
 
 边表：
   EntityRelationship（relationships）— 显式关系边，取代 Logic 的 JSON 数组
@@ -41,6 +42,24 @@ class EdgeType(str, Enum):
     CONCLUSION_LEADS_TO_PREDICTION = "conclusion_leads_to_prediction"
     CONCLUSION_ENABLES_SOLUTION = "conclusion_enables_solution"
     POLICY_SUPPORTS_CONCLUSION = "policy_supports_conclusion"
+    FACT_SUPPORTS_THEORY = "fact_supports_theory"
+    CONCLUSION_SUPPORTS_THEORY = "conclusion_supports_theory"
+    THEORY_SUPPORTS_THEORY = "theory_supports_theory"
+    THEORY_SUPPORTS_CONCLUSION = "theory_supports_conclusion"
+    THEORY_LEADS_TO_PREDICTION = "theory_leads_to_prediction"
+    THEORY_ENABLES_SOLUTION = "theory_enables_solution"
+    # 产业链研究扩展
+    PLAYER_DOMINATES_NODE = "player_dominates_node"
+    PLAYER_ENTERS_NODE = "player_enters_node"
+    ISSUE_CASCADES_ISSUE = "issue_cascades_issue"
+    ISSUE_BLOCKS_NODE = "issue_blocks_node"
+    ISSUE_CONSTRAINS_PLAYER = "issue_constrains_player"
+    TECHROUTE_MITIGATES_ISSUE = "techroute_mitigates_issue"
+    TECHROUTE_COMPETES_TECHROUTE = "techroute_competes_techroute"
+    METRIC_EVIDENCES_ISSUE = "metric_evidences_issue"
+    FACT_SUPPORTS_ISSUE = "fact_supports_issue"
+    CONCLUSION_ABOUT_PLAYER = "conclusion_about_player"
+    CONCLUSION_ABOUT_NODE = "conclusion_about_node"
 
 
 class SourceType(str, Enum):
@@ -338,6 +357,25 @@ class Solution(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class Theory(SQLModel, table=True):
+    """理论框架 — 作者建立的模型/理论/原则（不验证）
+
+    Theory 是作者用来推演预测和行动建议的理论框架，
+    它由 Fact/Conclusion 支撑，向下推出 Prediction/Solution。
+    """
+
+    __tablename__ = "theories"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id", index=True)
+    author_id: Optional[int] = Field(default=None, foreign_key="authors.id", index=True)
+
+    summary: Optional[str] = None                # 一句话摘要（≤15字）
+    claim: str                                   # 理论框架陈述（≤120字）
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 # ===========================================================================
 # 政策专属表（policy 模式，仅在 content_mode="policy" 时写入）
 # ===========================================================================
@@ -426,15 +464,139 @@ class PolicyMeasure(SQLModel, table=True):
 
 
 # ===========================================================================
+# 产业链研究表（industry 模式，仅在 content_mode="industry" 时写入）
+# ===========================================================================
+
+
+class CanonicalPlayer(SQLModel, table=True):
+    """产业玩家（跨文章归一化）"""
+
+    __tablename__ = "canonical_players"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    canonical_name: str = Field(unique=True, index=True)
+    entity_type: Optional[str] = None       # company|government|research_institute|alliance|startup
+    headquarters: Optional[str] = None
+    description: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class PlayerAlias(SQLModel, table=True):
+    """玩家别名（用于归一化匹配）"""
+
+    __tablename__ = "player_aliases"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    canonical_player_id: int = Field(foreign_key="canonical_players.id", index=True)
+    alias: str = Field(index=True)
+    language: Optional[str] = None           # zh|en|ja|...
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class SupplyNode(SQLModel, table=True):
+    """供应链节点（跨文章去重）"""
+
+    __tablename__ = "supply_nodes"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    industry_chain: str = Field(index=True)  # 如 "AI"
+    tier_id: int                             # 层级编号
+    layer_name: str                          # 层级名（如 "算力芯片"）
+    node_name: str                           # 节点名（如 "GPU 设计"）
+    description: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    class Config:
+        table_args = {"UniqueConstraint": ("industry_chain", "tier_id", "node_name")}
+
+
+class LayerSchema(SQLModel, table=True):
+    """层级指标定义（种子数据 + 运行时扩展）"""
+
+    __tablename__ = "layer_schemas"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    industry_chain: str = Field(index=True)
+    tier_id: int
+    metric_name: str
+    unit: Optional[str] = None
+    description: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    class Config:
+        table_args = {"UniqueConstraint": ("industry_chain", "tier_id", "metric_name")}
+
+
+class Issue(SQLModel, table=True):
+    """产业议题（per-article）"""
+
+    __tablename__ = "issues"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    raw_post_id: int = Field(foreign_key="raw_posts.id", index=True)
+    supply_node_id: Optional[int] = Field(default=None, foreign_key="supply_nodes.id")
+
+    issue_text: str                          # 议题描述（≤150字）
+    severity: Optional[str] = None           # critical|high|medium|low
+    status: Optional[str] = None             # active|emerging|resolved
+    resolution_progress: Optional[str] = None  # 进展描述（≤80字）
+    summary: Optional[str] = None            # ≤15字摘要
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class TechRoute(SQLModel, table=True):
+    """技术路线（per-article）"""
+
+    __tablename__ = "tech_routes"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    raw_post_id: int = Field(foreign_key="raw_posts.id", index=True)
+    supply_node_id: Optional[int] = Field(default=None, foreign_key="supply_nodes.id")
+
+    route_name: str                          # 技术路线名（如 "CoWoS 封装"）
+    maturity: Optional[str] = None           # experimental|emerging|growth|mature|declining
+    competing_routes: Optional[str] = None   # JSON array of route names
+    summary: Optional[str] = None            # ≤15字摘要
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class Metric(SQLModel, table=True):
+    """产业指标数据点（per-article）"""
+
+    __tablename__ = "metrics"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    raw_post_id: int = Field(foreign_key="raw_posts.id", index=True)
+    supply_node_id: Optional[int] = Field(default=None, foreign_key="supply_nodes.id")
+    canonical_player_id: Optional[int] = Field(default=None, foreign_key="canonical_players.id")
+
+    metric_name: str
+    metric_value: str
+    unit: Optional[str] = None
+    time_reference: Optional[str] = None     # 如 "2025Q4", "2026年"
+    evidence_score: Optional[float] = None   # 0-1
+    is_schema_metric: bool = False           # 是否匹配 LayerSchema 预定义指标
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+# ===========================================================================
 # 关系边表（v4，取代 Logic 的 JSON 数组）
 # ===========================================================================
 
 
 class EntityRelationship(SQLModel, table=True):
-    """实体关系边 — 显式记录六实体间的有向关系
+    """实体关系边 — 显式记录七实体间的有向关系
 
     source_type / target_type 取值：
-      fact | assumption | implicit_condition | conclusion | prediction | solution
+      fact | assumption | implicit_condition | conclusion | prediction | solution | theory
 
     edge_type 取值（EdgeType 枚举）：
       fact_supports_conclusion
@@ -443,6 +605,12 @@ class EntityRelationship(SQLModel, table=True):
       conclusion_supports_conclusion
       conclusion_leads_to_prediction
       conclusion_enables_solution
+      fact_supports_theory
+      conclusion_supports_theory
+      theory_supports_theory
+      theory_supports_conclusion
+      theory_leads_to_prediction
+      theory_enables_solution
     """
 
     __tablename__ = "relationships"

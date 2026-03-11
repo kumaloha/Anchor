@@ -9,7 +9,8 @@ import io
 import logging
 import os
 import re
-from typing import Optional
+from collections import defaultdict
+from typing import List, Optional
 
 import httpx
 from sqlmodel import select
@@ -29,6 +30,7 @@ from anchor.models import (
     Prediction,
     RawPost,
     Solution,
+    Theory,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,14 +39,14 @@ NOTION_API_KEY = settings.notion_api_key or os.environ.get("NOTION_API_KEY", "")
 NOTION_VERSION = "2022-06-28"
 
 # content_type → Notion Database ID（财经分析页面已改名为「财经分析」）
+_DEFAULT_NOTION_DB = "31ca7586-d273-80c9-98eb-dea5cec01133"
+
 NOTION_DB_MAP: dict[str, str] = {
-    "财经分析": "31ca7586-d273-80c9-98eb-dea5cec01133",
-    "市场动向":  "31ca7586-d273-80c9-98eb-dea5cec01133",
-    # 以下暂未启用（待补充 Database ID）
-    # "产业链研究": "",
-    # "公司调研": "",
-    # "技术论文": "",
-    # "政策解读": "",
+    "财经分析":   _DEFAULT_NOTION_DB,
+    "市场动向":   _DEFAULT_NOTION_DB,
+    "产业链研究": _DEFAULT_NOTION_DB,
+    "公司调研":   _DEFAULT_NOTION_DB,
+    "政策解读":   _DEFAULT_NOTION_DB,
 }
 
 # 实体类型前缀
@@ -55,6 +57,7 @@ _ETYPE_PREFIX = {
     "conclusion": "C",
     "prediction": "P",
     "solution": "S",
+    "theory": "T",
 }
 
 # verdict 值 → 显示符号（各实体类型独立映射）
@@ -75,6 +78,7 @@ _VERDICT_SYM: dict[str, dict[str, str]] = {
         "accurate": "✓", "directional": "≈", "off_target": "≈", "wrong": "✗",
     },
     "solution": {},
+    "theory": {},
 }
 
 # 各实体类型对应的 verdict 字段名
@@ -85,6 +89,7 @@ _VERDICT_FIELD: dict[str, Optional[str]] = {
     "conclusion":         "conclusion_verdict",
     "prediction":         "prediction_verdict",
     "solution":           None,
+    "theory":             None,
 }
 
 
@@ -98,11 +103,12 @@ def _rt(text: str, max_len: int = 2000) -> list[dict]:
     return [{"type": "text", "text": {"content": content}}]
 
 
-_CONCLUSION_LINE_RE = re.compile(r"^C\d+")
+# 匹配行中任意位置出现的结论标号（C1, C2...），用于红色高亮
+_LOGIC_LINE_RE = re.compile(r"C\d+")
 
 
-def _rt_conclusion(text: str) -> list[dict]:
-    """结论列专用 rich_text：以 C 开头的结论行用红色，其余行保持默认颜色。
+def _rt_logic(text: str) -> list[dict]:
+    """逻辑列专用 rich_text：含结论标号（C\d+）的行用红色，其余行保持默认颜色。
 
     Notion rich_text 是扁平数组，通过拼接相同颜色的连续行减少分段数量。
     单段内容超过 1800 字符时自动切断，以满足 Notion 2000 字符/段的上限。
@@ -122,7 +128,7 @@ def _rt_conclusion(text: str) -> list[dict]:
     cur_red = False
 
     for i, line in enumerate(lines):
-        is_red = bool(_CONCLUSION_LINE_RE.match(line))
+        is_red = bool(_LOGIC_LINE_RE.search(line))
         segment = line + ("\n" if i < len(lines) - 1 else "")
 
         if is_red != cur_red and cur_content:
@@ -171,116 +177,127 @@ def _entity_text(entities: list, etype: str, incoming: dict[int, list[str]]) -> 
     return "\n".join(lines)
 
 
-def _build_conclusion_column(
+def _build_dag_column(
     conclusions: list,
     facts: list,
     assumptions: list,
     implicits: list,
     label_map: dict[str, dict[int, str]],
     rels: list,
+    theories: Optional[List] = None,
+    predictions: Optional[List] = None,
+    solutions: Optional[List] = None,
 ) -> str:
     """
-    每个结论独占一段，格式：
-      C1 ✓ 结论摘要
-      [事实] F1 ✓ 摘要 | F2 ✗ 摘要
-      [假设] A1 ≈ 摘要
-      [隐含] H1 ✓ 摘要
+    将所有实体 + 关系渲染为 ASCII DAG，从输出端（预测/方案/核心结论）向下追溯支撑链。
 
-    多个结论之间空两行。
-    不被任何结论引用的孤立实体附在最后（[孤立事实] 等）。
+    格式示例：
+        ▶ P1 ≈ 美联储将在Q3降息
+          └─ C1 ✓ 通胀受控、就业稳定
+             ├─ F1 ✓ CPI连续三月低于3%
+             └─ F2 ✓ 失业率维持4.1%
+
+        ▶ C2 ✓ 科技股估值偏高
+          ├─ C1 (见上)
+          └─ A1 ≈ 市场无系统性风险
+
+        [孤立] F3 ✓ 未引用的事实
     """
-    # 反查：entity_id → entity 对象（按类型）
-    fact_by_id  = {e.id: e for e in facts}
-    assm_by_id  = {e.id: e for e in assumptions}
-    impl_by_id  = {e.id: e for e in implicits}
+    theories   = theories   or []
+    predictions = predictions or []
+    solutions  = solutions  or []
 
-    # 按结论 id 收集支撑实体（入边）
-    conc_by_id = {c.id: c for c in conclusions}
-    supports: dict[int, dict[str, list]] = {
-        c.id: {"fact": [], "assumption": [], "implicit_condition": [], "conclusion": []}
-        for c in conclusions
-    }
-    used_facts: set[int] = set()
-    used_assms: set[int] = set()
-    used_impls: set[int] = set()
-    used_concs: set[int] = set()
+    # 构建实体查找表 key=(etype, id) → entity
+    entity_by_key: dict[tuple, object] = {}
+    for e in facts:       entity_by_key[("fact", e.id)] = e
+    for e in assumptions: entity_by_key[("assumption", e.id)] = e
+    for e in implicits:   entity_by_key[("implicit_condition", e.id)] = e
+    for e in conclusions: entity_by_key[("conclusion", e.id)] = e
+    for e in theories:    entity_by_key[("theory", e.id)] = e
+    for e in predictions: entity_by_key[("prediction", e.id)] = e
+    for e in solutions:   entity_by_key[("solution", e.id)] = e
 
+    # 构建入边/出边索引（source → target 方向，表示"source 支撑 target"）
+    in_edges: dict[tuple, list[tuple]]  = defaultdict(list)  # tgt → [src]
+    out_edges: dict[tuple, list[tuple]] = defaultdict(list)  # src → [tgt]
     for rel in rels:
-        if rel.target_type == "conclusion" and rel.target_id in supports:
-            if rel.source_type == "fact" and rel.source_id in fact_by_id:
-                supports[rel.target_id]["fact"].append(rel.source_id)
-                used_facts.add(rel.source_id)
-            elif rel.source_type == "assumption" and rel.source_id in assm_by_id:
-                supports[rel.target_id]["assumption"].append(rel.source_id)
-                used_assms.add(rel.source_id)
-            elif rel.source_type == "implicit_condition" and rel.source_id in impl_by_id:
-                supports[rel.target_id]["implicit_condition"].append(rel.source_id)
-                used_impls.add(rel.source_id)
-            elif rel.source_type == "conclusion" and rel.source_id in conc_by_id:
-                supports[rel.target_id]["conclusion"].append(rel.source_id)
-                used_concs.add(rel.source_id)
+        src = (rel.source_type, rel.source_id)
+        tgt = (rel.target_type, rel.target_id)
+        if src in entity_by_key and tgt in entity_by_key:
+            out_edges[src].append(tgt)
+            in_edges[tgt].append(src)
 
-    blocks: list[str] = []
+    def _lbl(key: tuple) -> str:
+        return label_map.get(key[0], {}).get(key[1], f"{key[0][0].upper()}?")
 
-    for c in conclusions:
-        clbl = label_map["conclusion"].get(c.id, "C?")
-        lines = [_fmt_entity(c, "conclusion", clbl)]
+    def _summary_line(key: tuple) -> str:
+        return _fmt_entity(entity_by_key[key], key[0], _lbl(key))
 
-        # [事实]
-        f_parts = [
-            _fmt_entity(fact_by_id[fid], "fact", label_map["fact"].get(fid, "F?"))
-            for fid in supports[c.id]["fact"]
-        ]
-        if f_parts:
-            lines.append("[事实] " + " | ".join(f_parts))
+    # 输出端节点（在结论/理论/预测/方案中，没有出边的节点）
+    output_types = {"conclusion", "theory", "prediction", "solution"}
+    top_nodes = [k for k in entity_by_key if k[0] in output_types and not out_edges.get(k)]
+    # 排序：预测 > 方案 > 理论 > 结论；同类型按 id 升序
+    _top_priority = {"prediction": 0, "solution": 1, "theory": 2, "conclusion": 3}
+    top_nodes.sort(key=lambda k: (_top_priority.get(k[0], 9), k[1]))
 
-        # [假设]
-        a_parts = [
-            _fmt_entity(assm_by_id[aid], "assumption", label_map["assumption"].get(aid, "A?"))
-            for aid in supports[c.id]["assumption"]
-        ]
-        if a_parts:
-            lines.append("[假设] " + " | ".join(a_parts))
+    visited: set[tuple] = set()
+    lines: list[str] = []
 
-        # [隐含]
-        h_parts = [
-            _fmt_entity(impl_by_id[hid], "implicit_condition", label_map["implicit_condition"].get(hid, "H?"))
-            for hid in supports[c.id]["implicit_condition"]
-        ]
-        if h_parts:
-            lines.append("[隐含] " + " | ".join(h_parts))
+    # 支撑实体渲染顺序：理论 > 结论 > 事实 > 假设 > 隐含
+    _supp_priority = {"theory": 0, "conclusion": 1, "fact": 2, "assumption": 3, "implicit_condition": 4}
 
-        # [依据结论]
-        c_parts = [
-            _fmt_entity(conc_by_id[cid], "conclusion", label_map["conclusion"].get(cid, "C?"))
-            for cid in supports[c.id]["conclusion"]
-        ]
-        if c_parts:
-            lines.append("[依据] " + " | ".join(c_parts))
+    def _render(key: tuple, prefix: str, is_last: bool, depth: int) -> None:
+        connector = "└─ " if is_last else "├─ "
+        indent = (prefix + connector) if depth > 0 else ""
 
-        blocks.append("\n".join(lines))
+        if key in visited:
+            # 已渲染过 → 只引用标号，不展开
+            ref = f"{indent}{_lbl(key)} (见上)" if depth > 0 else f"▶ {_lbl(key)} (见上)"
+            lines.append(ref)
+            return
 
-    result = "\n\n\n".join(blocks)  # 两个空行分隔
+        visited.add(key)
 
-    # 孤立实体（未被任何结论引用）
-    orphan_lines: list[str] = []
-    orphan_facts = [e for e in facts if e.id not in used_facts]
-    if orphan_facts:
-        parts = [_fmt_entity(e, "fact", label_map["fact"].get(e.id, "F?")) for e in orphan_facts]
-        orphan_lines.append("[孤立事实] " + " | ".join(parts))
-    orphan_assms = [e for e in assumptions if e.id not in used_assms]
-    if orphan_assms:
-        parts = [_fmt_entity(e, "assumption", label_map["assumption"].get(e.id, "A?")) for e in orphan_assms]
-        orphan_lines.append("[孤立假设] " + " | ".join(parts))
-    orphan_impls = [e for e in implicits if e.id not in used_impls]
-    if orphan_impls:
-        parts = [_fmt_entity(e, "implicit_condition", label_map["implicit_condition"].get(e.id, "H?")) for e in orphan_impls]
-        orphan_lines.append("[孤立隐含] " + " | ".join(parts))
+        if depth == 0:
+            lines.append(f"▶ {_summary_line(key)}")
+        else:
+            lines.append(f"{indent}{_summary_line(key)}")
 
-    if orphan_lines:
-        result = result + "\n\n\n" + "\n".join(orphan_lines) if result else "\n".join(orphan_lines)
+        supporters = sorted(
+            in_edges.get(key, []),
+            key=lambda k: (_supp_priority.get(k[0], 5), k[1]),
+        )
+        child_prefix = ("  " if depth == 0 else prefix + ("   " if is_last else "│  "))
+        for i, supp in enumerate(supporters):
+            _render(supp, child_prefix, i == len(supporters) - 1, depth + 1)
 
-    return result
+    for i, top in enumerate(top_nodes):
+        if i > 0:
+            lines.append("")
+        _render(top, "", True, 0)
+
+    # 有出边但未被 DFS 访问到的结论/理论（极罕见，如孤立中间节点）
+    unvisited_abstract = [k for k in entity_by_key if k[0] in output_types and k not in visited]
+    if unvisited_abstract:
+        if lines:
+            lines.append("")
+        lines.append("[其他]")
+        for key in sorted(unvisited_abstract, key=lambda k: k[1]):
+            lines.append(f"  {_summary_line(key)}")
+            visited.add(key)
+
+    # 孤立叶节点（事实/假设/隐含，未被任何上层实体引用）
+    leaf_types = {"fact", "assumption", "implicit_condition"}
+    _leaf_priority = {"fact": 0, "assumption": 1, "implicit_condition": 2}
+    orphan_leaves = [k for k in entity_by_key if k[0] in leaf_types and k not in visited]
+    if orphan_leaves:
+        if lines:
+            lines.append("")
+        lines.append("[孤立]")
+        for key in sorted(orphan_leaves, key=lambda k: (_leaf_priority.get(k[0], 3), k[1])):
+            lines.append(f"  {_summary_line(key)}")
+
+    return "\n".join(lines)
 
 
 def _fmt_stance(dominant_stance: str) -> str:
@@ -455,6 +472,7 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
     conclusions = list((await session.exec(select(Conclusion).where(Conclusion.raw_post_id == post_id))).all())
     predictions = list((await session.exec(select(Prediction).where(Prediction.raw_post_id == post_id))).all())
     solutions   = list((await session.exec(select(Solution).where(Solution.raw_post_id == post_id))).all())
+    theories    = list((await session.exec(select(Theory).where(Theory.raw_post_id == post_id))).all())
 
     # ── 4. 构建标号映射 + 入边索引 ───────────────────────────────────────────
     label_map: dict[str, dict[int, str]] = {
@@ -464,6 +482,7 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
         "conclusion":         {e.id: _label("conclusion", i)         for i, e in enumerate(conclusions, 1)},
         "prediction":         {e.id: _label("prediction", i)         for i, e in enumerate(predictions, 1)},
         "solution":           {e.id: _label("solution", i)           for i, e in enumerate(solutions, 1)},
+        "theory":             {e.id: _label("theory", i)             for i, e in enumerate(theories, 1)},
     }
 
     # incoming[target_type][target_id] = [source_label, ...]
@@ -487,18 +506,11 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
             pass
     title = post.content_topic or _raw_title or post.author_name or "（无标题）"
 
-    # 结论 + 预测 + 方案 合并为一列，预测和方案各空两行接在结论之后
-    _conc_text = _build_conclusion_column(
-        conclusions, facts, assumptions, implicits, label_map, rels
+    # 逻辑列：所有实体 + 关系渲染为 ASCII DAG
+    _logic_text = _build_dag_column(
+        conclusions, facts, assumptions, implicits, label_map, rels,
+        theories=theories, predictions=predictions, solutions=solutions,
     )
-    _pred_text = _entity_text(predictions, "prediction", incoming["prediction"])
-    _soln_text = _entity_text(solutions,   "solution",   incoming["solution"])
-    _combined_parts = [_conc_text] if _conc_text else []
-    if _pred_text.strip():
-        _combined_parts.append(_pred_text)
-    if _soln_text.strip():
-        _combined_parts.append(_soln_text)
-    _conclusion_combined = "\n\n\n".join(_combined_parts)
 
     properties: dict = {
         "名称":    {"title": _rt(title, 200)},
@@ -512,7 +524,7 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
                    ])))},
         "已读":    {"checkbox": False},
         "核心总结": {"rich_text": _rt(post.content_summary or "")},
-        "结论":    {"rich_text": _rt_conclusion(_conclusion_combined)},
+        "逻辑":    {"rich_text": _rt_logic(_logic_text)},
     }
     # 财经分析子分类 → "分类" 列（Select 类型）
     if post.content_subtype:
@@ -536,18 +548,57 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
                 payload["cover"] = {"type": "external", "external": {"url": cover_url}}
                 logger.info("notion_sync: cover uploaded → %s", cover_url)
 
-    # ── 7. 发送到 Notion API ──────────────────────────────────────────────────
+    # ── 7. 发送到 Notion API（有则 UPDATE，无则 CREATE）─────────────────────
 
+    _headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Content-Type": "application/json",
+        "Notion-Version": NOTION_VERSION,
+    }
+
+    existing_page_id = post.notion_page_id
+    is_update = bool(existing_page_id)
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            "https://api.notion.com/v1/pages",
-            headers={
-                "Authorization": f"Bearer {NOTION_API_KEY}",
-                "Content-Type": "application/json",
-                "Notion-Version": NOTION_VERSION,
-            },
-            json=payload,
-        )
+        if existing_page_id:
+            # UPDATE：只更新 properties（不能改 parent）
+            resp = await client.patch(
+                f"https://api.notion.com/v1/pages/{existing_page_id}",
+                headers=_headers,
+                json={"properties": properties},
+            )
+            # 页面已归档 → 先解档再重试；若解档失败则降级为 CREATE
+            if resp.status_code == 400 and "archived" in resp.text:
+                logger.warning("notion_sync: page %s is archived, attempting unarchive", existing_page_id)
+                unarchive = await client.patch(
+                    f"https://api.notion.com/v1/pages/{existing_page_id}",
+                    headers=_headers,
+                    json={"archived": False},
+                )
+                if unarchive.status_code in (200, 201):
+                    resp = await client.patch(
+                        f"https://api.notion.com/v1/pages/{existing_page_id}",
+                        headers=_headers,
+                        json={"properties": properties},
+                    )
+                else:
+                    logger.warning(
+                        "notion_sync: unarchive failed (%s), falling back to CREATE",
+                        unarchive.status_code,
+                    )
+                    existing_page_id = None
+                    is_update = False
+                    resp = await client.post(
+                        "https://api.notion.com/v1/pages",
+                        headers=_headers,
+                        json=payload,
+                    )
+        else:
+            # CREATE
+            resp = await client.post(
+                "https://api.notion.com/v1/pages",
+                headers=_headers,
+                json=payload,
+            )
 
     if resp.status_code not in (200, 201):
         logger.error("notion_sync: API error %s: %s", resp.status_code, resp.text[:400])
@@ -556,12 +607,14 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
     resp_data = resp.json()
     page_url = resp_data.get("url", "")
     page_id  = resp_data.get("id", "")
-    logger.info("notion_sync: created page %s for post %s (type=%s)", page_url, post_id, ct)
 
-    # 将 Notion 页面 ID 写回 DB，便于后续更新
-    if page_id:
-        post.notion_page_id = page_id
-        session.add(post)
-        await session.flush()
+    if is_update:
+        logger.info("notion_sync: updated page %s for post %s", page_url, post_id)
+    else:
+        logger.info("notion_sync: created page %s for post %s (type=%s)", page_url, post_id, ct)
+        if page_id:
+            post.notion_page_id = page_id
+            session.add(post)
+            await session.flush()
 
     return page_url
