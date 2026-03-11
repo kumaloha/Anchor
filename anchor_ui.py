@@ -25,14 +25,17 @@ from anchor.database.session import AsyncSessionLocal, create_tables
 from anchor.models import (
     Assumption,
     Conclusion,
+    Effect,
     EntityRelationship,
     Fact,
     ImplicitCondition,
+    Limitation,
     Policy,
     PolicyItem,
     PolicyMeasure,
     PolicyTheme,
     Prediction,
+    Problem,
     RawPost,
     Solution,
     Theory,
@@ -323,6 +326,44 @@ async def api_post_detail(post_id: int):
                     "claim": t.claim or "",
                 }
                 for t in theos
+            ]
+
+            probs = list((await s.exec(
+                select(Problem).where(Problem.raw_post_id == post_id)
+            )).all())
+            result["problems"] = [
+                {
+                    "id": p.id,
+                    "summary": p.summary or "",
+                    "claim": p.claim or "",
+                    "problem_domain": p.problem_domain or "",
+                }
+                for p in probs
+            ]
+
+            effs = list((await s.exec(
+                select(Effect).where(Effect.raw_post_id == post_id)
+            )).all())
+            result["effects"] = [
+                {
+                    "id": e.id,
+                    "summary": e.summary or "",
+                    "claim": e.claim or "",
+                    "effect_type": e.effect_type or "",
+                }
+                for e in effs
+            ]
+
+            lims = list((await s.exec(
+                select(Limitation).where(Limitation.raw_post_id == post_id)
+            )).all())
+            result["limitations"] = [
+                {
+                    "id": l.id,
+                    "summary": l.summary or "",
+                    "claim": l.claim or "",
+                }
+                for l in lims
             ]
 
             edges = list((await s.exec(

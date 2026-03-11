@@ -79,6 +79,29 @@ class SupportingSolution(BaseModel):
     action_rationale: Optional[str] = None
 
 
+class SupportingProblem(BaseModel):
+    """v6 Step 2: 支撑问题"""
+    id: int
+    claim: str
+    summary: str
+    problem_domain: Optional[str] = None
+
+
+class SupportingEffect(BaseModel):
+    """v6 Step 2: 支撑效果"""
+    id: int
+    claim: str
+    summary: str
+    effect_type: Optional[str] = None
+
+
+class SupportingLimitation(BaseModel):
+    """v6 Step 2: 支撑局限"""
+    id: int
+    claim: str
+    summary: str
+
+
 class SupportingScanResult(BaseModel):
     """v6 Call 2 输出：相关支撑实体"""
     facts: List[SupportingFact] = Field(default_factory=list)
@@ -86,12 +109,15 @@ class SupportingScanResult(BaseModel):
     assumptions: List[SupportingAssumption] = Field(default_factory=list)
     predictions: List[SupportingPrediction] = Field(default_factory=list)
     solutions: List[SupportingSolution] = Field(default_factory=list)
+    problems: List[SupportingProblem] = Field(default_factory=list)
+    effects: List[SupportingEffect] = Field(default_factory=list)
+    limitations: List[SupportingLimitation] = Field(default_factory=list)
 
 
 class TypedEntity(BaseModel):
     """v6 统一实体格式（Call 3-5 共用）"""
     id: int
-    entity_type: str  # fact|conclusion|theory|prediction|solution|assumption
+    entity_type: str  # fact|conclusion|theory|prediction|solution|assumption|problem|effect|limitation
     claim: str = ""
     summary: str = ""
     is_core: bool = False
@@ -103,6 +129,8 @@ class TypedEntity(BaseModel):
     action_target: Optional[str] = None
     action_rationale: Optional[str] = None
     condition_text: Optional[str] = None
+    problem_domain: Optional[str] = None
+    effect_type: Optional[str] = None
 
     @field_validator("claim", "summary", mode="before")
     @classmethod

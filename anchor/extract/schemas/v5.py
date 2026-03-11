@@ -64,6 +64,26 @@ class ExtractedTheory(BaseModel):
     claim: str
 
 
+class ExtractedProblem(BaseModel):
+    """Layer2 提取的问题"""
+    summary: Optional[str] = None
+    claim: str
+    problem_domain: Optional[str] = None
+
+
+class ExtractedEffect(BaseModel):
+    """Layer2 提取的效果"""
+    summary: Optional[str] = None
+    claim: str
+    effect_type: Optional[str] = None
+
+
+class ExtractedLimitation(BaseModel):
+    """Layer2 提取的局限"""
+    summary: Optional[str] = None
+    claim: str
+
+
 class ExtractedRelationship(BaseModel):
     """Layer2 提取的关系边"""
     source_type: str
@@ -75,7 +95,7 @@ class ExtractedRelationship(BaseModel):
 
 
 class ExtractionResult(BaseModel):
-    """Layer2 完整提取结果（七实体 + 关系边）"""
+    """Layer2 完整提取结果（十实体 + 关系边）"""
     is_relevant_content: bool = True
     skip_reason: Optional[str] = None
     extraction_notes: Optional[str] = None
@@ -88,6 +108,9 @@ class ExtractionResult(BaseModel):
     predictions: List[ExtractedPrediction] = Field(default_factory=list)
     solutions: List[ExtractedSolution] = Field(default_factory=list)
     theories: List[ExtractedTheory] = Field(default_factory=list)
+    problems: List[ExtractedProblem] = Field(default_factory=list)
+    effects: List[ExtractedEffect] = Field(default_factory=list)
+    limitations: List[ExtractedLimitation] = Field(default_factory=list)
     relationships: List[ExtractedRelationship] = Field(default_factory=list)
 
 

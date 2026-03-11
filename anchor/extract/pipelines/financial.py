@@ -15,12 +15,14 @@ from sqlmodel import delete
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from anchor.models import (
-    Assumption, Author, Conclusion, EntityRelationship,
-    Fact, ImplicitCondition, Prediction, RawPost, Solution, Theory, _utcnow,
+    Assumption, Author, Conclusion, Effect, EntityRelationship,
+    Fact, ImplicitCondition, Limitation, Prediction, Problem, RawPost,
+    Solution, Theory, _utcnow,
 )
 from anchor.extract.schemas import (
     AbstractedResult, ExtractionResult, ExtractedAssumption, ExtractedConclusion,
-    ExtractedFact, ExtractedPrediction, ExtractedSolution, ExtractedTheory,
+    ExtractedEffect, ExtractedFact, ExtractedLimitation, ExtractedPrediction,
+    ExtractedProblem, ExtractedSolution, ExtractedTheory,
     MergedResult, RelationshipResult, SupportingScanResult, TopDownAnchorsResult,
     TypedEdge, TypedEntity,
 )
@@ -159,7 +161,8 @@ async def extract_v6(
 
     # DB Write
     _rp_id = raw_post.id
-    for _tbl in (EntityRelationship, Solution, Theory, Prediction, Conclusion,
+    for _tbl in (EntityRelationship, Limitation, Effect, Problem,
+                 Solution, Theory, Prediction, Conclusion,
                  ImplicitCondition, Assumption, Fact):
         await session.exec(delete(_tbl).where(_tbl.raw_post_id == _rp_id))
     await session.flush()
@@ -311,6 +314,26 @@ def _combine_to_typed_entities(
             action_rationale=ss.action_rationale,
         ))
 
+    for sp in step2.problems:
+        entities.append(TypedEntity(
+            id=sp.id, entity_type="problem",
+            claim=sp.claim, summary=sp.summary,
+            problem_domain=sp.problem_domain,
+        ))
+
+    for se in step2.effects:
+        entities.append(TypedEntity(
+            id=se.id, entity_type="effect",
+            claim=se.claim, summary=se.summary,
+            effect_type=se.effect_type,
+        ))
+
+    for sl in step2.limitations:
+        entities.append(TypedEntity(
+            id=sl.id, entity_type="limitation",
+            claim=sl.claim, summary=sl.summary,
+        ))
+
     return entities
 
 
@@ -391,6 +414,9 @@ async def _write_v6_entities(
     predictions_list: list[ExtractedPrediction] = []
     solutions_list: list[ExtractedSolution] = []
     theories_list: list[ExtractedTheory] = []
+    problems_list: list[ExtractedProblem] = []
+    effects_list: list[ExtractedEffect] = []
+    limitations_list: list[ExtractedLimitation] = []
     conclusion_db_ids: list[int] = []
 
     for ent in entities:
@@ -489,6 +515,46 @@ async def _write_v6_entities(
             all_id_maps["theory"][ent.id] = db_obj.id
             theories_list.append(ExtractedTheory(summary=ent.summary, claim=ent.claim))
 
+        elif et == "problem":
+            db_obj = Problem(
+                raw_post_id=raw_post.id, author_id=author_db.id,
+                summary=ent.summary, claim=ent.claim,
+                problem_domain=ent.problem_domain,
+            )
+            session.add(db_obj)
+            await session.flush()
+            all_id_maps["problem"][ent.id] = db_obj.id
+            problems_list.append(ExtractedProblem(
+                summary=ent.summary, claim=ent.claim,
+                problem_domain=ent.problem_domain,
+            ))
+
+        elif et == "effect":
+            db_obj = Effect(
+                raw_post_id=raw_post.id, author_id=author_db.id,
+                summary=ent.summary, claim=ent.claim,
+                effect_type=ent.effect_type,
+            )
+            session.add(db_obj)
+            await session.flush()
+            all_id_maps["effect"][ent.id] = db_obj.id
+            effects_list.append(ExtractedEffect(
+                summary=ent.summary, claim=ent.claim,
+                effect_type=ent.effect_type,
+            ))
+
+        elif et == "limitation":
+            db_obj = Limitation(
+                raw_post_id=raw_post.id, author_id=author_db.id,
+                summary=ent.summary, claim=ent.claim,
+            )
+            session.add(db_obj)
+            await session.flush()
+            all_id_maps["limitation"][ent.id] = db_obj.id
+            limitations_list.append(ExtractedLimitation(
+                summary=ent.summary, claim=ent.claim,
+            ))
+
     # Write edges
     premise_conclusion_ids: set[int] = set()
     conclusion_adj: dict[int, list[int]] = defaultdict(list)
@@ -550,11 +616,14 @@ async def _write_v6_entities(
         f"{len(facts_list)} facts, {len(assumptions_list)} assumptions, "
         f"{len(conclusions_list)} conclusions (core={n_core}), "
         f"{len(predictions_list)} predictions, {len(solutions_list)} solutions, "
-        f"{len(theories_list)} theories, {len(edges)} edges"
+        f"{len(theories_list)} theories, {len(problems_list)} problems, "
+        f"{len(effects_list)} effects, {len(limitations_list)} limitations, "
+        f"{len(edges)} edges"
     )
 
     return ExtractionResult(
         is_relevant_content=True,
         facts=facts_list, assumptions=assumptions_list, conclusions=conclusions_list,
         predictions=predictions_list, solutions=solutions_list, theories=theories_list,
+        problems=problems_list, effects=effects_list, limitations=limitations_list,
     )

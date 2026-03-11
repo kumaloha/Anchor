@@ -22,12 +22,15 @@ from anchor.models import (
     Author,
     AuthorStanceProfile,
     Conclusion,
+    Effect,
     EntityRelationship,
     Fact,
     ImplicitCondition,
+    Limitation,
     MonitoredSource,
     PostQualityAssessment,
     Prediction,
+    Problem,
     RawPost,
     Solution,
     Theory,
@@ -58,6 +61,9 @@ _ETYPE_PREFIX = {
     "prediction": "P",
     "solution": "S",
     "theory": "T",
+    "problem": "Q",
+    "effect": "E",
+    "limitation": "L",
 }
 
 # verdict 值 → 显示符号（各实体类型独立映射）
@@ -79,6 +85,9 @@ _VERDICT_SYM: dict[str, dict[str, str]] = {
     },
     "solution": {},
     "theory": {},
+    "problem": {},
+    "effect": {},
+    "limitation": {},
 }
 
 # 各实体类型对应的 verdict 字段名
@@ -90,6 +99,9 @@ _VERDICT_FIELD: dict[str, Optional[str]] = {
     "prediction":         "prediction_verdict",
     "solution":           None,
     "theory":             None,
+    "problem":            None,
+    "effect":             None,
+    "limitation":         None,
 }
 
 
@@ -187,6 +199,9 @@ def _build_dag_column(
     theories: Optional[List] = None,
     predictions: Optional[List] = None,
     solutions: Optional[List] = None,
+    problems: Optional[List] = None,
+    effects: Optional[List] = None,
+    limitations: Optional[List] = None,
 ) -> str:
     """
     将所有实体 + 关系渲染为 ASCII DAG，从输出端（预测/方案/核心结论）向下追溯支撑链。
@@ -203,9 +218,12 @@ def _build_dag_column(
 
         [孤立] F3 ✓ 未引用的事实
     """
-    theories   = theories   or []
+    theories    = theories    or []
     predictions = predictions or []
-    solutions  = solutions  or []
+    solutions   = solutions   or []
+    problems    = problems    or []
+    effects     = effects     or []
+    limitations = limitations or []
 
     # 构建实体查找表 key=(etype, id) → entity
     entity_by_key: dict[tuple, object] = {}
@@ -216,6 +234,9 @@ def _build_dag_column(
     for e in theories:    entity_by_key[("theory", e.id)] = e
     for e in predictions: entity_by_key[("prediction", e.id)] = e
     for e in solutions:   entity_by_key[("solution", e.id)] = e
+    for e in problems:    entity_by_key[("problem", e.id)] = e
+    for e in effects:     entity_by_key[("effect", e.id)] = e
+    for e in limitations: entity_by_key[("limitation", e.id)] = e
 
     # 构建入边/出边索引（source → target 方向，表示"source 支撑 target"）
     in_edges: dict[tuple, list[tuple]]  = defaultdict(list)  # tgt → [src]
@@ -233,11 +254,11 @@ def _build_dag_column(
     def _summary_line(key: tuple) -> str:
         return _fmt_entity(entity_by_key[key], key[0], _lbl(key))
 
-    # 输出端节点（在结论/理论/预测/方案中，没有出边的节点）
-    output_types = {"conclusion", "theory", "prediction", "solution"}
+    # 输出端节点（在结论/理论/预测/方案/问题/效果/局限中，没有出边的节点）
+    output_types = {"conclusion", "theory", "prediction", "solution", "problem", "effect", "limitation"}
     top_nodes = [k for k in entity_by_key if k[0] in output_types and not out_edges.get(k)]
     # 排序：预测 > 方案 > 理论 > 结论；同类型按 id 升序
-    _top_priority = {"prediction": 0, "solution": 1, "theory": 2, "conclusion": 3}
+    _top_priority = {"prediction": 0, "solution": 1, "effect": 2, "limitation": 3, "theory": 4, "conclusion": 5, "problem": 6}
     top_nodes.sort(key=lambda k: (_top_priority.get(k[0], 9), k[1]))
 
     visited: set[tuple] = set()
@@ -473,6 +494,9 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
     predictions = list((await session.exec(select(Prediction).where(Prediction.raw_post_id == post_id))).all())
     solutions   = list((await session.exec(select(Solution).where(Solution.raw_post_id == post_id))).all())
     theories    = list((await session.exec(select(Theory).where(Theory.raw_post_id == post_id))).all())
+    problems    = list((await session.exec(select(Problem).where(Problem.raw_post_id == post_id))).all())
+    effects     = list((await session.exec(select(Effect).where(Effect.raw_post_id == post_id))).all())
+    limitations = list((await session.exec(select(Limitation).where(Limitation.raw_post_id == post_id))).all())
 
     # ── 4. 构建标号映射 + 入边索引 ───────────────────────────────────────────
     label_map: dict[str, dict[int, str]] = {
@@ -483,6 +507,9 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
         "prediction":         {e.id: _label("prediction", i)         for i, e in enumerate(predictions, 1)},
         "solution":           {e.id: _label("solution", i)           for i, e in enumerate(solutions, 1)},
         "theory":             {e.id: _label("theory", i)             for i, e in enumerate(theories, 1)},
+        "problem":            {e.id: _label("problem", i)            for i, e in enumerate(problems, 1)},
+        "effect":             {e.id: _label("effect", i)             for i, e in enumerate(effects, 1)},
+        "limitation":         {e.id: _label("limitation", i)         for i, e in enumerate(limitations, 1)},
     }
 
     # incoming[target_type][target_id] = [source_label, ...]
@@ -510,6 +537,7 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
     _logic_text = _build_dag_column(
         conclusions, facts, assumptions, implicits, label_map, rels,
         theories=theories, predictions=predictions, solutions=solutions,
+        problems=problems, effects=effects, limitations=limitations,
     )
 
     properties: dict = {

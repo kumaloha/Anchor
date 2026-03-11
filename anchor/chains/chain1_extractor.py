@@ -28,10 +28,13 @@ from anchor.collect.input_handler import parse_url, process_url
 from anchor.models import (
     Assumption,
     Conclusion,
+    Effect,
     EntityRelationship,
     Fact,
     ImplicitCondition,
+    Limitation,
     Prediction,
+    Problem,
     RawPost,
     Solution,
 )
@@ -137,7 +140,9 @@ async def run_chain1(url: str, session: AsyncSession) -> dict:
             "skipped": True,
             "extraction_result": None,
             "facts": [], "assumptions": [], "implicit_conditions": [],
-            "conclusions": [], "predictions": [], "solutions": [], "relationships": [],
+            "conclusions": [], "predictions": [], "solutions": [],
+            "problems": [], "effects": [], "limitations": [],
+            "relationships": [],
         }
 
     if not extraction.is_relevant_content:
@@ -150,7 +155,9 @@ async def run_chain1(url: str, session: AsyncSession) -> dict:
             "skip_reason": extraction.skip_reason,
             "extraction_result": extraction,
             "facts": [], "assumptions": [], "implicit_conditions": [],
-            "conclusions": [], "predictions": [], "solutions": [], "relationships": [],
+            "conclusions": [], "predictions": [], "solutions": [],
+            "problems": [], "effects": [], "limitations": [],
+            "relationships": [],
         }
 
     # ── Step 5：从 DB 读取写入的实体汇总 ────────────────────────────────
@@ -180,6 +187,21 @@ async def run_chain1(url: str, session: AsyncSession) -> dict:
             select(Solution).where(Solution.raw_post_id == raw_post_id)
         )).all()
     )
+    problems = list(
+        (await session.exec(
+            select(Problem).where(Problem.raw_post_id == raw_post_id)
+        )).all()
+    )
+    effects = list(
+        (await session.exec(
+            select(Effect).where(Effect.raw_post_id == raw_post_id)
+        )).all()
+    )
+    limitations = list(
+        (await session.exec(
+            select(Limitation).where(Limitation.raw_post_id == raw_post_id)
+        )).all()
+    )
     relationships = list(
         (await session.exec(
             select(EntityRelationship).where(EntityRelationship.raw_post_id == raw_post_id)
@@ -190,7 +212,8 @@ async def run_chain1(url: str, session: AsyncSession) -> dict:
         f"[Chain1] Done: {len(facts)} facts, {len(assumptions)} assumptions, "
         f"{len(implicit_conditions)} implicit, {len(conclusions)} conclusions, "
         f"{len(predictions)} predictions, {len(solutions)} solutions, "
-        f"{len(relationships)} edges"
+        f"{len(problems)} problems, {len(effects)} effects, "
+        f"{len(limitations)} limitations, {len(relationships)} edges"
     )
 
     return {
@@ -205,5 +228,8 @@ async def run_chain1(url: str, session: AsyncSession) -> dict:
         "conclusions": conclusions,
         "predictions": predictions,
         "solutions": solutions,
+        "problems": problems,
+        "effects": effects,
+        "limitations": limitations,
         "relationships": relationships,
     }

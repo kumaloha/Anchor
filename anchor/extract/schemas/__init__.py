@@ -10,6 +10,9 @@ from anchor.extract.schemas.v5 import (
     ExtractedPrediction,
     ExtractedSolution,
     ExtractedTheory,
+    ExtractedProblem,
+    ExtractedEffect,
+    ExtractedLimitation,
     ExtractedRelationship,
     ExtractionResult,
     RawClaim,
@@ -43,6 +46,9 @@ from anchor.extract.schemas.v6 import (
     SupportingAssumption,
     SupportingPrediction,
     SupportingSolution,
+    SupportingProblem,
+    SupportingEffect,
+    SupportingLimitation,
     SupportingScanResult,
     TypedEntity,
     AbstractedResult,
@@ -68,7 +74,8 @@ __all__ = [
     # v5
     "ExtractedFact", "ExtractedAssumption", "ExtractedImplicitCondition",
     "ExtractedConclusion", "ExtractedPrediction", "ExtractedSolution",
-    "ExtractedTheory", "ExtractedRelationship", "ExtractionResult",
+    "ExtractedTheory", "ExtractedProblem", "ExtractedEffect", "ExtractedLimitation",
+    "ExtractedRelationship", "ExtractionResult",
     "RawClaim", "RawEdge", "Step1Result", "MergeGroup", "Step2Result",
     "ClassifiedEntity", "Step3Result", "ImplicitConditionItem", "Step4Result",
     # policy
@@ -78,7 +85,9 @@ __all__ = [
     # v6
     "CoreConclusion", "KeyTheory", "TopDownAnchorsResult",
     "SupportingFact", "SubConclusion", "SupportingAssumption",
-    "SupportingPrediction", "SupportingSolution", "SupportingScanResult",
+    "SupportingPrediction", "SupportingSolution",
+    "SupportingProblem", "SupportingEffect", "SupportingLimitation",
+    "SupportingScanResult",
     "TypedEntity", "AbstractedResult", "MergeDecision", "MergedResult",
     "TypedEdge", "RelationshipResult",
     # industry

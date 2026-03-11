@@ -15,8 +15,9 @@ from sqlmodel import delete, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from anchor.models import (
-    Assumption, Author, Conclusion, EntityRelationship,
-    Fact, ImplicitCondition, Prediction, RawPost, Solution, Theory, _utcnow,
+    Assumption, Author, Conclusion, Effect, EntityRelationship,
+    Fact, ImplicitCondition, Limitation, Prediction, Problem, RawPost,
+    Solution, Theory, _utcnow,
 )
 from anchor.extract.schemas import (
     ClassifiedEntity, ExtractionResult, ImplicitConditionItem,
@@ -175,7 +176,8 @@ async def extract_v5(
 
     # Step 7: 写库
     _rp_id = raw_post.id
-    for _tbl in (EntityRelationship, Solution, Theory, Prediction, Conclusion,
+    for _tbl in (EntityRelationship, Limitation, Effect, Problem,
+                 Solution, Theory, Prediction, Conclusion,
                  ImplicitCondition, Assumption, Fact):
         await session.exec(delete(_tbl).where(_tbl.raw_post_id == _rp_id))
     await session.flush()
@@ -271,10 +273,45 @@ async def extract_v5(
         await session.flush()
         theory_id_map[claim_id] = db_theory.id
 
+    # 6c. Problem
+    problem_id_map: dict[int, int] = {}
+    for claim_id, ep in result.get("problems", {}).items():
+        db_problem = Problem(
+            raw_post_id=raw_post.id, author_id=author_db.id,
+            summary=ep.summary, claim=ep.claim,
+        )
+        session.add(db_problem)
+        await session.flush()
+        problem_id_map[claim_id] = db_problem.id
+
+    # 6d. Effect
+    effect_id_map: dict[int, int] = {}
+    for claim_id, ee in result.get("effects", {}).items():
+        db_effect = Effect(
+            raw_post_id=raw_post.id, author_id=author_db.id,
+            summary=ee.summary, claim=ee.claim,
+        )
+        session.add(db_effect)
+        await session.flush()
+        effect_id_map[claim_id] = db_effect.id
+
+    # 6e. Limitation
+    limitation_id_map: dict[int, int] = {}
+    for claim_id, el in result.get("limitations", {}).items():
+        db_limitation = Limitation(
+            raw_post_id=raw_post.id, author_id=author_db.id,
+            summary=el.summary, claim=el.claim,
+        )
+        session.add(db_limitation)
+        await session.flush()
+        limitation_id_map[claim_id] = db_limitation.id
+
     all_id_maps: dict[str, dict[int, int]] = {
         "fact": fact_id_map, "assumption": assumption_id_map,
         "conclusion": conclusion_id_map, "prediction": prediction_id_map,
         "solution": solution_id_map, "theory": theory_id_map,
+        "problem": problem_id_map, "effect": effect_id_map,
+        "limitation": limitation_id_map,
     }
 
     # 7. EntityRelationship 边

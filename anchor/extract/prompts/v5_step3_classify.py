@@ -83,8 +83,24 @@ verifiable_statement 字段必须使用中文。
 【Solution（解决方案）】
   作者给出的具体行动建议，含「买入/卖出/持有/建议/对冲」等行动动词。
 
+【Problem（问题）】
+  作者识别的核心问题/痛点/矛盾/挑战。
+  ✓ 明确指出的困境/难题/瓶颈/风险
+  ✓ 需要解决的现状问题
+  问题是「问题→解法→效果→局限」链路的起点。
+
+【Effect（效果）】
+  解法/方案的预期效果或实际效果。
+  ✓ 方案实施后的预期收益/影响
+  ✓ 已实施方案的实际效果
+
+【Limitation（局限）】
+  解法/方案/结论的局限性、风险或约束条件。
+  ✓ 方案的适用范围限制
+  ✓ 方案可能带来的副作用
+
   DAG 位置辅助判断：
-    在 DAG 中没有入边（源节点）→ 通常是 Fact（论证的起点）
+    在 DAG 中没有入边（源节点）→ 通常是 Fact 或 Problem（论证的起点）
     在 DAG 中有入边和出边  → 通常是中间 Conclusion 或 Theory
     在 DAG 中只有入边（★核心结论）→ 通常是终极 Conclusion
 
@@ -147,7 +163,7 @@ def build_user_message(
 ## 分类任务
 
 根据上述 DAG 全局视角，对每个节点进行实体分类。
-- entity_type：fact | conclusion | prediction | assumption | solution | theory
+- entity_type：fact | conclusion | prediction | assumption | solution | theory | problem | effect | limitation
 - verifiable_statement：仅对 fact 和 conclusion 填写（单句可核实陈述，格式：主语+谓语+量化结果+时间）；其他类型填 null
 - author_confidence：仅对 conclusion 和 prediction 填写（certain|likely|uncertain|speculative）；其他类型填 null
 - temporal_note：仅对 prediction 填写时间范围（如"2027年前"）；无明确时间范围填 null

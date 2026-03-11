@@ -28,6 +28,7 @@ async def _load():
     from anchor.models import (
         Fact, Assumption, ImplicitCondition,
         Conclusion, Prediction, Solution, EntityRelationship, RawPost,
+        Problem, Effect, Limitation,
     )
     from sqlmodel import select
     async with AsyncSessionLocal() as s:
@@ -38,6 +39,9 @@ async def _load():
             conclusions = list((await s.exec(select(Conclusion))).all()),
             predictions = list((await s.exec(select(Prediction))).all()),
             solutions   = list((await s.exec(select(Solution))).all()),
+            problems    = list((await s.exec(select(Problem))).all()),
+            effects     = list((await s.exec(select(Effect))).all()),
+            limitations = list((await s.exec(select(Limitation))).all()),
             rels        = list((await s.exec(select(EntityRelationship))).all()),
             posts       = list((await s.exec(select(RawPost))).all()),
         )
@@ -50,18 +54,23 @@ implicits   = data["implicits"]
 conclusions = data["conclusions"]
 predictions = data["predictions"]
 solutions   = data["solutions"]
+problems    = data["problems"]
+effects     = data["effects"]
+limitations = data["limitations"]
 rels        = data["rels"]
 
 # post_id 顺序（按创建顺序排）
 post_ids = sorted({obj.raw_post_id
-                   for group in [facts, assumptions, implicits, conclusions, predictions, solutions]
+                   for group in [facts, assumptions, implicits, conclusions, predictions,
+                                 solutions, problems, effects, limitations]
                    for obj in group})
 if not post_ids:
     post_ids = [p.id for p in data["posts"]]
 
 print(f"Posts: {post_ids}")
 print(f"Loaded: {len(facts)}F {len(assumptions)}A {len(implicits)}I "
-      f"{len(conclusions)}C {len(predictions)}P {len(solutions)}S {len(rels)} rels")
+      f"{len(conclusions)}C {len(predictions)}P {len(solutions)}S "
+      f"{len(problems)}Q {len(effects)}E {len(limitations)}L {len(rels)} rels")
 
 # ── 2. matplotlib ────────────────────────────────────────────────────────────
 import matplotlib
@@ -83,6 +92,9 @@ STYLE = {
     "conclusion":         dict(shape="o", color="#F9E79F", size=3200, layer=1),
     "prediction":         dict(shape="D", color="#F1948A", size=2600, layer=0),
     "solution":           dict(shape="h", color="#FAD7A0", size=2600, layer=0),
+    "problem":            dict(shape="p", color="#FF9999", size=2600, layer=3),
+    "effect":             dict(shape="8", color="#99CCFF", size=2600, layer=0),
+    "limitation":         dict(shape="d", color="#CCCCCC", size=2400, layer=0),
 }
 LAYER_Y    = {3: 4.2, 2: 2.8, 1: 1.4, 0: 0.0}
 LAYER_NAME = {3: "事实层", 2: "前提层", 1: "子结论层", 0: "终极结论"}
@@ -95,6 +107,9 @@ TYPE_NORM = {
     "conclusion": "conclusion", "conclusions": "conclusion",
     "prediction": "prediction", "predictions": "prediction",
     "solution": "solution", "solutions": "solution",
+    "problem": "problem", "problems": "problem",
+    "effect": "effect", "effects": "effect",
+    "limitation": "limitation", "limitations": "limitation",
 }
 
 SEG_COLOR = {pid: c for pid, c in zip(
@@ -117,7 +132,7 @@ def short(obj, etype):
     lbl = getattr(obj, "summary", None)
     if lbl:
         return lbl
-    if etype in ("fact", "conclusion", "prediction", "solution"):
+    if etype in ("fact", "conclusion", "prediction", "solution", "problem", "effect", "limitation"):
         return (getattr(obj, "claim", "") or "")[:14]
     return (getattr(obj, "condition_text", "") or "")[:14]
 
@@ -162,6 +177,24 @@ for s in solutions:
     G.add_node(n)
     node_info[n] = dict(label=short(s, "solution"), etype="solution",
                         post_id=s.raw_post_id, is_core=False)
+
+for pr in problems:
+    n = nid("problem", pr.id)
+    G.add_node(n)
+    node_info[n] = dict(label=short(pr, "problem"), etype="problem",
+                        post_id=pr.raw_post_id, is_core=False)
+
+for ef in effects:
+    n = nid("effect", ef.id)
+    G.add_node(n)
+    node_info[n] = dict(label=short(ef, "effect"), etype="effect",
+                        post_id=ef.raw_post_id, is_core=False)
+
+for lm in limitations:
+    n = nid("limitation", lm.id)
+    G.add_node(n)
+    node_info[n] = dict(label=short(lm, "limitation"), etype="limitation",
+                        post_id=lm.raw_post_id, is_core=False)
 
 db_edges: set[tuple] = set()
 for r in rels:
@@ -360,6 +393,9 @@ type_patches = [
     mpatches.Patch(color="#D7BDE2", label="▼ 隐含条件"),
     mpatches.Patch(color="#F9E79F", label="● 结论"),
     mpatches.Patch(color="#F0B429", label="● 核心结论"),
+    mpatches.Patch(color="#FF9999", label="⬠ 问题"),
+    mpatches.Patch(color="#99CCFF", label="✦ 效果"),
+    mpatches.Patch(color="#CCCCCC", label="◇ 局限"),
 ]
 edge_patches = [
     Line2D([0], [0], color="#aaaaaa", linewidth=1.5, label="提取边"),

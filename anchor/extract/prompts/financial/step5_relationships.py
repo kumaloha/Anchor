@@ -26,24 +26,38 @@ SYSTEM = """\
 边方向 = 逻辑依赖方向：前提 → 结论。
 - 事实 → 结论（事实支撑结论）
 - 事实 → 理论（事实支撑理论）
+- 事实 → 问题（事实支撑问题）
 - 子结论 → 核心结论（子结论支撑核心结论）
 - 结论 → 预测（结论推导出预测）
 - 结论 → 方案（结论引出行动建议）
+- 结论 → 问题（结论识别出问题）
 - 假设 → 结论（假设作为结论的前提条件）
 - 理论 → 结论/预测/方案（理论支撑下游实体）
+- 问题 → 方案（问题引出解法）
+- 问题 → 结论（问题导致结论）
+- 方案 → 效果（方案产生效果）
+- 效果 → 局限（效果存在局限）
+- 方案 → 局限（方案存在局限）
 
 【合法 edge_type 枚举】
   fact_supports_conclusion
   fact_supports_theory
+  fact_supports_problem
   conclusion_supports_conclusion
   conclusion_supports_theory
   conclusion_leads_to_prediction
   conclusion_enables_solution
+  conclusion_identifies_problem
   theory_supports_conclusion
   theory_supports_theory
   theory_leads_to_prediction
   theory_enables_solution
   assumption_conditions_conclusion
+  problem_leads_to_solution
+  problem_leads_to_conclusion
+  solution_produces_effect
+  effect_has_limitation
+  solution_has_limitation
 
 【多层 DAG 结构】
 - 事实 → 子结论 → 核心结论（体现论证的层次结构）

@@ -26,6 +26,9 @@ from anchor.extract.schemas import (
     ExtractedPrediction,
     ExtractedSolution,
     ExtractedTheory,
+    ExtractedProblem,
+    ExtractedEffect,
+    ExtractedLimitation,
     ExtractedImplicitCondition,
     ExtractedRelationship,
     ExtractionResult,
@@ -129,6 +132,8 @@ def derive_edge_type(src_type: str, tgt_type: str) -> str:
     if src_type == "fact":
         if tgt_type == "theory":
             return "fact_supports_theory"
+        if tgt_type == "problem":
+            return "fact_supports_problem"
         return "fact_supports_conclusion"
     if src_type == "conclusion":
         if tgt_type == "conclusion":
@@ -139,6 +144,8 @@ def derive_edge_type(src_type: str, tgt_type: str) -> str:
             return "conclusion_enables_solution"
         if tgt_type == "theory":
             return "conclusion_supports_theory"
+        if tgt_type == "problem":
+            return "conclusion_identifies_problem"
     if src_type == "theory":
         if tgt_type == "theory":
             return "theory_supports_theory"
@@ -150,6 +157,18 @@ def derive_edge_type(src_type: str, tgt_type: str) -> str:
             return "theory_enables_solution"
     if src_type == "prediction" and tgt_type == "solution":
         return "conclusion_enables_solution"
+    # 问题-解法-效果-局限 链路
+    if src_type == "problem":
+        if tgt_type == "solution":
+            return "problem_leads_to_solution"
+        if tgt_type == "conclusion":
+            return "problem_leads_to_conclusion"
+    if src_type == "solution" and tgt_type == "effect":
+        return "solution_produces_effect"
+    if src_type == "effect" and tgt_type == "limitation":
+        return "effect_has_limitation"
+    if src_type == "solution" and tgt_type == "limitation":
+        return "solution_has_limitation"
     return "fact_supports_conclusion"
 
 
@@ -225,6 +244,9 @@ def build_extraction_result_from_claims(
     predictions: dict[int, ExtractedPrediction] = {}
     solutions: dict[int, ExtractedSolution] = {}
     theories: dict[int, ExtractedTheory] = {}
+    problems: dict[int, ExtractedProblem] = {}
+    effects: dict[int, ExtractedEffect] = {}
+    limitations: dict[int, ExtractedLimitation] = {}
 
     for c in claims:
         ce = class_map.get(c.id)
@@ -264,6 +286,12 @@ def build_extraction_result_from_claims(
             )
         elif et == "theory":
             theories[c.id] = ExtractedTheory(summary=c.summary, claim=c.text)
+        elif et == "problem":
+            problems[c.id] = ExtractedProblem(summary=c.summary, claim=c.text)
+        elif et == "effect":
+            effects[c.id] = ExtractedEffect(summary=c.summary, claim=c.text)
+        elif et == "limitation":
+            limitations[c.id] = ExtractedLimitation(summary=c.summary, claim=c.text)
         else:
             facts[c.id] = ExtractedFact(
                 summary=c.summary, claim=c.text, verifiable_statement=c.text,
@@ -272,6 +300,7 @@ def build_extraction_result_from_claims(
     return {
         "facts": facts, "assumptions": assumptions, "conclusions": conclusions,
         "predictions": predictions, "solutions": solutions, "theories": theories,
+        "problems": problems, "effects": effects, "limitations": limitations,
     }
 
 
@@ -288,6 +317,9 @@ def to_extraction_result(
     predictions = list(result.get("predictions", {}).values())
     solutions = list(result.get("solutions", {}).values())
     theories = list(result.get("theories", {}).values())
+    problems = list(result.get("problems", {}).values())
+    effects = list(result.get("effects", {}).values())
+    limitations = list(result.get("limitations", {}).values())
 
     implicit_conditions = [
         ExtractedImplicitCondition(
@@ -304,6 +336,9 @@ def to_extraction_result(
     prediction_ids = list(result.get("predictions", {}).keys())
     solution_ids = list(result.get("solutions", {}).keys())
     theory_ids = list(result.get("theories", {}).keys())
+    problem_ids = list(result.get("problems", {}).keys())
+    effect_ids = list(result.get("effects", {}).keys())
+    limitation_ids = list(result.get("limitations", {}).keys())
 
     def get_type_and_index(claim_id: int) -> tuple[str, int] | None:
         ce = class_map.get(claim_id)
@@ -312,6 +347,8 @@ def to_extraction_result(
             (fact_ids, "fact"), (assumption_ids, "assumption"),
             (conclusion_ids, "conclusion"), (prediction_ids, "prediction"),
             (solution_ids, "solution"), (theory_ids, "theory"),
+            (problem_ids, "problem"), (effect_ids, "effect"),
+            (limitation_ids, "limitation"),
         ]:
             if claim_id in id_list:
                 return type_name, id_list.index(claim_id)
@@ -334,7 +371,8 @@ def to_extraction_result(
         is_relevant_content=True,
         facts=facts, assumptions=assumptions, implicit_conditions=implicit_conditions,
         conclusions=conclusions, predictions=predictions, solutions=solutions,
-        theories=theories, relationships=relationships,
+        theories=theories, problems=problems, effects=effects, limitations=limitations,
+        relationships=relationships,
     )
 
 

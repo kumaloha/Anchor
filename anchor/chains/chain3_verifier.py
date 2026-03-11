@@ -2,7 +2,9 @@
 Chain 3 — 验证链路
 ==================
 输入：raw_post_id
-输出：六实体的 verdict 字段写入 DB
+输出：实体的 verdict 字段写入 DB
+
+注：Problem / Effect / Limitation 暂不验证（与 Solution / Theory 一致）。
 
 5个子步骤（各自独立可跳过）：
 

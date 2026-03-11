@@ -60,6 +60,25 @@ SYSTEM = """\
    ⚠️ 必须充分提取：如果作者用大量篇幅讨论「面对该局面该怎么办」，
    每条独立的行动建议都应作为单独的 solution 提取
 
+6. 问题（problems）
+   作者识别的核心问题、痛点、矛盾或挑战。
+   ✓ 明确指出的困境/难题/瓶颈/风险
+   ✓ 需要解决的现状问题
+   ✓ 行业/市场/社会面临的核心挑战
+   问题是「问题→解法→效果→局限」链路的起点
+
+7. 效果（effects）
+   解法/方案的预期效果或实际效果。
+   ✓ 方案实施后的预期收益/影响
+   ✓ 已实施方案的实际效果
+   ✓ 政策/措施的正面或负面效果
+
+8. 局限（limitations）
+   解法/方案/结论的局限性、风险或约束条件。
+   ✓ 方案的适用范围限制
+   ✓ 方案可能带来的副作用
+   ✓ 结论成立的前提条件/边界
+
 【事实与结论严格分离】
   当作者写「因为X（事实），所以Y（判断）」时，必须拆为：
   ✓ 事实：X（事实描述）
@@ -161,6 +180,29 @@ ID 编号从 {starting_id} 开始。
       "action_type": "buy|sell|hold|short|diversify|hedge|reduce|advocate",
       "action_target": "行动标的",
       "action_rationale": "推导依据"
+    }}
+  ],
+  "problems": [
+    {{
+      "id": {starting_id + 5},
+      "claim": "问题陈述（≤120字）",
+      "summary": "≤15字摘要",
+      "problem_domain": "问题领域（可选）"
+    }}
+  ],
+  "effects": [
+    {{
+      "id": {starting_id + 6},
+      "claim": "效果陈述（≤120字）",
+      "summary": "≤15字摘要",
+      "effect_type": "positive|negative|mixed|uncertain"
+    }}
+  ],
+  "limitations": [
+    {{
+      "id": {starting_id + 7},
+      "claim": "局限陈述（≤120字）",
+      "summary": "≤15字摘要"
     }}
   ]
 }}

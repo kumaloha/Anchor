@@ -1,7 +1,7 @@
 """
-Anchor 核心数据模型（v5 — 七实体 + 显式关系边表）
+Anchor 核心数据模型（v6 — 十实体 + 显式关系边表）
 =================================================
-七实体：
+十实体：
   Fact（事实依据）       — fact_verdict: credible|vague|unreliable|unavailable
   Assumption（假设条件） — assumption_verdict: high_probability|medium_probability|low_probability|unavailable
   ImplicitCondition     — implicit_verdict: consensus|contested|false
@@ -9,6 +9,11 @@ Anchor 核心数据模型（v5 — 七实体 + 显式关系边表）
   Prediction（预测）     — prediction_verdict: pending|accurate|directional|off_target|wrong
   Solution（解决方案）   — 不验证
   Theory（理论框架）     — 不验证
+  Problem（问题）        — 不验证
+  Effect（效果）         — 不验证
+  Limitation（局限）     — 不验证
+
+链路：问题 → 解法 → 效果 → 局限
 
 边表：
   EntityRelationship（relationships）— 显式关系边，取代 Logic 的 JSON 数组
@@ -48,6 +53,14 @@ class EdgeType(str, Enum):
     THEORY_SUPPORTS_CONCLUSION = "theory_supports_conclusion"
     THEORY_LEADS_TO_PREDICTION = "theory_leads_to_prediction"
     THEORY_ENABLES_SOLUTION = "theory_enables_solution"
+    # 问题-解法-效果-局限 链路
+    PROBLEM_LEADS_TO_SOLUTION = "problem_leads_to_solution"
+    SOLUTION_PRODUCES_EFFECT = "solution_produces_effect"
+    EFFECT_HAS_LIMITATION = "effect_has_limitation"
+    SOLUTION_HAS_LIMITATION = "solution_has_limitation"
+    FACT_SUPPORTS_PROBLEM = "fact_supports_problem"
+    CONCLUSION_IDENTIFIES_PROBLEM = "conclusion_identifies_problem"
+    PROBLEM_LEADS_TO_CONCLUSION = "problem_leads_to_conclusion"
     # 产业链研究扩展
     PLAYER_DOMINATES_NODE = "player_dominates_node"
     PLAYER_ENTERS_NODE = "player_enters_node"
@@ -201,7 +214,7 @@ class RawPost(SQLModel, table=True):
 
 
 # ===========================================================================
-# 六实体（v4）
+# 十实体（v6：七实体 + 问题/效果/局限）
 # ===========================================================================
 
 
@@ -372,6 +385,56 @@ class Theory(SQLModel, table=True):
 
     summary: Optional[str] = None                # 一句话摘要（≤15字）
     claim: str                                   # 理论框架陈述（≤120字）
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class Problem(SQLModel, table=True):
+    """问题 — 作者识别的核心问题/痛点/矛盾（不验证）
+
+    问题→解法→效果→局限 链路的起点。
+    """
+
+    __tablename__ = "problems"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id", index=True)
+    author_id: Optional[int] = Field(default=None, foreign_key="authors.id", index=True)
+
+    summary: Optional[str] = None                # 一句话摘要（≤15字）
+    claim: str                                   # 问题陈述（≤120字）
+    problem_domain: Optional[str] = None         # 问题领域（可选）
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class Effect(SQLModel, table=True):
+    """效果 — 解法的预期效果/实际效果（不验证）"""
+
+    __tablename__ = "effects"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id", index=True)
+    author_id: Optional[int] = Field(default=None, foreign_key="authors.id", index=True)
+
+    summary: Optional[str] = None                # 一句话摘要（≤15字）
+    claim: str                                   # 效果陈述（≤120字）
+    effect_type: Optional[str] = None            # positive|negative|mixed|uncertain
+
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class Limitation(SQLModel, table=True):
+    """局限 — 解法/效果/结论的局限性和约束条件（不验证）"""
+
+    __tablename__ = "limitations"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    raw_post_id: Optional[int] = Field(default=None, foreign_key="raw_posts.id", index=True)
+    author_id: Optional[int] = Field(default=None, foreign_key="authors.id", index=True)
+
+    summary: Optional[str] = None                # 一句话摘要（≤15字）
+    claim: str                                   # 局限陈述（≤120字）
 
     created_at: datetime = Field(default_factory=_utcnow)
 
@@ -593,24 +656,23 @@ class Metric(SQLModel, table=True):
 
 
 class EntityRelationship(SQLModel, table=True):
-    """实体关系边 — 显式记录七实体间的有向关系
+    """实体关系边 — 显式记录十实体间的有向关系
 
     source_type / target_type 取值：
-      fact | assumption | implicit_condition | conclusion | prediction | solution | theory
+      fact | assumption | implicit_condition | conclusion | prediction
+      | solution | theory | problem | effect | limitation
 
     edge_type 取值（EdgeType 枚举）：
-      fact_supports_conclusion
-      assumption_conditions_conclusion
-      implicit_conditions_conclusion
-      conclusion_supports_conclusion
-      conclusion_leads_to_prediction
-      conclusion_enables_solution
-      fact_supports_theory
-      conclusion_supports_theory
-      theory_supports_theory
-      theory_supports_conclusion
-      theory_leads_to_prediction
-      theory_enables_solution
+      fact_supports_conclusion / assumption_conditions_conclusion
+      implicit_conditions_conclusion / conclusion_supports_conclusion
+      conclusion_leads_to_prediction / conclusion_enables_solution
+      fact_supports_theory / conclusion_supports_theory
+      theory_supports_theory / theory_supports_conclusion
+      theory_leads_to_prediction / theory_enables_solution
+      problem_leads_to_solution / solution_produces_effect
+      effect_has_limitation / solution_has_limitation
+      fact_supports_problem / conclusion_identifies_problem
+      problem_leads_to_conclusion
     """
 
     __tablename__ = "relationships"
