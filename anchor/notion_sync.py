@@ -1,7 +1,7 @@
 """
 Notion 同步模块 — 将 Anchor 提取结果写入对应 Notion 数据库
 ===========================================================
-触发时机：Chain 3 完成后（standard 模式）或 Chain 1 完成后（policy 模式）
+触发时机：事实验证完成后（standard 模式）或内容提取完成后（policy 模式）
 当前启用：市场动向、市场分析
 """
 
@@ -18,19 +18,13 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from anchor.config import settings
 from anchor.models import (
-    Assumption,
     Author,
     AuthorStanceProfile,
-    Conclusion,
-    EntityRelationship,
-    Fact,
-    ImplicitCondition,
+    Edge,
     MonitoredSource,
+    Node,
     PostQualityAssessment,
-    Prediction,
     RawPost,
-    Solution,
-    Theory,
 )
 
 logger = logging.getLogger(__name__)
@@ -465,38 +459,48 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
     if pqa and pqa.stance_label:
         author_stance = pqa.stance_label
 
-    # ── 3. 加载六实体 ─────────────────────────────────────────────────────────
-    facts       = list((await session.exec(select(Fact).where(Fact.raw_post_id == post_id))).all())
-    assumptions = list((await session.exec(select(Assumption).where(Assumption.raw_post_id == post_id))).all())
-    implicits   = list((await session.exec(select(ImplicitCondition).where(ImplicitCondition.raw_post_id == post_id))).all())
-    conclusions = list((await session.exec(select(Conclusion).where(Conclusion.raw_post_id == post_id))).all())
-    predictions = list((await session.exec(select(Prediction).where(Prediction.raw_post_id == post_id))).all())
-    solutions   = list((await session.exec(select(Solution).where(Solution.raw_post_id == post_id))).all())
-    theories    = list((await session.exec(select(Theory).where(Theory.raw_post_id == post_id))).all())
+    # ── 3. 加载 Node/Edge（v8 架构）──────────────────────────────────────────
+    nodes = list((await session.exec(select(Node).where(Node.raw_post_id == post_id))).all())
+    edges = list((await session.exec(select(Edge).where(Edge.added_by_post_id == post_id))).all())
 
-    # ── 4. 构建标号映射 + 入边索引 ───────────────────────────────────────────
-    label_map: dict[str, dict[int, str]] = {
-        "fact":               {e.id: _label("fact", i)               for i, e in enumerate(facts, 1)},
-        "assumption":         {e.id: _label("assumption", i)         for i, e in enumerate(assumptions, 1)},
-        "implicit_condition": {e.id: _label("implicit_condition", i) for i, e in enumerate(implicits, 1)},
-        "conclusion":         {e.id: _label("conclusion", i)         for i, e in enumerate(conclusions, 1)},
-        "prediction":         {e.id: _label("prediction", i)         for i, e in enumerate(predictions, 1)},
-        "solution":           {e.id: _label("solution", i)           for i, e in enumerate(solutions, 1)},
-        "theory":             {e.id: _label("theory", i)             for i, e in enumerate(theories, 1)},
-    }
+    # ── 4. 构建节点列表文本 ──────────────────────────────────────────────────
+    def _build_node_list(nodes: list, edges: list) -> str:
+        """将节点+边渲染为简洁的文本列表。"""
+        lines = []
+        # 按 domain + node_type 分组
+        by_type: dict[str, list] = {}
+        for n in nodes:
+            by_type.setdefault(n.node_type, []).append(n)
 
-    # incoming[target_type][target_id] = [source_label, ...]
-    incoming: dict[str, dict[int, list[str]]] = {et: {} for et in label_map}
-    rels = list((await session.exec(
-        select(EntityRelationship).where(EntityRelationship.raw_post_id == post_id)
-    )).all())
-    for rel in rels:
-        src_lbl = label_map.get(rel.source_type, {}).get(rel.source_id)
-        if src_lbl and rel.target_type in incoming:
-            incoming[rel.target_type].setdefault(rel.target_id, []).append(src_lbl)
+        node_labels: dict[int, str] = {}
+        idx = 0
+        for ntype, ns in by_type.items():
+            for n in ns:
+                idx += 1
+                label = f"N{idx}"
+                node_labels[n.id] = label
+                verdict_sym = ""
+                if n.verdict:
+                    v_map = {"credible": "✓", "confirmed": "✓", "accurate": "✓",
+                             "vague": "≈", "partial": "≈", "directional": "≈",
+                             "unreliable": "✗", "refuted": "✗", "wrong": "✗"}
+                    verdict_sym = " " + v_map.get(n.verdict, "")
+                text = n.abstract or n.summary
+                lines.append(f"{label}{verdict_sym} [{ntype}] {text}")
+
+        if edges:
+            lines.append("")
+            for e in edges:
+                src = node_labels.get(e.source_node_id, "?")
+                tgt = node_labels.get(e.target_node_id, "?")
+                note = f" ({e.note})" if e.note else ""
+                lines.append(f"  {src} → {tgt}{note}")
+
+        return "\n".join(lines)
+
+    _logic_text = _build_node_list(nodes, edges)
 
     # ── 5. 构建 Notion 页面属性 ───────────────────────────────────────────────
-    # 优先 Chain 2 主题，其次原始文章标题（存在 raw_metadata.title），最后作者名
     _raw_title = ""
     if post.raw_metadata:
         import json as _json
@@ -505,12 +509,6 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
         except Exception:
             pass
     title = post.content_topic or _raw_title or post.author_name or "（无标题）"
-
-    # 逻辑列：所有实体 + 关系渲染为 ASCII DAG
-    _logic_text = _build_dag_column(
-        conclusions, facts, assumptions, implicits, label_map, rels,
-        theories=theories, predictions=predictions, solutions=solutions,
-    )
 
     properties: dict = {
         "名称":    {"title": _rt(title, 200)},

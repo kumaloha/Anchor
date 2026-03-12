@@ -1,27 +1,17 @@
 """
-run_url.py — 单条 URL / 本地文件 全链路分析并写入 Notion
-==========================================================
-通用判断（内容分类 + 作者分析）→ 内容提取（Node/Edge）→ Notion 同步
-
-用法：
-    python run_url.py <url>
-    python run_url.py 'https://robinjbrooks.substack.com/p/...'
-    python run_url.py /path/to/article.txt
-    python run_url.py /path/to/reports/          # 批量处理目录下所有文件
+anchor.commands.run_url — 单条 URL / 本地文件全链路分析
+=====================================================
+从根目录 run_url.py 迁入，移除 sys.path hack。
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json as _json
-import os
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
-
-sys.path.insert(0, os.path.dirname(__file__))
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./anchor_ui.db")
 
 _PAYWALL_RE = re.compile(
     r"subscribe\s+to\s+(?:\w+\s+to\s+)?(read|continue|access|unlock|the full)"
@@ -139,12 +129,11 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
     from anchor.database.session import AsyncSessionLocal
     from anchor.chains.general_assessment import run_assessment
     from anchor.extract.extractor import Extractor
-    from anchor.models import RawPost, Node, Edge
+    from anchor.models import RawPost
     from sqlmodel import select
 
     extractor = Extractor()
 
-    # ── 强制重置 ──────────────────────────────────────────────────────────────
     async with AsyncSessionLocal() as s:
         rp = (await s.exec(select(RawPost).where(RawPost.id == raw_post_id))).first()
         rp.is_processed = False
@@ -155,7 +144,6 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
 
     print(f"      post_id={raw_post_id}  author={rp.author_name!r}")
 
-    # ── 内容质量检查 ──────────────────────────────────────────────────────────
     _meta: dict = {}
     try:
         _meta = _json.loads(rp.raw_metadata or "{}")
@@ -165,7 +153,7 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
     yt_redirect = _meta.get("youtube_redirect")
     if yt_redirect:
         print(f"  检测到 YouTube 嵌入，改抓: {yt_redirect}")
-        await main(yt_redirect)
+        await _main_url(yt_redirect)
         return
 
     _duration_s = _meta.get("duration_s") or 0
@@ -182,7 +170,6 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
         print(f"  跳过：检测到付费墙")
         return
 
-    # ── Step 2: 通用判断 ────────────────────────────────────────────────────
     print(f"\n[2/4] 通用判断  内容分类 + 作者分析")
     from anchor.chains.general_assessment import resolve_content_mode
     async with AsyncSessionLocal() as s:
@@ -195,7 +182,6 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
     print(f"      summary={pre.get('assessment_summary')!r}")
     print(f"      mode={content_mode}")
 
-    # ── Step 3: 内容提取（Node/Edge）──────────────────────────────────────────
     print(f"\n[3/4] 内容提取（{content_mode} 模式）")
     async with AsyncSessionLocal() as s:
         rp3 = (await s.exec(select(RawPost).where(RawPost.id == raw_post_id))).first()
@@ -216,8 +202,6 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
         summary = result3.get("summary")
         if summary:
             print(f"      摘要: {summary}")
-
-        # 打印节点详情
         if isinstance(nodes, list):
             for node in nodes:
                 node_type = node.node_type if hasattr(node, "node_type") else "?"
@@ -230,7 +214,6 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
     else:
         print(f"      内容提取返回空（LLM 调用失败）")
 
-    # ── Step 4: Notion 同步 ───────────────────────────────────────────────────
     print(f"\n[4/4] 写入 Notion")
     try:
         from anchor.notion_sync import sync_post_to_notion
@@ -250,10 +233,10 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
 # ── URL 入口 ──────────────────────────────────────────────────────────────────
 
 async def _refetch_and_update(raw_post_id: int, url: str) -> None:
-    """重新抓取 URL 内容，更新 RawPost 并清除旧数据。"""
+    """重新抓取 URL 内容，更新 RawPost 并清除旧实体数据。"""
     from anchor.database.session import AsyncSessionLocal
     from anchor.collect.input_handler import parse_url, _get_fetcher
-    from anchor.models import Node, Edge, RawPost, PostQualityAssessment
+    from anchor.models import Edge, Node, RawPost, PostQualityAssessment
     from sqlmodel import select, delete
 
     parsed = parse_url(url)
@@ -286,7 +269,7 @@ async def _refetch_and_update(raw_post_id: int, url: str) -> None:
         print(f"  已更新内容 + 清除旧数据  posted_at={rp.posted_at}")
 
 
-async def main(url: str) -> None:
+async def _main_url(url: str) -> None:
     from anchor.database.session import AsyncSessionLocal
     from anchor.collect.input_handler import process_url
 
@@ -310,7 +293,7 @@ async def main(url: str) -> None:
 _SUPPORTED_EXTS = {".txt", ".md", ".pdf"}
 
 
-async def main_local(path: Path) -> None:
+async def _main_local(path: Path) -> None:
     if path.is_file():
         files = [path]
     elif path.is_dir():
@@ -334,18 +317,15 @@ async def main_local(path: Path) -> None:
         await _run_pipeline(rp_id, str(f))
 
 
-# ── 入口 ──────────────────────────────────────────────────────────────────────
+# ── CLI 入口 ────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print(__doc__)
-        sys.exit(0 if "--help" in sys.argv else 1)
-
-    arg = sys.argv[1]
+def run_url_command(target: str, force: bool = False) -> None:
+    """CLI 入口，由 anchor.cli 调用。"""
+    arg = target
     if arg.startswith("file://"):
         arg = arg[len("file://"):]
     p = Path(arg)
     if p.exists():
-        asyncio.run(main_local(p))
+        asyncio.run(_main_local(p))
     else:
-        asyncio.run(main(arg))
+        asyncio.run(_main_url(arg))

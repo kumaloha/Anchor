@@ -1,13 +1,17 @@
 """
-Anchor v4 — 三条独立链路
-========================
-Chain 1 — 逻辑提炼：URL → 六实体提取 + DAG 分析
-Chain 2 — 作者分析：author_id → 档案 + 立场分析
-Chain 3 — 验证：raw_post_id → 事实/假设/隐含条件/结论/预测验证
+Anchor — 三步流水线
+====================
+1. 通用判断 (General Assessment)  — 作者背景 + 2D分类 + 摘要 + 利益冲突
+2. 内容提取 (Content Extraction)  — 路由 → 实体提取 + DAG 分析
+3. 事实验证 (Fact Verification)   — 事实/假设/结论/预测验证
 """
 
-from anchor.chains.chain1_extractor import run_chain1
-from anchor.chains.chain2_author import run_chain2
-from anchor.chains.chain3_verifier import run_chain3
+from anchor.chains.general_assessment import run_assessment, assess_post
+from anchor.chains.content_extraction import run_extraction
+from anchor.chains.fact_verification import run_verification
 
-__all__ = ["run_chain1", "run_chain2", "run_chain3"]
+__all__ = [
+    "run_assessment", "assess_post",
+    "run_extraction",
+    "run_verification",
+]

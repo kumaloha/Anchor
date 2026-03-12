@@ -1,36 +1,20 @@
 """
-run_monitor.py — Anchor 订阅监控主脚本
-========================================
-从 watchlist.yaml 读取所有可自动抓取的来源，
-拉取新内容 URL，喂入 Anchor 分析流水线并写入 Notion。
-
-用法：
-    python run_monitor.py              # 跑全部来源（默认 5 并发）
-    python run_monitor.py --dry-run    # 仅列出新 URL，不分析
-    python run_monitor.py --source "Howard Marks"   # 仅跑指定名称
-    python run_monitor.py --limit 5    # 每个来源最多处理 N 条新内容
-    python run_monitor.py --concurrency 3  # 控制并行提取数
-
-依赖：
-    pip install feedparser yt-dlp httpx pyyaml
+anchor.commands.monitor — 订阅监控主流程
+=========================================
+从根目录 run_monitor.py 迁入，移除 sys.path hack。
 """
 from __future__ import annotations
 
-import argparse
 import asyncio
 import logging
-import os
 import re
-import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import yaml
-
-sys.path.insert(0, str(Path(__file__).parent))
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./anchor_ui.db")
 
 # 只抓取此日期之后发布的内容（UTC）
 DEFAULT_SINCE = datetime(2026, 3, 1, tzinfo=timezone.utc)
@@ -42,7 +26,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("monitor")
 
-WATCHLIST_PATH = Path(__file__).parent / "watchlist.yaml"
+
+def _find_watchlist() -> Path:
+    """查找 watchlist.yaml：优先 cwd，其次包根目录。"""
+    cwd = Path.cwd() / "watchlist.yaml"
+    if cwd.exists():
+        return cwd
+    pkg = Path(__file__).resolve().parent.parent.parent / "watchlist.yaml"
+    if pkg.exists():
+        return pkg
+    return cwd  # fallback, 让后续 open 报错
 
 
 # ── 付费墙检测 ────────────────────────────────────────────────────────────────
@@ -71,7 +64,7 @@ def _is_paywalled(content: str) -> bool:
     return bool(_PAYWALL_RE.search(content))
 
 
-# ── 非文章内容检测（导航页 / 目录页 / 错误页 / 纯数据）──────────────────────
+# ── 非文章内容检测 ────────────────────────────────────────────────────────────
 
 _NAV_LINK_RE = re.compile(r"\[[^\]]{2,}\]\(https?://[^\s)]+\)")
 _ERROR_PAGE_RE = re.compile(
@@ -83,7 +76,6 @@ _ERROR_PAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 _DISCLAIMER_RE = re.compile(
     r"^Disclaimer\s*(&|and)\s*(Agreement|Notice)"
     r"|investment\s+advisory\s+or\s+similar\s+services"
@@ -92,7 +84,6 @@ _DISCLAIMER_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
-# 投资类网站的法律声明关键词（多匹配 = 确认是免责声明页）
 _INVEST_DISCLAIMER_RE = re.compile(
     r"not\s+(a\s+)?recommendation|not\s+investment\s+advice"
     r"|institutional\s+investors?\s+only"
@@ -108,12 +99,6 @@ _INVEST_DISCLAIMER_RE = re.compile(
 
 
 def _count_article_paragraphs(content: str) -> int:
-    """统计真正的文章段落数（排除法律声明、导航说明等样板文字）。
-
-    规则：一段 ≥100 字符的连续文本（不含 markdown 链接语法），
-    且包含 ≥2 个句号/句末标点，且非全大写（法律文本常全大写）。
-    """
-    # 按空行分段
     blocks = re.split(r"\n{2,}", content)
     count = 0
     _boilerplate_kw = re.compile(
@@ -123,17 +108,13 @@ def _count_article_paragraphs(content: str) -> int:
         re.IGNORECASE,
     )
     for block in blocks:
-        # 去掉 markdown 链接
         clean = _NAV_LINK_RE.sub("", block).strip()
         if len(clean) < 100:
             continue
-        # 全大写 → 法律文本
         if clean == clean.upper() and len(clean) > 200:
             continue
-        # 样板文字
         if _boilerplate_kw.search(clean[:200]):
             continue
-        # 句末标点 ≥2 → 真正的段落
         sentence_ends = sum(1 for c in clean if c in ".。!！?？")
         if sentence_ends >= 2:
             count += 1
@@ -141,7 +122,7 @@ def _count_article_paragraphs(content: str) -> int:
 
 
 _ROUNDUP_URL_RE = re.compile(
-    r"top-\d+-\w+"            # top-10-blogs, top-5-articles
+    r"top-\d+-\w+"
     r"|year-in-review"
     r"|best-of-\d{4}"
     r"|roundup"
@@ -151,66 +132,45 @@ _ROUNDUP_URL_RE = re.compile(
 
 
 def _is_roundup_url(url: str) -> bool:
-    """检测汇总/盘点类 URL（"top 10 blogs of 2025" 等）。"""
     return bool(_ROUNDUP_URL_RE.search(url))
 
 
 def _is_junk_content(content: str) -> str | None:
-    """检测非文章内容，返回跳过原因字符串；如果内容正常则返回 None。
-
-    关键区分：导航/目录页 vs 有真实段落的文章（即使有大量站点导航）。
-    """
-    # 1) 错误/被封页面
     if len(content) < 500 and _ERROR_PAGE_RE.search(content):
         return "blocked_page"
-
-    # 2) 法律声明/免责页面（且内容短 → 整页都是声明）
     if len(content) < 5000 and _DISCLAIMER_RE.search(content[:500]):
         return "disclaimer"
-
-    # 3) 投资免责声明页（大量法律文本 + 链接目录）
-    #    如果匹配 ≥3 个免责声明关键词且有很多链接 → 免责声明包装的目录页
     links = _NAV_LINK_RE.findall(content)
     n_links = len(links)
     disclaimer_hits = len(_INVEST_DISCLAIMER_RE.findall(content))
     if disclaimer_hits >= 3 and n_links > 15:
         return "disclaimer_index"
-
-    # 4) 文章段落计数：≥3 段真实文章内容 → 认定为文章，不过滤
     n_paras = _count_article_paragraphs(content)
     if n_paras >= 3:
-        return None  # 真正的文章
-
-    # 5) 没有足够段落 → 检查链接密度
+        return None
     if n_links > 15:
         return "nav_page"
-
-    # 6) 菜单结构
     first_500 = content[:500].lower()
     menu_signals = sum(1 for kw in ("menu", "login", "register", "close menu", "sign in")
                        if kw in first_500)
     if menu_signals >= 2:
         return "nav_page"
-
-    # 7) 纯数值数据
     plain = _NAV_LINK_RE.sub("", content).strip()
     if len(plain) > 500:
         digit_space = sum(1 for c in plain if c.isdigit() or c in " ,.-\t\n")
         if digit_space > len(plain) * 0.7:
             return "raw_data"
-
     return None
 
 
 # ── Watchlist 解析 ────────────────────────────────────────────────────────────
 
 def load_watchlist() -> dict:
-    with open(WATCHLIST_PATH, encoding="utf-8") as f:
+    with open(_find_watchlist(), encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def _platform_hint(platform_str: str) -> str:
-    """从 platform 字段推断平台 key（小写，去除展示性描述）。"""
     s = platform_str.lower()
     if "substack" in s:
         return "substack"
@@ -230,13 +190,6 @@ def _platform_hint(platform_str: str) -> str:
 
 
 def iter_fetchable_sources(watchlist: dict, name_filter: Optional[str] = None):
-    """
-    生成器：遍历 authors + channels 下所有 accessible=true 的来源。
-    Yields (display_name, platform_hint, url, crawl_depth, author_name)
-      crawl_depth > 0 表示该 URL 是目录页，需递归爬取
-      author_name: 来源于 authors 节的真实作者姓名（用于覆盖平台返回的频道名）；
-                   channels 节则为 None
-    """
     for author in watchlist.get("authors", []):
         if name_filter and name_filter.lower() not in author["name"].lower():
             continue
@@ -259,10 +212,9 @@ def iter_fetchable_sources(watchlist: dict, name_filter: Optional[str] = None):
         yield ch["name"], hint, ch["url"], ch.get("crawl_depth", 0), None
 
 
-# ── 已处理 URL 集合（内存内去重）─────────────────────────────────────────────
+# ── 已处理 URL 集合 ──────────────────────────────────────────────────────────
 
 async def load_processed_urls() -> set[str]:
-    """从数据库加载所有已处理过的 RawPost.url。"""
     from anchor.database.session import AsyncSessionLocal
     from anchor.models import RawPost
     from sqlmodel import select
@@ -283,11 +235,11 @@ async def load_processed_urls() -> set[str]:
 class ExtractResult:
     url: str
     post_id: int | None
-    reason: str           # "extracted" | skip reasons
+    reason: str
     author_hint: str | None
 
 
-# ── 单 URL 提取（不含 Notion 写入）─────────────────────────────────────────────
+# ── 单 URL 提取 ──────────────────────────────────────────────────────────────
 
 async def run_extraction(
     url: str,
@@ -295,24 +247,6 @@ async def run_extraction(
     _allow_directory_crawl: bool = True,
     force: bool = False,
 ) -> list[ExtractResult]:
-    """
-    对单条 URL 执行 collect → quality check → 通用判断 → 内容提取。
-    不写 Notion，返回 ExtractResult 列表供后续 FIFO 写入。
-
-    通常返回单元素列表；若检测到目录/索引页，会递归爬取子文章，
-    返回多个 ExtractResult（每个对应一篇实际内容页）。
-
-    reason 值：
-      "extracted"    — LLM 提取完成，可写 Notion
-      "video_only"   — 纯视频占位页
-      "video_short"  — 视频 < 3 分钟
-      "text_short"   — 文章正文 < 200 字
-      "non_market"   — 内容类型非财经分析
-      "junk_skip"    — 非文章页
-      "paywall_skip" — 付费墙
-      "not_relevant" — 内容无关
-      "error"        — 采集 / LLM 调用失败
-    """
     from anchor.database.session import AsyncSessionLocal
     from anchor.collect.input_handler import process_url
     from anchor.chains.general_assessment import run_assessment
@@ -321,10 +255,8 @@ async def run_extraction(
     from sqlmodel import select
 
     extractor = Extractor()
-
     _skip = lambda reason: [ExtractResult(url=url, post_id=None, reason=reason, author_hint=author_hint)]
 
-    # Step 1: 采集
     try:
         async with AsyncSessionLocal() as s:
             result = await process_url(url, s)
@@ -338,7 +270,6 @@ async def run_extraction(
 
     _skip = lambda reason: [ExtractResult(url=url, post_id=rp.id, reason=reason, author_hint=author_hint)]
 
-    # ── force 模式：重置已有记录的分析状态 ────────────────────────────────────
     if force and rp.assessed:
         try:
             async with AsyncSessionLocal() as s:
@@ -353,7 +284,6 @@ async def run_extraction(
         except Exception as e:
             logger.warning(f"  [extract] force reset failed: {e}")
 
-    # ── 内容质量检查 ──────────────────────────────────────────────────────────
     import json as _json
     _meta = {}
     try:
@@ -389,7 +319,6 @@ async def run_extraction(
 
     _junk_reason = _is_junk_content(rp.content or "")
     if _junk_reason:
-        # 目录/索引页 fallback：尝试爬取子文章，用内容页 URL 替代目录页 URL
         if _allow_directory_crawl and _junk_reason in ("nav_page", "disclaimer_index"):
             from anchor.monitor.index_crawler import crawl_index_page
             sub_items = await crawl_index_page(
@@ -397,8 +326,6 @@ async def run_extraction(
             )
             if sub_items:
                 logger.info(f"  [extract] directory detected at {url}, crawling {len(sub_items)} sub-articles")
-                # 删除目录页的 RawPost，使下次运行时该 URL 不在 processed_urls 中，
-                # 从而能重新检查目录页、发现新子文章
                 try:
                     async with AsyncSessionLocal() as s:
                         dir_post = (await s.exec(select(RawPost).where(RawPost.id == rp.id))).first()
@@ -417,7 +344,6 @@ async def run_extraction(
         logger.info(f"  [extract] junk content ({_junk_reason}), skip: {url}")
         return _skip("junk_skip")
 
-    # Step 2: 通用判断
     try:
         async with AsyncSessionLocal() as s:
             pre = await run_assessment(rp.id, s, author_hint=author_hint)
@@ -428,7 +354,7 @@ async def run_extraction(
         )
     except Exception as e:
         logger.error(f"  [extract] assessment error: {e}")
-        content_mode = "expert"
+        content_mode = "standard"
         pre = {}
         ct = ""
 
@@ -437,7 +363,6 @@ async def run_extraction(
         logger.info(f"  [extract] content_type={ct!r} (非目标类型), skip: {url}")
         return _skip("non_market")
 
-    # Step 3: 内容提取
     try:
         async with AsyncSessionLocal() as s:
             rp3 = (await s.exec(select(RawPost).where(RawPost.id == rp.id))).first()
@@ -456,7 +381,6 @@ async def run_extraction(
 
 
 async def _write_notion(result: ExtractResult) -> str:
-    """将已提取的 post 写入 Notion，返回 "written" 或 "notion_skip"。"""
     if not result.post_id:
         return "notion_skip"
     try:
@@ -478,24 +402,28 @@ async def _write_notion(result: ExtractResult) -> str:
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 
-async def main(args: argparse.Namespace) -> None:
+async def _main(
+    dry_run: bool,
+    source: Optional[str],
+    limit: int,
+    concurrency: int,
+    since: Optional[datetime],
+    force: bool,
+) -> None:
     from anchor.monitor.feed_fetcher import fetch_source
-    from collections import Counter
 
-    since: Optional[datetime] = args.since or DEFAULT_SINCE
-    logger.info(f"Date cutoff: {since.date()} (只抓取此日期之后的文章)")
+    _since = since or DEFAULT_SINCE
+    logger.info(f"Date cutoff: {_since.date()} (只抓取此日期之后的文章)")
 
     watchlist = load_watchlist()
     processed_urls = await load_processed_urls()
-    force = getattr(args, "force", False)
     if force:
         logger.info("Force mode: 重新处理所有 URL（忽略已处理标记）")
 
-    sources = list(iter_fetchable_sources(watchlist, name_filter=args.source))
+    sources = list(iter_fetchable_sources(watchlist, name_filter=source))
     logger.info(f"Sources to check: {len(sources)}")
 
-    # ── 阶段 A：收集所有新 URL ────────────────────────────────────────────────
-    all_items: list[tuple[str, str | None, str]] = []  # (url, author_hint, display_label)
+    all_items: list[tuple[str, str | None, str]] = []
     total_new = 0
     total_capped = 0
 
@@ -510,7 +438,7 @@ async def main(args: argparse.Namespace) -> None:
                     processed_urls=processed_urls,
                 )
             else:
-                items = fetch_source(hint, src_url, since=since)
+                items = fetch_source(hint, src_url, since=_since)
         except Exception as e:
             logger.error(f"  fetch error: {e}")
             continue
@@ -521,13 +449,13 @@ async def main(args: argparse.Namespace) -> None:
             new_items = [it for it in items if it.url not in processed_urls]
         logger.info(f"  {len(items)} fetched, {len(new_items)} {'total (force)' if force else 'new'}")
 
-        if args.dry_run:
+        if dry_run:
             for it in new_items:
                 print(f"    [DRY-RUN] {it.url}  「{it.title[:60]}」")
             total_new += len(new_items)
             continue
 
-        to_process = new_items[:args.limit] if args.limit else new_items
+        to_process = new_items[:limit] if limit else new_items
         capped = len(new_items) - len(to_process)
         total_new += len(new_items)
         total_capped += capped
@@ -535,9 +463,9 @@ async def main(args: argparse.Namespace) -> None:
         for it in to_process:
             label = f"{display_name}: {it.title[:60]}"
             all_items.append((it.url, author_name, label))
-            processed_urls.add(it.url)  # 立刻标记，防止跨源重复
+            processed_urls.add(it.url)
 
-    if args.dry_run:
+    if dry_run:
         logger.info(f"\n══ 完成：发现新内容 {total_new} 条（dry-run）")
         return
 
@@ -545,19 +473,17 @@ async def main(args: argparse.Namespace) -> None:
         logger.info(f"\n══ 完成：无新内容需要处理")
         return
 
-    logger.info(f"\n══ 开始并行处理 {len(all_items)} 条（concurrency={args.concurrency}）")
+    logger.info(f"\n══ 开始并行处理 {len(all_items)} 条（concurrency={concurrency}）")
 
-    # ── 阶段 B：并行提取 + 顺序写入 Notion ────────────────────────────────────
     queue: asyncio.Queue[ExtractResult | None] = asyncio.Queue()
-    sem = asyncio.Semaphore(args.concurrency)
+    sem = asyncio.Semaphore(concurrency)
     skip_counts: Counter = Counter()
 
-    # Y consumer: 单 task，FIFO 取结果写 Notion
     async def notion_consumer():
         while True:
             result = await queue.get()
             if result is None:
-                break  # sentinel
+                break
             if result.reason == "extracted":
                 notion_reason = await _write_notion(result)
                 skip_counts[notion_reason] += 1
@@ -565,7 +491,6 @@ async def main(args: argparse.Namespace) -> None:
                 skip_counts[result.reason] += 1
             queue.task_done()
 
-    # X producer: 并行提取（run_extraction 可能返回多条结果，如目录页展开）
     async def extract_worker(url: str, author_hint: str | None, label: str):
         async with sem:
             logger.info(f"  → {label}")
@@ -579,10 +504,9 @@ async def main(args: argparse.Namespace) -> None:
         for url, author_hint, label in all_items
     ]
     await asyncio.gather(*producers)
-    await queue.put(None)  # stop consumer
+    await queue.put(None)
     await consumer_task
 
-    # ── 汇总 ──────────────────────────────────────────────────────────────────
     written = skip_counts.pop("written", 0)
     lines = [f"\n══ 完成：发现新内容 {total_new} 条，处理 {sum(skip_counts.values()) + written} 条，写入 Notion {written} 条"]
     if total_capped:
@@ -604,40 +528,26 @@ async def main(args: argparse.Namespace) -> None:
     logger.info("\n".join(lines))
 
 
-# ── 入口 ──────────────────────────────────────────────────────────────────────
+# ── CLI 入口 ────────────────────────────────────────────────────────────────
 
-def _parse_since(s: str) -> datetime:
-    """解析 --since 参数，格式：YYYY-MM-DD"""
-    return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+def monitor_command(
+    dry_run: bool = False,
+    source: Optional[str] = None,
+    limit: int = 0,
+    concurrency: int = 5,
+    since: Optional[str] = None,
+    force: bool = False,
+) -> None:
+    """CLI 入口，由 anchor.cli 调用。"""
+    since_dt: Optional[datetime] = None
+    if since:
+        since_dt = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Anchor 订阅监控 — 从 watchlist.yaml 批量拉取新文章并写入 Notion",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例：
-  python run_monitor.py                        # 跑全部来源（默认 5 并发）
-  python run_monitor.py --dry-run              # 仅预览新 URL，不分析
-  python run_monitor.py --source "Robin Brooks"  # 仅跑指定作者
-  python run_monitor.py --force --source "Buffett"  # 强制重跑巴菲特所有文章
-  python run_monitor.py --limit 0              # 不限条数
-  python run_monitor.py --concurrency 3        # 3 路并行提取
-  python run_monitor.py --since 2026-02-01     # 自定义日期截止
-        """,
-    )
-    parser.add_argument("--dry-run", action="store_true",
-                        help="仅列出新 URL，不执行分析流水线")
-    parser.add_argument("--force", "-f", action="store_true",
-                        help="强制重新处理所有 URL（忽略已处理标记，重跑通用判断 + 内容提取）")
-    parser.add_argument("--source", default=None, metavar="NAME",
-                        help="仅处理名称含该字符串的来源")
-    parser.add_argument("--limit", type=int, default=0, metavar="N",
-                        help="每个来源最多处理新条目数（默认 0=不限）")
-    parser.add_argument("--concurrency", type=int, default=5, metavar="N",
-                        help="并行提取 worker 数量（默认 5）")
-    parser.add_argument("--since", type=_parse_since, default=None, metavar="YYYY-MM-DD",
-                        help=f"只抓此日期之后的文章（默认 {DEFAULT_SINCE.date()}）")
-    args = parser.parse_args()
-
-    asyncio.run(main(args))
+    asyncio.run(_main(
+        dry_run=dry_run,
+        source=source,
+        limit=limit,
+        concurrency=concurrency,
+        since=since_dt,
+        force=force,
+    ))

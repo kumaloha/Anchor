@@ -205,3 +205,20 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ── Anchor 项目专属 ──────────────────────────────────────────────────────────
+
+# SQLite 数据库文件
+*.db
+*.db-shm
+*.db-wal
+
+# 测试产物
+industry.txt
+industry_test_log.md
+
+# Claude Code
+.claude/
+
+# macOS
+.DS_Store

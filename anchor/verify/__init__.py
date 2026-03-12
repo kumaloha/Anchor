@@ -1,4 +1,4 @@
-"""anchor.verify — Chain 2/3 验证与分析组件"""
+"""anchor.verify — 通用判断 / 事实验证组件"""
 
 from anchor.verify.author_profiler import AuthorProfiler
 

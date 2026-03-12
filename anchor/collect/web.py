@@ -22,6 +22,16 @@ from anchor.collect.base import BaseCollector, RawPostData
 
 _JINA_BASE = "https://r.jina.ai/"
 
+# arXiv → ar5iv 重定向（ar5iv 提供论文 HTML 渲染，Jina Reader 解析效果远优于 PDF）
+_ARXIV_RE = re.compile(r"^https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5}(?:v\d+)?)")
+
+
+def _arxiv_to_ar5iv(url: str) -> str:
+    m = _ARXIV_RE.match(url)
+    if m:
+        return f"https://ar5iv.labs.arxiv.org/html/{m.group(1)}"
+    return url
+
 
 class WebCollector(BaseCollector):
     """通用网页文章采集器，通过 Jina Reader 提取正文。"""
@@ -31,7 +41,10 @@ class WebCollector(BaseCollector):
         return "web"
 
     async def collect_by_url(self, url: str) -> RawPostData | None:
-        text = await _fetch_jina(url)
+        fetch_url = _arxiv_to_ar5iv(url)
+        if fetch_url != url:
+            logger.info(f"[WebCollector] arXiv → ar5iv: {fetch_url}")
+        text = await _fetch_jina(fetch_url)
         if not text:
             return None
         post = _parse_article(text, url)
@@ -59,22 +72,32 @@ class WebCollector(BaseCollector):
 
 
 async def _fetch_jina(url: str) -> str | None:
+    # PDF 和大型文档需要更长超时
+    is_pdf = url.lower().endswith(".pdf") or "/pdf/" in url.lower()
+    max_time = "180" if is_pdf else "60"
+    wait_timeout = 200 if is_pdf else 70
+
     jina_url = _JINA_BASE + url
+    logger.info(f"[WebCollector] Fetching via Jina (max_time={max_time}s): {url}")
     try:
         proc = await asyncio.create_subprocess_exec(
             "curl", "-s",
             "-H", "Accept: text/plain",
-            "--max-time", "30",
+            "--max-time", max_time,
             jina_url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=35)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=wait_timeout)
         text = stdout.decode("utf-8", errors="replace").strip()
         if not text or "403: Forbidden" in text or "CAPTCHA" in text:
             logger.warning(f"[WebCollector] Jina blocked for {url}")
             return None
+        logger.info(f"[WebCollector] Jina returned {len(text)} chars for {url}")
         return text
+    except asyncio.TimeoutError:
+        logger.error(f"[WebCollector] Jina timeout ({max_time}s) for {url}")
+        return None
     except Exception as exc:
         logger.error(f"[WebCollector] fetch failed for {url}: {exc}")
         return None
