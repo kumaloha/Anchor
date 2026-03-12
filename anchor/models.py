@@ -207,6 +207,7 @@ class ExtractionNode(SQLModel, table=True):
     metadata_json: Optional[str] = None    # 领域特定扩展数据 (JSON)
     valid_from: Optional[date] = None      # 生效日期（LLM 判断）
     valid_until: Optional[date] = None     # 失效日期（LLM 判断）
+    authority: Optional[int] = None          # 权威等级：0=一手信息，其他=作者 credibility_tier
     # 验证结论（过渡期：canonicalize 实现前暂存于此，之后迁移到 KnowledgeNode）
     verdict: Optional[str] = None
     verdict_evidence: Optional[str] = None
@@ -229,6 +230,7 @@ class ExtractionEdge(SQLModel, table=True):
     edge_type: str = "connected"          # 先简单连接，后续加类型
     note: Optional[str] = None            # ≤80字说明
     added_by_post_id: int = Field(foreign_key="raw_posts.id", index=True)
+    authority: Optional[int] = None          # 权威等级：0=一手信息，其他=作者 credibility_tier
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -256,6 +258,7 @@ class KnowledgeNode(SQLModel, table=True):
     metadata_json: Optional[str] = None
     valid_from: Optional[date] = None
     valid_until: Optional[date] = None
+    authority: Optional[int] = None          # 权威等级：0=一手信息，其他=作者 credibility_tier
     # 验证结论（事实核查写入此处）
     verdict: Optional[str] = None
     verdict_evidence: Optional[str] = None
@@ -274,6 +277,7 @@ class KnowledgeEdge(SQLModel, table=True):
     target_node_id: int = Field(foreign_key="knowledge_nodes.id", index=True)
     edge_type: str = "connected"
     note: Optional[str] = None
+    authority: Optional[int] = None          # 权威等级：0=一手信息，其他=作者 credibility_tier
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 

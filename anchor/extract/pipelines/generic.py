@@ -36,6 +36,23 @@ def _parse_date(s: str | None) -> _date | None:
         return _date.fromisoformat(s)
     except (ValueError, TypeError):
         return None
+
+
+async def _resolve_authority(raw_post: RawPost, session) -> int | None:
+    """计算权威等级：一手信息→0，其他→作者 credibility_tier。"""
+    if raw_post.content_nature == "一手信息":
+        return 0
+    from anchor.models import Author
+    from sqlmodel import select
+    author = (await session.exec(
+        select(Author).where(
+            Author.platform == raw_post.source,
+            Author.name == raw_post.author_name,
+        )
+    )).first()
+    if author and author.credibility_tier is not None:
+        return author.credibility_tier
+    return None
 _CALL2_TOKENS = 8000
 
 # ── 通用智能分段 ──────────────────────────────────────────────────────────
@@ -394,6 +411,9 @@ async def extract_generic(
             "summary": None,
         }
 
+    # ── 计算权威等级 ────────────────────────────────────────────────────
+    authority = await _resolve_authority(raw_post, session)
+
     # ── 写入 ExtractionNode 表 ──────────────────────────────────────────
     temp_id_to_db_id: dict[str, int] = {}
     db_nodes: list[ExtractionNode] = []
@@ -409,6 +429,7 @@ async def extract_generic(
             metadata_json=json.dumps(n.metadata, ensure_ascii=False) if n.metadata else None,
             valid_from=_parse_date(n.valid_from),
             valid_until=_parse_date(n.valid_until),
+            authority=authority,
         )
         session.add(node)
         db_nodes.append(node)
@@ -459,6 +480,7 @@ async def extract_generic(
                 target_node_id=tgt_id,
                 note=e.note[:80] if e.note else None,
                 added_by_post_id=raw_post.id,
+                authority=authority,
             )
             session.add(edge)
             edges_written += 1
