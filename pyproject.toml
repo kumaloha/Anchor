@@ -44,8 +44,7 @@ dependencies = [
     "pandas-datareader>=0.10.0",
     "wbgapi>=1.0.12",
     "dbnomics>=0.9.3",
-    # Web search
-    "tavily-python>=0.5.0",
+    # Web search (Serper.dev — uses httpx, no extra package)
     # Utilities
     "tenacity>=9.0.0",
     "loguru>=0.7.2",

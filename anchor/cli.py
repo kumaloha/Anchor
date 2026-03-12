@@ -53,7 +53,7 @@ def run_url(target: str, force: bool):
 @click.option("--since", default=None, metavar="YYYY-MM-DD", help="只抓此日期之后的文章")
 @click.option("--force", "-f", is_flag=True, help="强制重新处理所有 URL")
 def monitor(dry_run: bool, source: str | None, limit: int, concurrency: int, since: str | None, force: bool):
-    """从 watchlist.yaml 批量拉取新文章并分析"""
+    """从 sources.yaml 批量拉取新文章并分析"""
     from anchor.commands.monitor import monitor_command
 
     monitor_command(

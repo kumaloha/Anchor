@@ -14,7 +14,7 @@ from loguru import logger
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from anchor.llm_client import chat_completion
+from anchor.llm_client import batch_chat_completions, chat_completion
 from anchor.models import Author, RawPost
 
 
@@ -24,6 +24,28 @@ async def call_llm(system: str, user: str, max_tokens: int) -> str | None:
         return None
     logger.debug(f"LLM: model={resp.model} in={resp.input_tokens} out={resp.output_tokens}")
     return resp.content
+
+
+async def call_llm_batch(
+    requests: list[tuple[str, str, int]],
+) -> list[str | None]:
+    """批量 LLM 调用（自动走 Batch API 或串行退化）。
+
+    Args:
+        requests: [(system, user, max_tokens), ...]
+
+    Returns:
+        与 requests 等长的 content 字符串列表（失败为 None）。
+    """
+    responses = await batch_chat_completions(requests)
+    results = []
+    for resp in responses:
+        if resp is None:
+            results.append(None)
+        else:
+            logger.debug(f"LLM batch: model={resp.model} in={resp.input_tokens} out={resp.output_tokens}")
+            results.append(resp.content)
+    return results
 
 
 def parse_json(raw: str, model_cls, step_name: str):

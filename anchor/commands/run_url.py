@@ -236,7 +236,7 @@ async def _refetch_and_update(raw_post_id: int, url: str) -> None:
     """重新抓取 URL 内容，更新 RawPost 并清除旧实体数据。"""
     from anchor.database.session import AsyncSessionLocal
     from anchor.collect.input_handler import parse_url, _get_fetcher
-    from anchor.models import Edge, Node, RawPost, PostQualityAssessment
+    from anchor.models import ExtractionEdge, ExtractionNode, RawPost, PostQualityAssessment
     from sqlmodel import select, delete
 
     parsed = parse_url(url)
@@ -261,8 +261,8 @@ async def _refetch_and_update(raw_post_id: int, url: str) -> None:
         s.add(rp)
 
         # 清除旧数据（Node/Edge + PostQualityAssessment）
-        await s.exec(delete(Edge).where(Edge.added_by_post_id == raw_post_id))
-        await s.exec(delete(Node).where(Node.raw_post_id == raw_post_id))
+        await s.exec(delete(ExtractionEdge).where(ExtractionEdge.added_by_post_id == raw_post_id))
+        await s.exec(delete(ExtractionNode).where(ExtractionNode.raw_post_id == raw_post_id))
         await s.exec(delete(PostQualityAssessment).where(PostQualityAssessment.raw_post_id == raw_post_id))
 
         await s.commit()

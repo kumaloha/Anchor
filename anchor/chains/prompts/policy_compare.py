@@ -4,7 +4,7 @@
 仅对 content_type in (政策宣布, 政策解读) 触发。
 
 逻辑：
-  - 通过 Tavily 搜索上一年同类政策的原文摘要
+  - 通过 Serper 搜索上一年同类政策的原文摘要
   - LLM 对比今年 vs 去年的措辞变化、新增/删减、侧重点转移
   - 输出 policy_delta（变化摘要）和基于对比的 intent_note
 

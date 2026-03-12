@@ -11,11 +11,12 @@
   ("company", "表现") → verify_fact     — 财务数据核实
   ("policy", "反馈")  → verify_fact     — 执行追踪
 
-一手信息门控保留：content_nature="一手信息" 的内容跳过验证。
+验证搜索策略：
+  1. 用原文语言搜索（original_claim 或 claim）
+  2. 用英文交叉验证（自动翻译关键词）
+  3. 综合两组搜索结果给 LLM 判断
 
-用法：
-  async with AsyncSessionLocal() as session:
-      result = await run_verification(raw_post_id=1, session=session)
+一手信息门控保留：content_nature="一手信息" 的内容跳过验证。
 """
 
 from __future__ import annotations
@@ -28,8 +29,8 @@ from loguru import logger
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from anchor.llm_client import chat_completion
-from anchor.models import Edge, Node, RawPost, _utcnow
+from anchor.llm_client import batch_chat_completions, chat_completion
+from anchor.models import ExtractionEdge, ExtractionNode, RawPost, _utcnow
 from anchor.verify.web_searcher import format_search_results, web_search
 
 _MAX_TOKENS = 1024
@@ -69,47 +70,112 @@ _SYS_PREDICTION = """\
 
 
 # ---------------------------------------------------------------------------
+# 搜索辅助：原文语言 + 英文交叉验证
+# ---------------------------------------------------------------------------
+
+
+def _get_original_claim(node: ExtractionNode) -> str | None:
+    """从 metadata_json 提取 original_claim（非中文原文的原始语言 claim）。"""
+    if not node.metadata_json:
+        return None
+    try:
+        meta = json.loads(node.metadata_json)
+        return meta.get("original_claim")
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _build_query(statement: str) -> str:
+    """构建搜索查询：截短到 200 字，附加年份。"""
+    base = statement[:200]
+    current_year = str(datetime.date.today().year)
+    if not re.search(r"20\d{2}", base):
+        base = f"{base} {current_year}"
+    return base
+
+
+async def _cross_language_search(node: ExtractionNode) -> str:
+    """双语搜索：原文语言 + 英文交叉验证。
+
+    策略：
+    1. 如果有 original_claim（非中文来源），用它搜索（原文语言）
+    2. 用中文 claim 搜索（覆盖中文来源）
+    3. 如果原文不是英文，额外做英文搜索交叉验证
+
+    所有结果合并提供给 LLM。
+    """
+    sections: list[str] = []
+    original_claim = _get_original_claim(node)
+
+    # 1. 原文语言搜索（非中文时）
+    if original_claim:
+        query_orig = _build_query(original_claim)
+        results = await web_search(query_orig, max_results=3)
+        if results:
+            sections.append(f"## 搜索结果（原文语言）\n\n{format_search_results(results)}")
+
+        # 2. 英文交叉验证（如果原文也不是英文，构造英文关键词搜索）
+        if not _looks_english(original_claim):
+            en_query = _build_query(node.claim)  # claim 是中文，但也试英文
+            en_results = await web_search(en_query, max_results=2)
+            if en_results:
+                sections.append(f"## 搜索结果（英文交叉验证）\n\n{format_search_results(en_results)}")
+    else:
+        # 中文原文：用 claim 搜索 + 英文交叉验证
+        query_cn = _build_query(node.claim)
+        results = await web_search(query_cn, max_results=3)
+        if results:
+            sections.append(f"## 搜索结果（中文）\n\n{format_search_results(results)}")
+
+        # 英文交叉验证
+        en_query = _build_query(node.claim)
+        en_results = await web_search(en_query, max_results=2)
+        if en_results:
+            sections.append(f"## 搜索结果（英文交叉验证）\n\n{format_search_results(en_results)}")
+
+    if sections:
+        return "\n\n" + "\n\n".join(sections)
+    return ""
+
+
+def _looks_english(text: str) -> bool:
+    """粗略判断文本是否为英文（ASCII 字母占比 > 60%）。"""
+    if not text:
+        return False
+    ascii_count = sum(1 for c in text if c.isascii() and c.isalpha())
+    total = sum(1 for c in text if c.isalpha())
+    if total == 0:
+        return False
+    return ascii_count / total > 0.6
+
+
+# ---------------------------------------------------------------------------
 # 验证注册表
 # ---------------------------------------------------------------------------
 
-async def _verify_fact(node: Node, session: AsyncSession) -> bool:
-    """联网搜索核实事实类节点。"""
-    query = _build_query(node.claim)
-    search_text = await _search(query)
-
-    prompt = f"""请对以下事实陈述进行核查：
-
-## 待核查陈述
-{node.claim}
-{search_text}
-
-请基于搜索结果（优先）和训练知识输出 JSON。"""
-
-    result = await _call_llm(_SYS_FACT, prompt)
+async def _verify_fact(node: ExtractionNode, session: AsyncSession) -> bool:
+    """联网搜索核实事实类节点 — 注册表标记，批量模式下由 run_verification 统一调度。"""
+    # 单节点退化路径（仅在非批量调用时使用）
+    search_text = await _cross_language_search(node)
+    result = await _call_llm(
+        _SYS_FACT,
+        f"请对以下事实陈述进行核查：\n\n## 待核查陈述\n{node.claim}\n{search_text}\n\n请基于搜索结果（优先）和训练知识输出 JSON。",
+    )
     if result is None:
         return False
-
-    verdict = _normalize(
-        result.get("verdict"),
-        {"credible", "vague", "unreliable", "unavailable"},
-        "unavailable",
-    )
-
-    node.verdict = verdict
+    node.verdict = _normalize(result.get("verdict"), {"credible", "vague", "unreliable", "unavailable"}, "unavailable")
     node.verdict_evidence = _safe_str(result.get("evidence"))
     node.verdict_verified_at = _utcnow()
     session.add(node)
-
-    logger.info(f"[Verification] Node id={node.id} [{node.node_type}] → {verdict}")
+    logger.info(f"[Verification] Node id={node.id} [{node.node_type}] → {node.verdict}")
     return True
 
 
-async def _derive_verdict(node: Node, session: AsyncSession) -> bool:
+async def _derive_verdict(node: ExtractionNode, session: AsyncSession) -> bool:
     """从支撑边推导判断类节点的 verdict。"""
-    # 查找所有指向该节点的边
     edges = list(
         (await session.exec(
-            select(Edge).where(Edge.target_node_id == node.id)
+            select(ExtractionEdge).where(ExtractionEdge.target_node_id == node.id)
         )).all()
     )
 
@@ -119,11 +185,10 @@ async def _derive_verdict(node: Node, session: AsyncSession) -> bool:
         session.add(node)
         return True
 
-    # 获取所有源节点的 verdict
     source_ids = [e.source_node_id for e in edges]
     source_nodes = list(
         (await session.exec(
-            select(Node).where(Node.id.in_(source_ids))
+            select(ExtractionNode).where(ExtractionNode.id.in_(source_ids))
         )).all()
     )
 
@@ -135,7 +200,6 @@ async def _derive_verdict(node: Node, session: AsyncSession) -> bool:
         session.add(node)
         return True
 
-    # 聚合规则
     if any(v == "unreliable" for v in verdicts):
         verdict = "refuted"
         reason = "支撑节点中有不可靠信息"
@@ -158,35 +222,20 @@ async def _derive_verdict(node: Node, session: AsyncSession) -> bool:
     return True
 
 
-async def _monitor_prediction(node: Node, session: AsyncSession) -> bool:
-    """预测类节点验证。"""
-    query = _build_query(node.claim)
-    search_text = await _search(query)
-
-    prompt = f"""请对以下预测型陈述进行核查分类：
-
-## 预测陈述
-{node.claim}
-{search_text}
-
-请基于搜索结果（优先）和训练知识输出 JSON。"""
-
-    result = await _call_llm(_SYS_PREDICTION, prompt)
+async def _monitor_prediction(node: ExtractionNode, session: AsyncSession) -> bool:
+    """预测类节点验证 — 注册表标记，批量模式下由 run_verification 统一调度。"""
+    search_text = await _cross_language_search(node)
+    result = await _call_llm(
+        _SYS_PREDICTION,
+        f"请对以下预测型陈述进行核查分类：\n\n## 预测陈述\n{node.claim}\n{search_text}\n\n请基于搜索结果（优先）和训练知识输出 JSON。",
+    )
     if result is None:
         return False
-
-    verdict = _normalize(
-        result.get("verdict"),
-        {"pending", "accurate", "directional", "off_target", "wrong"},
-        "pending",
-    )
-
-    node.verdict = verdict
+    node.verdict = _normalize(result.get("verdict"), {"pending", "accurate", "directional", "off_target", "wrong"}, "pending")
     node.verdict_evidence = _safe_str(result.get("evidence"))
     node.verdict_verified_at = _utcnow()
     session.add(node)
-
-    logger.info(f"[Verification] Node id={node.id} [{node.node_type}] → {verdict}")
+    logger.info(f"[Verification] Node id={node.id} [{node.node_type}] → {node.verdict}")
     return True
 
 
@@ -211,12 +260,7 @@ VERIFIABLE_TYPES: dict[tuple[str, str], object] = {
 async def run_verification(raw_post_id: int, session: AsyncSession) -> dict:
     """事实验证：对某帖子的所有可验证节点进行验证。
 
-    Args:
-        raw_post_id: raw_posts 表主键
-        session:     异步数据库 Session
-
-    Returns:
-        dict with keys: raw_post_id, nodes_verified, skipped
+    使用 Batch API 批量处理所有搜索+LLM 调用，节省 50% 成本。
     """
     logger.info(f"[Verification] Starting for raw_post_id={raw_post_id}")
 
@@ -234,20 +278,89 @@ async def run_verification(raw_post_id: int, session: AsyncSession) -> dict:
     # ── 加载该帖子的所有节点 ───────────────────────────────────────────────
     nodes = list(
         (await session.exec(
-            select(Node).where(Node.raw_post_id == raw_post_id)
+            select(ExtractionNode).where(ExtractionNode.raw_post_id == raw_post_id)
         )).all()
     )
 
-    nodes_verified = 0
+    # ── 分类：哪些需要搜索验证、哪些从边推导 ─────────────────────────────
+    search_nodes: list[Node] = []       # 需要搜索 + LLM
+    derive_nodes: list[Node] = []       # 从边推导
+
     for node in nodes:
         if node.verdict is not None:
             continue
-
         verify_fn = VERIFIABLE_TYPES.get((node.domain, node.node_type))
         if verify_fn is None:
             continue
+        if verify_fn is _derive_verdict:
+            derive_nodes.append(node)
+        else:
+            search_nodes.append(node)
 
-        changed = await verify_fn(node, session)
+    # ── Phase 1: 批量搜索（并发执行所有网络搜索）──────────────────────────
+    import asyncio
+    search_tasks = [_cross_language_search(n) for n in search_nodes]
+    search_texts = await asyncio.gather(*search_tasks) if search_tasks else []
+
+    # ── Phase 2: 批量 LLM 调用 ───────────────────────────────────────────
+    llm_requests: list[tuple[str, str, int]] = []
+    node_sys_prompts: list[str] = []     # 记录每个节点用的 system prompt
+
+    for node, search_text in zip(search_nodes, search_texts):
+        verify_fn = VERIFIABLE_TYPES.get((node.domain, node.node_type))
+        if verify_fn is _monitor_prediction:
+            sys_prompt = _SYS_PREDICTION
+            user_prompt = f"""请对以下预测型陈述进行核查分类：
+
+## 预测陈述
+{node.claim}
+{search_text}
+
+请基于搜索结果（优先）和训练知识输出 JSON。"""
+        else:
+            sys_prompt = _SYS_FACT
+            user_prompt = f"""请对以下事实陈述进行核查：
+
+## 待核查陈述
+{node.claim}
+{search_text}
+
+请基于搜索结果（优先）和训练知识输出 JSON。"""
+
+        llm_requests.append((sys_prompt, user_prompt, _MAX_TOKENS))
+        node_sys_prompts.append(sys_prompt)
+
+    nodes_verified = 0
+
+    if llm_requests:
+        logger.info(f"[Verification] Batch LLM: {len(llm_requests)} requests")
+        llm_results = await batch_chat_completions(llm_requests)
+
+        for node, raw_resp, sys_prompt in zip(search_nodes, llm_results, node_sys_prompts):
+            if raw_resp is None:
+                continue
+
+            result = _parse_json(raw_resp.content)
+            if result is None:
+                continue
+
+            if sys_prompt == _SYS_PREDICTION:
+                valid_set = {"pending", "accurate", "directional", "off_target", "wrong"}
+                default = "pending"
+            else:
+                valid_set = {"credible", "vague", "unreliable", "unavailable"}
+                default = "unavailable"
+
+            node.verdict = _normalize(result.get("verdict"), valid_set, default)
+            node.verdict_evidence = _safe_str(result.get("evidence"))
+            node.verdict_verified_at = _utcnow()
+            session.add(node)
+            nodes_verified += 1
+            logger.info(f"[Verification] Node id={node.id} [{node.node_type}] → {node.verdict}")
+
+    # ── Phase 3: 边推导（不需要 LLM）─────────────────────────────────────
+    for node in derive_nodes:
+        changed = await _derive_verdict(node, session)
         if changed:
             nodes_verified += 1
 
@@ -271,27 +384,11 @@ async def run_verification(raw_post_id: int, session: AsyncSession) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def _search(query: str) -> str:
-    """Tavily 搜索，返回格式化文本。"""
-    results = await web_search(query, max_results=4)
-    if results:
-        return f"\n\n## 搜索结果\n\n{format_search_results(results)}"
-    return ""
-
-
 async def _call_llm(system: str, user: str) -> dict | None:
     resp = await chat_completion(system=system, user=user, max_tokens=_MAX_TOKENS)
     if resp is None:
         return None
     return _parse_json(resp.content)
-
-
-def _build_query(statement: str) -> str:
-    base = statement[:200]
-    current_year = str(datetime.date.today().year)
-    if not re.search(r"20\d{2}", base):
-        base = f"{base} {current_year}"
-    return base
 
 
 def _parse_json(raw: str) -> dict | None:

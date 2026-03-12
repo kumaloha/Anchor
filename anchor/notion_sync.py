@@ -20,9 +20,9 @@ from anchor.config import settings
 from anchor.models import (
     Author,
     AuthorStanceProfile,
-    Edge,
+    ExtractionEdge,
+    ExtractionNode,
     MonitoredSource,
-    Node,
     PostQualityAssessment,
     RawPost,
 )
@@ -459,9 +459,9 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
     if pqa and pqa.stance_label:
         author_stance = pqa.stance_label
 
-    # ── 3. 加载 Node/Edge（v8 架构）──────────────────────────────────────────
-    nodes = list((await session.exec(select(Node).where(Node.raw_post_id == post_id))).all())
-    edges = list((await session.exec(select(Edge).where(Edge.added_by_post_id == post_id))).all())
+    # ── 3. 加载 ExtractionNode/ExtractionEdge（v8.1 两层架构）─────────────
+    nodes = list((await session.exec(select(ExtractionNode).where(ExtractionNode.raw_post_id == post_id))).all())
+    edges = list((await session.exec(select(ExtractionEdge).where(ExtractionEdge.added_by_post_id == post_id))).all())
 
     # ── 4. 构建节点列表文本 ──────────────────────────────────────────────────
     def _build_node_list(nodes: list, edges: list) -> str:

@@ -38,8 +38,7 @@ pandas-datareader>=0.10.0  # 多源路由（FRED/World Bank/OECD/Eurostat）
 wbgapi>=1.0.12           # World Bank Open Data（200+国，17000+指标，无需API Key）
 dbnomics>=0.9.3          # DBnomics 全球聚合器（IMF/World Bank/Eurostat/NBS，无需API Key）
 
-# Web search（Layer3 事实核查联网模式）
-tavily-python>=0.5.0         # Tavily Search API — LLM 专用搜索，支持 include_domains 过滤
+# Web search（Layer3 事实核查联网模式 — 使用 Serper.dev Google Search API，通过 httpx 调用，无额外依赖）
 
 # Utilities
 tenacity>=9.0.0

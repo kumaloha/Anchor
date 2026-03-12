@@ -29,6 +29,16 @@ def build_system_call1(domain: str, node_type_descriptions: dict[str, str]) -> s
 6. 相似内容合并为一个节点，不要重复
 7. 如果文章与「{domain}」领域无关，设置 is_relevant_content=false 并说明原因
 ★ 无论原文是什么语言，所有输出字段（summary、abstract、claim）必须使用中文。
+★ 如果原文不是中文，在 metadata 中额外输出 "original_claim"（原文语言的 claim，≤300字符），用于后续事实核查。中文原文无需此字段。
+
+【有效期判断】
+★ 每个节点需判断其信息的有效时间范围，输出 valid_from 和 valid_until（格式 YYYY-MM-DD）。
+  · 根据原文上下文推断，能判断就填，无法判断则输出 null
+  · 政策类：发布/生效日 → 明确到期日或该年年底
+  · 财报回顾（表现/归因）：覆盖的财报周期（如 Q4 → 2025-10-01 至 2025-12-31）
+  · 财报前瞻（指引/风险）：指引覆盖的未来周期
+  · 预测类：发布日 → 预测目标时间点
+  · 叙事/长期趋势：根据原文描述判断，原文未说明时间的留 null
 
 【数字敏感度】
 ★ 包含具体数字的内容通常是关键信息，必须优先提取且保留原始数字。
@@ -109,7 +119,9 @@ def build_user_message_call1(
       "claim": "≤300字符详细描述",
       "summary": "≤30字符标签",
       "abstract": "≤100字符一句话总结",
-      "metadata": null
+      "metadata": null,
+      "valid_from": "YYYY-MM-DD 或 null",
+      "valid_until": "YYYY-MM-DD 或 null"
     }}
   ]
 }}

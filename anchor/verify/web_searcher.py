@@ -1,19 +1,19 @@
 """
 联网搜索辅助模块
 ================
-为 Layer3 事实核查提供实时网页搜索能力。
+为事实核查提供实时网页搜索能力。
 
-使用 Tavily Search API（专为 LLM 应用设计，返回结构化内容摘要）。
-Tavily Key 未配置时返回 None，调用方降级为纯训练知识模式。
+使用 Serper.dev（Google Search API，返回结构化 SERP 数据）。
+Key 未配置时返回 None，调用方降级为纯训练知识模式。
 
-免费注册：https://app.tavily.com（1000 次/月）
+免费注册：https://serper.dev（2500 credits）
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
+import httpx
 from loguru import logger
 
 from anchor.config import settings
@@ -23,8 +23,8 @@ from anchor.config import settings
 class SearchResult:
     title: str
     url: str
-    content: str     # Tavily 提取的正文摘要
-    score: float     # 相关性评分 0-1
+    content: str     # snippet 摘要
+    score: float     # 相关性排序分 0-1
 
 
 async def web_search(
@@ -40,40 +40,52 @@ async def web_search(
         include_domains: 优先抓取的域名列表（可选）
 
     Returns:
-        搜索结果列表；Tavily Key 未配置或请求失败时返回 None。
+        搜索结果列表；Key 未配置或请求失败时返回 None。
     """
-    if not settings.tavily_api_key:
-        logger.debug("[WebSearcher] TAVILY_API_KEY 未配置，跳过联网搜索")
+    if not settings.serper_api_key:
+        logger.debug("[WebSearcher] SERPER_API_KEY 未配置，跳过联网搜索")
         return None
 
     try:
-        from tavily import AsyncTavilyClient
-
-        client = AsyncTavilyClient(api_key=settings.tavily_api_key)
-        kwargs: dict = {
-            "query": query,
-            "max_results": max_results,
-            "search_depth": "advanced",   # 深度搜索，内容更丰富
-            "include_answer": False,
-            "include_raw_content": False,
-        }
+        # 域名过滤：用 Google site: 语法
+        q = query
         if include_domains:
-            kwargs["include_domains"] = include_domains
+            domain_filter = " OR ".join(f"site:{d}" for d in include_domains)
+            q = f"({q}) ({domain_filter})"
 
-        resp = await client.search(**kwargs)
-        results = resp.get("results", [])
+        payload = {
+            "q": q,
+            "num": max_results,
+        }
+        headers = {
+            "X-API-KEY": settings.serper_api_key,
+            "Content-Type": "application/json",
+        }
 
-        return [
-            SearchResult(
-                title=r.get("title", ""),
-                url=r.get("url", ""),
-                content=r.get("content", ""),
-                score=r.get("score", 0.0),
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://google.serper.dev/search",
+                json=payload,
+                headers=headers,
             )
-            for r in results
-        ]
+            resp.raise_for_status()
+            data = resp.json()
+
+        organic = data.get("organic", [])
+
+        results = []
+        for i, r in enumerate(organic[:max_results]):
+            results.append(SearchResult(
+                title=r.get("title", ""),
+                url=r.get("link", ""),
+                content=r.get("snippet", ""),
+                score=round(1.0 - i * 0.1, 2),  # 按排名递减
+            ))
+
+        return results
+
     except Exception as exc:
-        logger.warning(f"[WebSearcher] 搜索失败: {exc}")
+        logger.warning(f"[WebSearcher] Serper 搜索失败: {exc}")
         return None
 
 
@@ -97,13 +109,12 @@ def format_search_results(results: list[SearchResult]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_fact_query(claim: str, verifiable_expression: str | None) -> str:
+def build_fact_query(claim: str, verifiable_expression: str | None = None) -> str:
     """从 Fact 字段构建搜索查询字符串。
 
     优先使用 verifiable_expression（更精确），截短到 200 字内。
     """
     base = verifiable_expression or claim
-    # 截短：搜索引擎通常最佳查询长度 10-20 词
     if len(base) > 200:
         base = base[:200]
     return base

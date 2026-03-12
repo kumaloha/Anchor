@@ -24,7 +24,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from anchor.extract.extractor import Extractor
 from anchor.collect.input_handler import parse_url, process_url
-from anchor.models import Edge, Node, RawPost
+from anchor.models import ExtractionEdge, ExtractionNode, RawPost
 
 
 async def run_extraction(url: str, session: AsyncSession) -> dict:
@@ -127,10 +127,10 @@ async def run_extraction(url: str, session: AsyncSession) -> dict:
 
     # ── Step 5：从 DB 读取写入的实体汇总 ────────────────────────────────
     nodes = list(
-        (await session.exec(select(Node).where(Node.raw_post_id == raw_post_id))).all()
+        (await session.exec(select(ExtractionNode).where(ExtractionNode.raw_post_id == raw_post_id))).all()
     )
     edges = list(
-        (await session.exec(select(Edge).where(Edge.added_by_post_id == raw_post_id))).all()
+        (await session.exec(select(ExtractionEdge).where(ExtractionEdge.added_by_post_id == raw_post_id))).all()
     )
 
     logger.info(

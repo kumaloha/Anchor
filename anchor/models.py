@@ -1,15 +1,19 @@
 """
-Anchor 核心数据模型（v8 — 通用节点+边架构）
-=============================================
-Node（节点）— 6 领域 × 各自节点类型
-Edge（边）  — 节点间关系，记录来源文章
+Anchor 核心数据模型（v8.1 — 两层 Node/Edge 架构）
+==================================================
+Layer 1 — 提取层（per-article, write-once）：
+  ExtractionNode / ExtractionEdge
+
+Layer 2 — 知识层（cross-article, canonical）：
+  KnowledgeNode / KnowledgeEdge
+  KnowledgeNodeSource / KnowledgeEdgeSource（M:N 溯源）
 
 保留基础设施表（不变）：
   AuthorGroup / Topic / Author / MonitoredSource / RawPost
   PostQualityAssessment / AuthorStanceProfile / AuthorStats
 """
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -184,14 +188,14 @@ class RawPost(SQLModel, table=True):
 
 
 # ===========================================================================
-# v8 Node + Edge 表
+# Layer 1 — 提取层（per-article, write-once LLM 输出）
 # ===========================================================================
 
 
-class Node(SQLModel, table=True):
-    """通用节点 — 所有领域的提取实体统一存储"""
+class ExtractionNode(SQLModel, table=True):
+    """提取层节点 — 单篇文章的 LLM 提取结果，写入后不变"""
 
-    __tablename__ = "nodes"
+    __tablename__ = "extraction_nodes"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     raw_post_id: int = Field(foreign_key="raw_posts.id", index=True)
@@ -201,23 +205,101 @@ class Node(SQLModel, table=True):
     summary: str                           # 短摘要 (≤30字符)
     abstract: Optional[str] = None         # 一句话总结 (≤100字符)
     metadata_json: Optional[str] = None    # 领域特定扩展数据 (JSON)
-    verdict: Optional[str] = None          # 验证结论
+    valid_from: Optional[date] = None      # 生效日期（LLM 判断）
+    valid_until: Optional[date] = None     # 失效日期（LLM 判断）
+    # 验证结论（过渡期：canonicalize 实现前暂存于此，之后迁移到 KnowledgeNode）
+    verdict: Optional[str] = None
     verdict_evidence: Optional[str] = None
     verdict_verified_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=_utcnow)
+    # 归一化后指向的知识层节点（由 canonicalize 填充）
+    knowledge_node_id: Optional[int] = Field(
+        default=None, foreign_key="knowledge_nodes.id", index=True
+    )
 
 
-class Edge(SQLModel, table=True):
-    """通用边 — 节点间关系"""
+class ExtractionEdge(SQLModel, table=True):
+    """提取层边 — 单篇文章内节点间关系"""
 
-    __tablename__ = "edges"
+    __tablename__ = "extraction_edges"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    source_node_id: int = Field(foreign_key="nodes.id", index=True)
-    target_node_id: int = Field(foreign_key="nodes.id", index=True)
+    source_node_id: int = Field(foreign_key="extraction_nodes.id", index=True)
+    target_node_id: int = Field(foreign_key="extraction_nodes.id", index=True)
     edge_type: str = "connected"          # 先简单连接，后续加类型
     note: Optional[str] = None            # ≤80字说明
     added_by_post_id: int = Field(foreign_key="raw_posts.id", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+# 向后兼容别名（过渡期间，逐步替换）
+Node = ExtractionNode
+Edge = ExtractionEdge
+
+
+# ===========================================================================
+# Layer 2 — 知识层（cross-article, canonical graph）
+# ===========================================================================
+
+
+class KnowledgeNode(SQLModel, table=True):
+    """知识层节点 — 跨文章归一化后的 canonical 节点"""
+
+    __tablename__ = "knowledge_nodes"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    domain: str = Field(index=True)
+    node_type: str = Field(index=True)
+    claim: str                             # canonical claim (≤300字符)
+    summary: str                           # canonical summary (≤30字符)
+    abstract: Optional[str] = None
+    metadata_json: Optional[str] = None
+    valid_from: Optional[date] = None
+    valid_until: Optional[date] = None
+    # 验证结论（事实核查写入此处）
+    verdict: Optional[str] = None
+    verdict_evidence: Optional[str] = None
+    verdict_verified_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class KnowledgeEdge(SQLModel, table=True):
+    """知识层边 — 跨文章归一化后的 canonical 关系"""
+
+    __tablename__ = "knowledge_edges"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    source_node_id: int = Field(foreign_key="knowledge_nodes.id", index=True)
+    target_node_id: int = Field(foreign_key="knowledge_nodes.id", index=True)
+    edge_type: str = "connected"
+    note: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class KnowledgeNodeSource(SQLModel, table=True):
+    """知识节点溯源 — M:N 映射 ExtractionNode → KnowledgeNode"""
+
+    __tablename__ = "knowledge_node_sources"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    knowledge_node_id: int = Field(foreign_key="knowledge_nodes.id", index=True)
+    extraction_node_id: int = Field(foreign_key="extraction_nodes.id", index=True)
+    raw_post_id: int = Field(foreign_key="raw_posts.id", index=True)
+    alignment: Optional[str] = None       # supports|contradicts|updates|neutral
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class KnowledgeEdgeSource(SQLModel, table=True):
+    """知识边溯源 — M:N 映射 ExtractionEdge → KnowledgeEdge"""
+
+    __tablename__ = "knowledge_edge_sources"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    knowledge_edge_id: int = Field(foreign_key="knowledge_edges.id", index=True)
+    extraction_edge_id: int = Field(foreign_key="extraction_edges.id", index=True)
+    raw_post_id: int = Field(foreign_key="raw_posts.id", index=True)
     created_at: datetime = Field(default_factory=_utcnow)
 
 

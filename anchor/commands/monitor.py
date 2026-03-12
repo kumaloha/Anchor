@@ -27,12 +27,12 @@ logging.basicConfig(
 logger = logging.getLogger("monitor")
 
 
-def _find_watchlist() -> Path:
-    """查找 watchlist.yaml：优先 cwd，其次包根目录。"""
-    cwd = Path.cwd() / "watchlist.yaml"
+def _find_sources() -> Path:
+    """查找 sources.yaml：优先 cwd，其次包根目录。"""
+    cwd = Path.cwd() / "sources.yaml"
     if cwd.exists():
         return cwd
-    pkg = Path(__file__).resolve().parent.parent.parent / "watchlist.yaml"
+    pkg = Path(__file__).resolve().parent.parent.parent / "sources.yaml"
     if pkg.exists():
         return pkg
     return cwd  # fallback, 让后续 open 报错
@@ -163,10 +163,10 @@ def _is_junk_content(content: str) -> str | None:
     return None
 
 
-# ── Watchlist 解析 ────────────────────────────────────────────────────────────
+# ── Sources 解析 ────────────────────────────────────────────────────────────
 
-def load_watchlist() -> dict:
-    with open(_find_watchlist(), encoding="utf-8") as f:
+def load_sources() -> dict:
+    with open(_find_sources(), encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -189,8 +189,8 @@ def _platform_hint(platform_str: str) -> str:
     return "generic"
 
 
-def iter_fetchable_sources(watchlist: dict, name_filter: Optional[str] = None):
-    for author in watchlist.get("authors", []):
+def iter_fetchable_sources(sources_config: dict, name_filter: Optional[str] = None):
+    for author in sources_config.get("authors", []):
         if name_filter and name_filter.lower() not in author["name"].lower():
             continue
         for src in author.get("sources", []):
@@ -201,7 +201,7 @@ def iter_fetchable_sources(watchlist: dict, name_filter: Optional[str] = None):
                 continue
             yield author["name"], hint, src["url"], src.get("crawl_depth", 0), author["name"]
 
-    for ch in watchlist.get("channels", []):
+    for ch in sources_config.get("channels", []):
         if name_filter and name_filter.lower() not in ch["name"].lower():
             continue
         if not ch.get("accessible", False):
@@ -415,12 +415,12 @@ async def _main(
     _since = since or DEFAULT_SINCE
     logger.info(f"Date cutoff: {_since.date()} (只抓取此日期之后的文章)")
 
-    watchlist = load_watchlist()
+    sources_config = load_sources()
     processed_urls = await load_processed_urls()
     if force:
         logger.info("Force mode: 重新处理所有 URL（忽略已处理标记）")
 
-    sources = list(iter_fetchable_sources(watchlist, name_filter=source))
+    sources = list(iter_fetchable_sources(sources_config, name_filter=source))
     logger.info(f"Sources to check: {len(sources)}")
 
     all_items: list[tuple[str, str | None, str]] = []

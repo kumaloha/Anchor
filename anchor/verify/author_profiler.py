@@ -3,7 +3,7 @@ Layer3 Step 0 — 作者档案分析器
 ================================
 在开始观点验证前，先分析作者的角色、专业背景和可信度：
   - 如果 Author.profile_fetched == True，跳过（已分析过）
-  - 通过 Tavily 联网搜索获取作者公开信息（可选，无 Key 时降级）
+  - 通过 Serper 联网搜索获取作者公开信息（可选，无 Key 时降级）
   - 调用 LLM 生成结构化档案：
       role（职业角色）、expertise_areas（专业领域）、
       known_biases（已知立场偏见）、credibility_tier（1-5分级）、
@@ -147,15 +147,15 @@ class AuthorProfiler:
                     f"(tier={author.credibility_tier}), skip"
                 )
                 return
-            # tier=5（未知）且 Tavily 可用时：重新联网查询
+            # tier=5（未知）且 Serper 可用时：重新联网查询
             from anchor.config import settings as _settings
-            if not _settings.tavily_api_key:
+            if not _settings.serper_api_key:
                 logger.debug(
-                    f"[AuthorProfiler] author id={author.id} tier=5 but no Tavily, skip"
+                    f"[AuthorProfiler] author id={author.id} tier=5 but no Serper API key, skip"
                 )
                 return
             logger.info(
-                f"[AuthorProfiler] author id={author.id} tier=5, retrying with Tavily web search"
+                f"[AuthorProfiler] author id={author.id} tier=5, retrying with web search"
             )
         else:
             logger.info(f"[AuthorProfiler] profiling author: {author.name} ({author.platform})")

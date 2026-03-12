@@ -811,7 +811,7 @@ _RSS_DOMAINS = {
 def fetch_source(platform_hint: str, url: str,
                  since: Optional[datetime] = None) -> list[FetchedItem]:
     """
-    统一入口：根据 platform_hint（来自 watchlist.yaml）选择抓取方式。
+    统一入口：根据 platform_hint（来自 sources.yaml）选择抓取方式。
 
     platform_hint 可能为：
       "substack", "rss", "youtube", "bilibili", "weibo",

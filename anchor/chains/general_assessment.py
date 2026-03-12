@@ -43,14 +43,14 @@ _VALID_NATURES = {"一手信息", "第三方分析"}
 
 
 # ---------------------------------------------------------------------------
-# watchlist 机构 → tier 映射（缓存）
+# sources 机构 → tier 映射（缓存）
 # ---------------------------------------------------------------------------
 
 _INSTITUTION_TIER_CACHE: dict[str, int] | None = None
 
 
 def _load_institution_tier_map() -> dict[str, int]:
-    """从 watchlist.yaml 构建 机构关键词 → tier 映射。"""
+    """从 sources.yaml 构建 机构关键词 → tier 映射。"""
     global _INSTITUTION_TIER_CACHE
     if _INSTITUTION_TIER_CACHE is not None:
         return _INSTITUTION_TIER_CACHE
@@ -59,7 +59,7 @@ def _load_institution_tier_map() -> dict[str, int]:
     from pathlib import Path
 
     mapping: dict[str, int] = {}
-    wl_path = Path(__file__).parent.parent.parent / "watchlist.yaml"
+    wl_path = Path(__file__).parent.parent.parent / "sources.yaml"
     if not wl_path.exists():
         _INSTITUTION_TIER_CACHE = mapping
         return mapping
@@ -97,7 +97,7 @@ def _load_institution_tier_map() -> dict[str, int]:
 
 
 def _lookup_institution_tier(author_name: str) -> int | None:
-    """若作者名匹配 watchlist 中某机构，返回该机构的 tier，否则 None。"""
+    """若作者名匹配 sources.yaml 中某机构，返回该机构的 tier，否则 None。"""
     if not author_name:
         return None
     mapping = _load_institution_tier_map()
@@ -172,7 +172,7 @@ async def assess_post(
     """
     author = await _get_or_create_author(post, session)
     await AuthorProfiler().profile(author, session)
-    # 机构作者 tier 覆盖：watchlist 机构 tier 优先于 LLM 判定
+    # 机构作者 tier 覆盖：sources.yaml 机构 tier 优先于 LLM 判定
     inst_tier = _lookup_institution_tier(author.name)
     if inst_tier is not None and author.credibility_tier != inst_tier:
         logger.info(
@@ -191,7 +191,7 @@ async def assess_post(
             real_name = _safe_str(post_analysis.get("real_author_name"))
             if not real_name and author_hint:
                 real_name = author_hint
-                logger.info(f"[Assessment] Using watchlist author hint: {author_hint!r}")
+                logger.info(f"[Assessment] Using sources author hint: {author_hint!r}")
             if real_name and real_name != author.name:
                 author = await _reassign_author(post, author, real_name, session)
         post.assessed = True
@@ -224,7 +224,7 @@ async def run_assessment(
     Args:
         post_id:      raw_posts 表主键
         session:      异步数据库 Session
-        author_hint:  来自 watchlist 的真实作者姓名（可选，作为兜底参考）
+        author_hint:  来自 sources.yaml 的真实作者姓名（可选，作为兜底参考）
 
     Returns:
         dict with keys:
@@ -264,7 +264,7 @@ async def run_assessment(
             real_name = _safe_str(post_analysis.get("real_author_name"))
             if not real_name and author_hint:
                 real_name = author_hint
-                logger.info(f"[Assessment] Using watchlist author hint: {author_hint!r}")
+                logger.info(f"[Assessment] Using sources author hint: {author_hint!r}")
             if real_name and real_name != author.name:
                 author = await _reassign_author(post, author, real_name, session)
 

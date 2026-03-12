@@ -3,7 +3,7 @@ anchor/monitor/index_crawler.py
 ─────────────────────────────────
 多级目录页递归爬取器。
 
-适用于 watchlist.yaml 中标注了 crawl_depth: N 的来源。
+适用于 sources.yaml 中标注了 crawl_depth: N 的来源。
 流程：
   1. 用 Jina Reader 抓取目录页，获取干净 Markdown
   2. 提取所有链接（anchor text + url）
@@ -203,7 +203,7 @@ async def crawl_index_page(
 
     Args:
         url:            目录页 URL
-        display_name:   watchlist 来源名（用于日志）
+        display_name:   sources.yaml 来源名（用于日志）
         max_depth:      最大递归深度（上限 _MAX_DEPTH_CAP）
         processed_urls: 已处理 URL 集合（用于去重，函数不修改它）
     """

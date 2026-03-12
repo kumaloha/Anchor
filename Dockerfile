@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir .
 
 # 复制应用代码
 COPY anchor/ anchor/
-COPY watchlist.yaml .
+COPY sources.yaml .
 
 EXPOSE 8765
 

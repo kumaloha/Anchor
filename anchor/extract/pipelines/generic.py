@@ -15,7 +15,7 @@ from loguru import logger
 from sqlmodel import delete
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from anchor.models import DOMAIN_NODE_TYPES, Edge, Node, RawPost, _utcnow
+from anchor.models import DOMAIN_NODE_TYPES, ExtractionEdge, ExtractionNode, RawPost, _utcnow
 from anchor.extract.schemas.nodes import (
     EdgeExtractionResult,
     ExtractedNode,
@@ -23,8 +23,19 @@ from anchor.extract.schemas.nodes import (
 )
 
 import re as _re
+from datetime import date as _date
 
 _CALL1_TOKENS = 16000
+
+
+def _parse_date(s: str | None) -> _date | None:
+    """Parse YYYY-MM-DD string to date, return None on failure."""
+    if not s or s == "null":
+        return None
+    try:
+        return _date.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
 _CALL2_TOKENS = 8000
 
 # ── 通用智能分段 ──────────────────────────────────────────────────────────
@@ -212,6 +223,99 @@ def _dedup_theme_nodes(nodes: list[ExtractedNode]) -> list[ExtractedNode]:
     return result
 
 
+# ── Batch 模式：分段 Call 1 批量提交 ─────────────────────────────────────
+
+
+async def _call1_chunked_batch(
+    prompt_module,
+    chunks: list[str],
+    platform: str,
+    author: str,
+    today: str,
+    valid_types: set[str],
+    call_llm,
+    parse_json,
+) -> list[ExtractedNode]:
+    """分段 Call 1：使用 Batch API 批量提交所有 chunk，一次性获取结果。
+
+    策略：
+    - 将所有 chunk 的 Call 1 请求打包提交 batch_chat_completions
+    - 解析所有结果，重编号 temp_id，收集主旨去重
+    """
+    from anchor.extract.pipelines._base import call_llm_batch
+
+    # 构建所有请求
+    batch_requests: list[tuple[str, str, int]] = []
+    for chunk in chunks:
+        user1 = prompt_module.build_user_message_call1(chunk, platform, author, today)
+        batch_requests.append((prompt_module.SYSTEM_CALL1, user1, _CALL1_TOKENS))
+
+    logger.info(f"[Generic] Call 1 batch: {len(batch_requests)} chunks")
+    raw_results = await call_llm_batch(batch_requests)
+
+    # 解析结果，重编号
+    all_nodes: list[ExtractedNode] = []
+    id_offset = 0
+
+    for i, raw in enumerate(raw_results):
+        if raw is None:
+            logger.warning(f"[Generic] Call 1 chunk {i+1}/{len(chunks)} returned None")
+            continue
+
+        result1 = parse_json(raw, NodeExtractionResult, f"generic_call1_chunk{i}")
+        if result1 is None or not result1.is_relevant_content:
+            continue
+
+        for n in result1.nodes:
+            if n.node_type not in valid_types:
+                logger.warning(f"[Generic] Invalid node_type={n.node_type!r}, skipping")
+                continue
+            if id_offset > 0:
+                n.temp_id = f"n{int(n.temp_id.lstrip('n')) + id_offset}"
+            all_nodes.append(n)
+
+        id_offset += len(result1.nodes)
+
+    return all_nodes
+
+
+async def _call2_batch(
+    prompt_module,
+    node_batches: list[list[dict]],
+    content_for_call2: str,
+    call_llm,
+    parse_json,
+) -> tuple[list[EdgeExtractionResult], str | None, str | None]:
+    """Call 2 多批次批量提交。返回 (edge_results, summary, one_liner)。"""
+    from anchor.extract.pipelines._base import call_llm_batch
+
+    batch_requests: list[tuple[str, str, int]] = []
+    for batch in node_batches:
+        nodes_json = json.dumps(batch, ensure_ascii=False, indent=2)
+        user2 = prompt_module.build_user_message_call2(content_for_call2, nodes_json)
+        batch_requests.append((prompt_module.SYSTEM_CALL2, user2, _CALL2_TOKENS))
+
+    logger.info(f"[Generic] Call 2 batch: {len(batch_requests)} batches")
+    raw_results = await call_llm_batch(batch_requests)
+
+    edge_results = []
+    summary = None
+    one_liner = None
+
+    for i, raw in enumerate(raw_results):
+        if raw is None:
+            logger.warning(f"[Generic] Call 2 batch {i+1} returned None")
+            continue
+        result2 = parse_json(raw, EdgeExtractionResult, f"generic_call2_batch{i}")
+        if result2 is not None:
+            edge_results.append(result2)
+            if i == 0:
+                summary = result2.summary
+                one_liner = result2.one_liner
+
+    return edge_results, summary, one_liner
+
+
 # ── 主入口 ───────────────────────────────────────────────────────────────
 
 async def extract_generic(
@@ -242,8 +346,8 @@ async def extract_generic(
     valid_types = set(DOMAIN_NODE_TYPES.get(domain, []))
 
     # ── 清除旧数据 ────────────────────────────────────────────────────────
-    await session.exec(delete(Edge).where(Edge.added_by_post_id == raw_post.id))
-    await session.exec(delete(Node).where(Node.raw_post_id == raw_post.id))
+    await session.exec(delete(ExtractionEdge).where(ExtractionEdge.added_by_post_id == raw_post.id))
+    await session.exec(delete(ExtractionNode).where(ExtractionNode.raw_post_id == raw_post.id))
     await session.flush()
 
     # ── Call 1：提取节点（支持分段）────────────────────────────────────────
@@ -261,22 +365,10 @@ async def extract_generic(
 
     if chunks:
         logger.info(f"[Generic] Long content ({len(content)} chars) → {len(chunks)} chunks")
-        id_offset = 0
-        existing_themes: list[str] = []
-        for i, chunk in enumerate(chunks):
-            logger.info(f"[Generic] Call 1 chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
-            chunk_nodes = await _call1_single(
-                prompt_module, chunk, platform, author, today,
-                valid_types, call_llm, parse_json,
-                id_offset=id_offset,
-                existing_themes=existing_themes if existing_themes else None,
-            )
-            # 收集本段新增的主旨
-            for n in chunk_nodes:
-                if n.node_type == "主旨":
-                    existing_themes.append(n.summary)
-            valid_nodes.extend(chunk_nodes)
-            id_offset += len(chunk_nodes)
+        valid_nodes = await _call1_chunked_batch(
+            prompt_module, chunks, platform, author, today,
+            valid_types, call_llm, parse_json,
+        )
     else:
         # 单次调用
         valid_nodes = await _call1_single(
@@ -302,12 +394,12 @@ async def extract_generic(
             "summary": None,
         }
 
-    # ── 写入 Node 表 ──────────────────────────────────────────────────────
+    # ── 写入 ExtractionNode 表 ──────────────────────────────────────────
     temp_id_to_db_id: dict[str, int] = {}
-    db_nodes: list[Node] = []
+    db_nodes: list[ExtractionNode] = []
 
     for n in valid_nodes:
-        node = Node(
+        node = ExtractionNode(
             raw_post_id=raw_post.id,
             domain=domain,
             node_type=n.node_type,
@@ -315,6 +407,8 @@ async def extract_generic(
             summary=n.summary[:30],
             abstract=n.abstract[:100] if n.abstract else None,
             metadata_json=json.dumps(n.metadata, ensure_ascii=False) if n.metadata else None,
+            valid_from=_parse_date(n.valid_from),
+            valid_until=_parse_date(n.valid_until),
         )
         session.add(node)
         db_nodes.append(node)
@@ -326,67 +420,50 @@ async def extract_generic(
 
     logger.info(f"[Generic] Call 1: {len(db_nodes)} nodes written (domain={domain})")
 
-    # ── Call 2：发现边 + 生成摘要（大文档自动分批）──────────────────────────
+    # ── Call 2：发现边 + 生成摘要（大文档自动分批，批量提交）──────────────
     nodes_for_llm = [
         {"temp_id": n.temp_id, "node_type": n.node_type, "claim": n.claim, "summary": n.summary, "abstract": n.abstract}
         for n in valid_nodes
     ]
 
-    # 分批策略：节点过多时拆成多批 Call 2，每批 ≤40 节点
-    _CALL2_BATCH = 40
-    summary = None
-    one_liner = None
+    _CALL2_BATCH_SIZE = 40
     edges_written = 0
-
-    if len(nodes_for_llm) <= _CALL2_BATCH:
-        # 单批
-        node_batches = [nodes_for_llm]
-    else:
-        # 多批：按 temp_id 顺序拆分
-        node_batches = [
-            nodes_for_llm[i:i + _CALL2_BATCH]
-            for i in range(0, len(nodes_for_llm), _CALL2_BATCH)
-        ]
-        logger.info(f"[Generic] Call 2 batched: {len(nodes_for_llm)} nodes → {len(node_batches)} batches")
-
     content_for_call2 = content[:15000] if len(content) > 15000 else content
 
-    for batch_idx, batch in enumerate(node_batches):
-        nodes_json = json.dumps(batch, ensure_ascii=False, indent=2)
-        user2 = prompt_module.build_user_message_call2(content_for_call2, nodes_json)
-        raw2 = await call_llm(prompt_module.SYSTEM_CALL2, user2, _CALL2_TOKENS)
+    if len(nodes_for_llm) <= _CALL2_BATCH_SIZE:
+        node_batches = [nodes_for_llm]
+    else:
+        node_batches = [
+            nodes_for_llm[i:i + _CALL2_BATCH_SIZE]
+            for i in range(0, len(nodes_for_llm), _CALL2_BATCH_SIZE)
+        ]
+        logger.info(f"[Generic] Call 2: {len(nodes_for_llm)} nodes → {len(node_batches)} batches")
 
-        if raw2 is not None:
-            result2 = parse_json(raw2, EdgeExtractionResult, "generic_call2")
-            if result2 is not None:
-                # 只取第一批的摘要（最完整）
-                if batch_idx == 0:
-                    summary = result2.summary
-                    one_liner = result2.one_liner
+    # 批量提交 Call 2
+    edge_results, summary, one_liner = await _call2_batch(
+        prompt_module, node_batches, content_for_call2, call_llm, parse_json,
+    )
 
-                for e in result2.edges:
-                    src_id = temp_id_to_db_id.get(e.source_id)
-                    tgt_id = temp_id_to_db_id.get(e.target_id)
-                    if src_id is None or tgt_id is None:
-                        logger.warning(
-                            f"[Generic] Edge ref invalid: {e.source_id}→{e.target_id}"
-                        )
-                        continue
-                    if src_id == tgt_id:
-                        continue
+    for result2 in edge_results:
+        for e in result2.edges:
+            src_id = temp_id_to_db_id.get(e.source_id)
+            tgt_id = temp_id_to_db_id.get(e.target_id)
+            if src_id is None or tgt_id is None:
+                logger.warning(f"[Generic] Edge ref invalid: {e.source_id}→{e.target_id}")
+                continue
+            if src_id == tgt_id:
+                continue
 
-                    edge = Edge(
-                        source_node_id=src_id,
-                        target_node_id=tgt_id,
-                        note=e.note[:80] if e.note else None,
-                        added_by_post_id=raw_post.id,
-                    )
-                    session.add(edge)
-                    edges_written += 1
+            edge = ExtractionEdge(
+                source_node_id=src_id,
+                target_node_id=tgt_id,
+                note=e.note[:80] if e.note else None,
+                added_by_post_id=raw_post.id,
+            )
+            session.add(edge)
+            edges_written += 1
 
-                await session.flush()
-        else:
-            logger.warning(f"[Generic] Call 2 batch {batch_idx+1} LLM returned None")
+    await session.flush()
 
     # ── 更新 RawPost ──────────────────────────────────────────────────────
     raw_post.is_processed = True

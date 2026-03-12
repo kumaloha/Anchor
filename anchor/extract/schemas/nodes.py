@@ -19,6 +19,8 @@ class ExtractedNode(BaseModel):
     summary: str           # ≤15字
     abstract: Optional[str] = None  # 一句话总结 (≤50字)
     metadata: Optional[dict] = None
+    valid_from: Optional[str] = None   # 生效日期 YYYY-MM-DD（LLM 判断）
+    valid_until: Optional[str] = None  # 失效日期 YYYY-MM-DD（LLM 判断）
 
 
 class NodeExtractionResult(BaseModel):

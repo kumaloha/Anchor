@@ -73,9 +73,9 @@ class Settings(BaseSettings):
         return [main, main, main]
 
     # ── Web Search（Layer3 联网核查用）────────────────────────────────────────
-    # Tavily Search API Key（免费注册：https://app.tavily.com）
+    # Serper.dev API Key（免费 2500 credits：https://serper.dev）
     # 不填则 Layer3 事实核查仅使用 LLM 训练知识（无联网能力）
-    tavily_api_key: str = ""
+    serper_api_key: str = ""
 
     # ── Notion ────────────────────────────────────────────────────────────────
     notion_api_key: str = ""
@@ -83,6 +83,14 @@ class Settings(BaseSettings):
     # ── 链路开关 ──────────────────────────────────────────────────────────────
     # 设为 False 可暂停事实验证（仅跑通用判断 + 内容提取），调试时用
     enable_verification: bool = False
+
+    # ── Batch 模式（Qwen/OpenAI 兼容端点 50% 成本优化）────────────────────
+    # 开启后 LLM 调用走 OpenAI Batch API，异步提交 + 轮询获取结果
+    # 仅 llm_provider=openai 时生效；Anthropic 模式自动忽略
+    enable_batch: bool = False
+    # 轮询间隔（秒）和最大等待时间（秒）
+    batch_poll_interval: int = 15
+    batch_max_wait: int = 3600
 
     # ── 宏观数据 API Keys（Layer3 事实核查用）──────────────────────────────────
     # FRED API Key（免费注册：https://fred.stlouisfed.org/docs/api/api_key.html）

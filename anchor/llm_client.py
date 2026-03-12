@@ -3,21 +3,32 @@
 ===============
 屏蔽 Anthropic SDK 和 OpenAI SDK 的差异，提供统一的 chat_completion 接口。
 
+Batch 模式（enable_batch=True + llm_provider=openai）：
+  通过 OpenAI Batch API 提交请求（DashScope/Qwen 兼容），享受 50% 成本折扣。
+  异步提交 JSONL → 轮询 → 下载结果。
+
 配置方式（.env）：
   # 使用 Anthropic（默认）
   LLM_PROVIDER=anthropic
   ANTHROPIC_API_KEY=sk-ant-...
 
-  # 使用 OpenAI 兼容接口（Qwen / DeepSeek / 本地 Ollama 等）
+  # 使用 OpenAI 兼容接口（Qwen / DeepSeek 等）
   LLM_PROVIDER=openai
   LLM_API_KEY=sk-...
   LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
   LLM_MODEL=qwen-plus
+
+  # Batch 模式（50% 折扣）
+  ENABLE_BATCH=true
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from anchor.config import settings
@@ -47,22 +58,47 @@ async def chat_completion(
     return await _anthropic_completion(system, user, max_tokens, model=model)
 
 
+async def batch_chat_completions(
+    requests: list[tuple[str, str, int]],
+    model: str | None = None,
+) -> list[LLMResponse | None]:
+    """批量 LLM 调用。
+
+    当 enable_batch=True 且 llm_provider=openai 时，走 Batch API（50% 折扣）。
+    否则退化为串行实时调用。
+
+    Args:
+        requests: [(system, user, max_tokens), ...]
+        model:    覆盖默认模型
+
+    Returns:
+        与 requests 等长的列表，每个元素为 LLMResponse 或 None（失败）。
+    """
+    if not requests:
+        return []
+
+    # 单条请求直接走实时
+    if len(requests) == 1:
+        r = await chat_completion(*requests[0], model=model)
+        return [r]
+
+    # Batch API 仅 OpenAI 模式 + enable_batch
+    if _is_openai_mode() and settings.enable_batch:
+        return await _openai_batch(requests, model=model)
+
+    # 退化：串行实时调用
+    results = []
+    for sys, usr, max_tok in requests:
+        r = await chat_completion(sys, usr, max_tok, model=model)
+        results.append(r)
+    return results
+
+
 async def transcribe_audio(
     audio_path: str,
     language: str | None = None,
 ) -> str | None:
-    """将音频文件转录为文字（Whisper 兼容 API）。
-
-    优先使用 asr_api_key；若未配置，则尝试复用 llm_api_key（OpenAI 模式）。
-    两者都未配置时返回 None。
-
-    Args:
-        audio_path: 本地音频文件路径（mp3/m4a/webm/wav，≤25 MB）
-        language:   语言代码（如 "zh"、"en"）；None 时由 Whisper 自动检测
-
-    Returns:
-        转录文本；失败时返回 None
-    """
+    """将音频文件转录为文字（Whisper 兼容 API）。"""
     from loguru import logger
 
     api_key  = settings.asr_api_key or settings.llm_api_key
@@ -125,6 +161,157 @@ def _get_anthropic_model() -> str:
 
 def _get_anthropic_vision_model() -> str:
     return settings.llm_vision_model or settings.llm_model or "claude-sonnet-4-6"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Batch API（Qwen DashScope 兼容）
+# ---------------------------------------------------------------------------
+
+
+async def _openai_batch(
+    requests: list[tuple[str, str, int]],
+    model: str | None = None,
+) -> list[LLMResponse | None]:
+    """通过 OpenAI Batch API 提交批量请求，轮询等待结果。
+
+    流程：写 JSONL → 上传文件 → 创建 Batch → 轮询 → 下载结果 → 解析
+    """
+    from openai import AsyncOpenAI
+    from loguru import logger
+
+    use_model = model or _get_openai_model()
+    client = AsyncOpenAI(
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url or None,
+    )
+
+    # ── 1. 写 JSONL 临时文件 ─────────────────────────────────────────────
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".jsonl", delete=False, encoding="utf-8",
+    )
+    try:
+        for i, (sys_msg, usr_msg, max_tok) in enumerate(requests):
+            line = {
+                "custom_id": f"req-{i}",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": use_model,
+                    "messages": [
+                        {"role": "system", "content": sys_msg},
+                        {"role": "user", "content": usr_msg},
+                    ],
+                    "max_tokens": max_tok,
+                },
+            }
+            tmp.write(json.dumps(line, ensure_ascii=False) + "\n")
+        tmp.close()
+
+        logger.info(f"[Batch] 提交 {len(requests)} 个请求 (model={use_model})")
+
+        # ── 2. 上传文件 ──────────────────────────────────────────────────
+        with open(tmp.name, "rb") as f:
+            file_obj = await client.files.create(file=f, purpose="batch")
+        logger.info(f"[Batch] 文件已上传: {file_obj.id}")
+
+        # ── 3. 创建 Batch ────────────────────────────────────────────────
+        batch = await client.batches.create(
+            input_file_id=file_obj.id,
+            endpoint="/v1/chat/completions",
+            completion_window="24h",
+        )
+        logger.info(f"[Batch] 批次已创建: {batch.id}")
+
+        # ── 4. 轮询等待完成 ──────────────────────────────────────────────
+        poll_interval = settings.batch_poll_interval
+        max_wait = settings.batch_max_wait
+        elapsed = 0
+
+        while elapsed < max_wait:
+            batch = await client.batches.retrieve(batch.id)
+            status = batch.status
+
+            if status == "completed":
+                logger.info(
+                    f"[Batch] 完成: {batch.request_counts.completed}/{batch.request_counts.total} "
+                    f"成功, {batch.request_counts.failed} 失败, 耗时 {elapsed}s"
+                )
+                break
+            elif status in ("failed", "expired", "cancelled"):
+                logger.error(f"[Batch] 失败: status={status}")
+                return [None] * len(requests)
+
+            logger.debug(f"[Batch] 等待中: status={status}, elapsed={elapsed}s")
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        if elapsed >= max_wait:
+            logger.error(f"[Batch] 超时: 等待超过 {max_wait}s")
+            return [None] * len(requests)
+
+        # ── 5. 下载结果 ──────────────────────────────────────────────────
+        if not batch.output_file_id:
+            logger.error("[Batch] 无输出文件")
+            return [None] * len(requests)
+
+        output_content = await client.files.content(batch.output_file_id)
+        output_text = output_content.text
+
+        # ── 6. 解析结果 ──────────────────────────────────────────────────
+        result_map: dict[str, LLMResponse | None] = {}
+        for line in output_text.strip().split("\n"):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            custom_id = item["custom_id"]
+            resp_body = item.get("response", {}).get("body", {})
+
+            if item.get("error"):
+                logger.warning(f"[Batch] {custom_id} error: {item['error']}")
+                result_map[custom_id] = None
+                continue
+
+            choices = resp_body.get("choices", [])
+            usage = resp_body.get("usage", {})
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+                result_map[custom_id] = LLMResponse(
+                    content=content,
+                    model=resp_body.get("model", use_model),
+                    input_tokens=usage.get("prompt_tokens", 0),
+                    output_tokens=usage.get("completion_tokens", 0),
+                )
+            else:
+                result_map[custom_id] = None
+
+        # 按原始顺序返回
+        results = []
+        total_in = 0
+        total_out = 0
+        for i in range(len(requests)):
+            r = result_map.get(f"req-{i}")
+            results.append(r)
+            if r:
+                total_in += r.input_tokens
+                total_out += r.output_tokens
+
+        logger.info(
+            f"[Batch] 解析完成: {sum(1 for r in results if r)}/{len(results)} 成功, "
+            f"tokens: in={total_in} out={total_out}"
+        )
+        return results
+
+    except Exception as exc:
+        logger.error(f"[Batch] 异常: {exc}")
+        # 退化为串行实时调用
+        logger.info("[Batch] 退化为串行实时调用")
+        results = []
+        for sys_msg, usr_msg, max_tok in requests:
+            r = await _openai_completion(sys_msg, usr_msg, max_tok, model=model)
+            results.append(r)
+        return results
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

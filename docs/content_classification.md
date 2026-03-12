@@ -125,14 +125,14 @@
 
 | (domain, node_type) | 验证方法 | verdict 枚举值 |
 |---------------------|---------|---------------|
-| (expert, 事实) | Tavily 搜索 + LLM 核实 | credible · vague · unreliable · unavailable |
+| (expert, 事实) | Serper 搜索 + LLM 核实 | credible · vague · unreliable · unavailable |
 | (expert, 判断) | 从支撑边推导 | confirmed · refuted · partial · pending |
-| (expert, 预测) | 时间窗口 + Tavily + LLM | pending · accurate · off_target · wrong |
-| (company, 表现) | Tavily + LLM 核实财务数据 | credible · vague · unreliable · unavailable |
+| (expert, 预测) | 时间窗口 + Serper + LLM | pending · accurate · off_target · wrong |
+| (company, 表现) | Serper + LLM 核实财务数据 | credible · vague · unreliable · unavailable |
 | (policy, 反馈) | 搜索执行新闻 + LLM | implemented · in_progress · stalled · not_started · unknown |
-| (futures, 供给) | Tavily + LLM 核实 | credible · vague · unreliable · unavailable |
-| (futures, 需求) | Tavily + LLM 核实 | credible · vague · unreliable · unavailable |
-| (technology, 效果性能) | Tavily + LLM 核实 | credible · vague · unreliable · unavailable |
+| (futures, 供给) | Serper + LLM 核实 | credible · vague · unreliable · unavailable |
+| (futures, 需求) | Serper + LLM 核实 | credible · vague · unreliable · unavailable |
+| (technology, 效果性能) | Serper + LLM 核实 | credible · vague · unreliable · unavailable |
 
 > **验证门控**：content_nature="一手信息" → 跳过验证（一手信息不验证）
 
