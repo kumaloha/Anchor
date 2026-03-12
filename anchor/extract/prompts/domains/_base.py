@@ -69,14 +69,30 @@ def build_system_call2(domain: str) -> str:
 你是专业的结构化信息分析专家。给定文章内容和已提取的「{domain}」领域节点列表，你需要：
 
 1. 发现节点之间的关系（边），用 source_id / target_id 引用节点的 temp_id
-2. 每条边可选附加 note（≤80字），说明关系的具体含义
-3. 生成一段叙事摘要（summary，≤200字，必须用中文），概括文章的核心内容
-4. 生成一句话总结（one_liner，≤50字，必须用中文），用一句话概括「谁说了什么、核心观点是什么」
+2. 每条边必须指定 edge_type（从下方 12 种合法类型中选择）
+3. 每条边可选附加 note（≤80字），说明关系的具体含义
+4. 生成一段叙事摘要（summary，≤200字，必须用中文），概括文章的核心内容
+5. 生成一句话总结（one_liner，≤50字，必须用中文），用一句话概括「谁说了什么、核心观点是什么」
+
+【12 种边类型定义】
+  causes      — 导致：A 直接导致 B 发生（如：关税提高→成本上升）
+  produces    — 产出：A 产生 B 作为结果（如：方案→效果性能）
+  derives     — 推导：从 A 逻辑推出 B（如：判断→预测）
+  supports    — 支撑：A 是 B 的证据/论据/资源（如：事实→判断）
+  contradicts — 矛盾：A 与 B 相互冲突（如：通胀上行 vs 就业趋弱）
+  implements  — 实现：A 是 B 的具体落地/执行（如：战术→战略）
+  constrains  — 约束：A 限制 B 的范围或可能性（如：约束→战术）
+  amplifies   — 加强：A 放大/促进 B 的效果（如：头寸→缺口放大）
+  mitigates   — 缓解：A 削弱/对冲 B 的效果（如：库存→缓解缺口）
+  resolves    — 解决：A 解决 B 的问题（如：方案→问题）
+  measures    — 量化：A 是 B 的度量/考核指标（如：KPI→目标）
+  competes    — 竞争：A 与 B 相互竞争/替代（如：方案A vs 方案B）
 
 【边发现规则】
 - 只建立文章中有明确逻辑关联的边
 - 避免无意义的全连接
-- source → target 表示"source 支撑/导致/影响 target"
+- source → target 表示"source 对 target 产生上述类型的关系"
+- edge_type 必须是上述 12 种之一，不得自创
 
 输出合法 JSON，不加任何其他文字。\
 """
@@ -156,6 +172,7 @@ def build_user_message_call2(
     {{
       "source_id": "n0",
       "target_id": "n1",
+      "edge_type": "causes|produces|derives|supports|contradicts|implements|constrains|amplifies|mitigates|resolves|measures|competes",
       "note": "≤80字说明"
     }}
   ],

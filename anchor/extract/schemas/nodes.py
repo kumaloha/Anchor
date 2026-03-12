@@ -30,10 +30,18 @@ class NodeExtractionResult(BaseModel):
     nodes: list[ExtractedNode] = []
 
 
+VALID_EDGE_TYPES = {
+    "causes", "produces", "derives", "supports", "contradicts",
+    "implements", "constrains", "amplifies", "mitigates",
+    "resolves", "measures", "competes",
+}
+
+
 class ExtractedEdge(BaseModel):
     """LLM 发现的单条边"""
     source_id: str         # temp_id 引用
     target_id: str
+    edge_type: str = "causes"  # 12 种合法类型之一
     note: Optional[str] = None
 
 

@@ -213,9 +213,9 @@ class ExtractionNode(SQLModel, table=True):
     verdict_evidence: Optional[str] = None
     verdict_verified_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=_utcnow)
-    # 归一化后指向的知识层节点（由 canonicalize 填充）
-    knowledge_node_id: Optional[int] = Field(
-        default=None, foreign_key="knowledge_nodes.id", index=True
+    # 归一化：指向主节点（自己=主节点，他人id=被合并）
+    canonical_node_id: Optional[int] = Field(
+        default=None, foreign_key="extraction_nodes.id", index=True
     )
 
 
@@ -227,7 +227,7 @@ class ExtractionEdge(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     source_node_id: int = Field(foreign_key="extraction_nodes.id", index=True)
     target_node_id: int = Field(foreign_key="extraction_nodes.id", index=True)
-    edge_type: str = "connected"          # 先简单连接，后续加类型
+    edge_type: str = "causes"             # 12种：causes|produces|derives|supports|contradicts|implements|constrains|amplifies|mitigates|resolves|measures|competes
     note: Optional[str] = None            # ≤80字说明
     added_by_post_id: int = Field(foreign_key="raw_posts.id", index=True)
     authority: Optional[int] = None          # 权威等级：0=一手信息，其他=作者 credibility_tier

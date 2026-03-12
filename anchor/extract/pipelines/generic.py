@@ -436,8 +436,13 @@ async def extract_generic(
 
     await session.flush()
 
+    # canonical_node_id 初始指向自己
     for n, db_node in zip(valid_nodes, db_nodes):
         temp_id_to_db_id[n.temp_id] = db_node.id
+        db_node.canonical_node_id = db_node.id
+        session.add(db_node)
+
+    await session.flush()
 
     logger.info(f"[Generic] Call 1: {len(db_nodes)} nodes written (domain={domain})")
 
@@ -465,6 +470,8 @@ async def extract_generic(
         prompt_module, node_batches, content_for_call2, call_llm, parse_json,
     )
 
+    from anchor.extract.schemas.nodes import VALID_EDGE_TYPES
+
     for result2 in edge_results:
         for e in result2.edges:
             src_id = temp_id_to_db_id.get(e.source_id)
@@ -475,9 +482,12 @@ async def extract_generic(
             if src_id == tgt_id:
                 continue
 
+            edge_type = e.edge_type if e.edge_type in VALID_EDGE_TYPES else "causes"
+
             edge = ExtractionEdge(
                 source_node_id=src_id,
                 target_node_id=tgt_id,
+                edge_type=edge_type,
                 note=e.note[:80] if e.note else None,
                 added_by_post_id=raw_post.id,
                 authority=authority,
