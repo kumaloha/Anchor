@@ -10,6 +10,7 @@ Call 2: 发现边 + 生成摘要（一次调用，基于全部节点）
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 
 from loguru import logger
 from sqlmodel import delete
@@ -333,52 +334,52 @@ async def _call2_batch(
     return edge_results, summary, one_liner
 
 
-# ── 主入口 ───────────────────────────────────────────────────────────────
+# ── Compute-only 阶段（纯 LLM 调用，不涉及 DB）──────────────────────────
 
-async def extract_generic(
-    raw_post: RawPost,
-    session: AsyncSession,
+
+@dataclass
+class ExtractionComputeResult:
+    """LLM 提取的中间结果（不含 DB 写入）。"""
+    is_relevant: bool = False
+    skip_reason: str | None = None
+    valid_nodes: list[ExtractedNode] = field(default_factory=list)
+    edge_results: list[EdgeExtractionResult] = field(default_factory=list)
+    summary: str | None = None
+    one_liner: str | None = None
+
+
+async def extract_generic_compute(
     content: str,
     platform: str,
     author: str,
     today: str,
     domain: str,
-    author_intent: str | None = None,
-    force: bool = False,
-) -> dict | None:
-    """统一提取入口：2-call LLM pipeline → Node/Edge 写入 DB。
+) -> ExtractionComputeResult:
+    """纯 LLM 计算阶段：提取节点 + 发现边，不涉及任何 DB 操作。
 
-    Returns:
-        dict with keys: is_relevant_content, skip_reason, nodes, edges, summary
-        or None if LLM call failed.
+    可安全并发调用。返回中间结果，由 extract_generic_write 写入 DB。
     """
     from anchor.extract.prompts.domains import DOMAIN_PROMPTS
     from anchor.extract.pipelines._base import call_llm, parse_json
 
+    result = ExtractionComputeResult()
+
     prompt_module = DOMAIN_PROMPTS.get(domain)
     if prompt_module is None:
         logger.error(f"[Generic] Unknown domain: {domain}")
-        return None
+        return result
 
     valid_types = set(DOMAIN_NODE_TYPES.get(domain, []))
 
-    # ── 清除旧数据 ────────────────────────────────────────────────────────
-    await session.exec(delete(ExtractionEdge).where(ExtractionEdge.added_by_post_id == raw_post.id))
-    await session.exec(delete(ExtractionNode).where(ExtractionNode.raw_post_id == raw_post.id))
-    await session.flush()
-
-    # ── Call 1：提取节点（支持分段）────────────────────────────────────────
+    # ── Call 1：提取节点 ──────────────────────────────────────────────────
     chunks = None
     if hasattr(prompt_module, "chunk_content"):
         chunks = prompt_module.chunk_content(content)
 
-    # 通用智能分段：若域特定分段未触发但内容超长，自动检测文档结构并切割
     if chunks is None and len(content) > _CHUNK_TARGET:
         chunks = _smart_chunk(content, target=_CHUNK_TARGET)
         if chunks:
             logger.info(f"[Generic] Smart chunking: {len(content)} chars → {len(chunks)} chunks")
-
-    valid_nodes: list[ExtractedNode] = []
 
     if chunks:
         logger.info(f"[Generic] Long content ({len(content)} chars) → {len(chunks)} chunks")
@@ -387,38 +388,96 @@ async def extract_generic(
             valid_types, call_llm, parse_json,
         )
     else:
-        # 单次调用
         valid_nodes = await _call1_single(
             prompt_module, content, platform, author, today,
             valid_types, call_llm, parse_json,
         )
 
-    # ── 去重：合并重复主旨节点 ──────────────────────────────────────────
     if chunks and valid_nodes:
         valid_nodes = _dedup_theme_nodes(valid_nodes)
 
     if not valid_nodes:
         logger.info("[Generic] No valid nodes extracted")
+        result.skip_reason = "no valid nodes"
+        return result
+
+    result.valid_nodes = valid_nodes
+    result.is_relevant = True
+
+    logger.info(f"[Generic] Call 1 compute: {len(valid_nodes)} nodes (domain={domain})")
+
+    # ── Call 2：发现边 + 摘要 ─────────────────────────────────────────────
+    nodes_for_llm = [
+        {"temp_id": n.temp_id, "node_type": n.node_type, "claim": n.claim,
+         "summary": n.summary, "abstract": n.abstract}
+        for n in valid_nodes
+    ]
+
+    _CALL2_BATCH_SIZE = 40
+    content_for_call2 = content[:15000] if len(content) > 15000 else content
+
+    if len(nodes_for_llm) <= _CALL2_BATCH_SIZE:
+        node_batches = [nodes_for_llm]
+    else:
+        node_batches = [
+            nodes_for_llm[i:i + _CALL2_BATCH_SIZE]
+            for i in range(0, len(nodes_for_llm), _CALL2_BATCH_SIZE)
+        ]
+        logger.info(f"[Generic] Call 2: {len(nodes_for_llm)} nodes → {len(node_batches)} batches")
+
+    edge_results, summary, one_liner = await _call2_batch(
+        prompt_module, node_batches, content_for_call2, call_llm, parse_json,
+    )
+
+    result.edge_results = edge_results
+    result.summary = summary
+    result.one_liner = one_liner
+
+    logger.info(f"[Generic] Compute done: {len(valid_nodes)} nodes, domain={domain}")
+    return result
+
+
+# ── Write-only 阶段（纯 DB 写入，无 LLM 调用）──────────────────────────
+
+
+async def extract_generic_write(
+    raw_post: RawPost,
+    session: AsyncSession,
+    domain: str,
+    compute_result: ExtractionComputeResult,
+) -> dict | None:
+    """DB 写入阶段：将 compute 阶段的结果写入数据库。
+
+    设计为可串行调用（通过 WritePool FIFO 排队），避免并发写入冲突。
+    """
+    from anchor.extract.schemas.nodes import VALID_EDGE_TYPES
+
+    # ── 清除旧数据 ────────────────────────────────────────────────────────
+    await session.exec(delete(ExtractionEdge).where(ExtractionEdge.added_by_post_id == raw_post.id))
+    await session.exec(delete(ExtractionNode).where(ExtractionNode.raw_post_id == raw_post.id))
+    await session.flush()
+
+    if not compute_result.is_relevant or not compute_result.valid_nodes:
         raw_post.is_processed = True
         raw_post.processed_at = _utcnow()
         session.add(raw_post)
         await session.flush()
         return {
-            "is_relevant_content": len(valid_nodes) == 0 and chunks is None,
-            "skip_reason": "no valid nodes",
+            "is_relevant_content": False,
+            "skip_reason": compute_result.skip_reason or "no valid nodes",
             "nodes": [],
-            "edges": [],
+            "edges": 0,
             "summary": None,
         }
 
     # ── 计算权威等级 ────────────────────────────────────────────────────
     authority = await _resolve_authority(raw_post, session)
 
-    # ── 写入 ExtractionNode 表 ──────────────────────────────────────────
+    # ── 写入节点 ──────────────────────────────────────────────────────────
     temp_id_to_db_id: dict[str, int] = {}
     db_nodes: list[ExtractionNode] = []
 
-    for n in valid_nodes:
+    for n in compute_result.valid_nodes:
         node = ExtractionNode(
             raw_post_id=raw_post.id,
             domain=domain,
@@ -436,43 +495,16 @@ async def extract_generic(
 
     await session.flush()
 
-    # canonical_node_id 初始指向自己
-    for n, db_node in zip(valid_nodes, db_nodes):
+    for n, db_node in zip(compute_result.valid_nodes, db_nodes):
         temp_id_to_db_id[n.temp_id] = db_node.id
         db_node.canonical_node_id = db_node.id
         session.add(db_node)
 
     await session.flush()
 
-    logger.info(f"[Generic] Call 1: {len(db_nodes)} nodes written (domain={domain})")
-
-    # ── Call 2：发现边 + 生成摘要（大文档自动分批，批量提交）──────────────
-    nodes_for_llm = [
-        {"temp_id": n.temp_id, "node_type": n.node_type, "claim": n.claim, "summary": n.summary, "abstract": n.abstract}
-        for n in valid_nodes
-    ]
-
-    _CALL2_BATCH_SIZE = 40
+    # ── 写入边 ────────────────────────────────────────────────────────────
     edges_written = 0
-    content_for_call2 = content[:15000] if len(content) > 15000 else content
-
-    if len(nodes_for_llm) <= _CALL2_BATCH_SIZE:
-        node_batches = [nodes_for_llm]
-    else:
-        node_batches = [
-            nodes_for_llm[i:i + _CALL2_BATCH_SIZE]
-            for i in range(0, len(nodes_for_llm), _CALL2_BATCH_SIZE)
-        ]
-        logger.info(f"[Generic] Call 2: {len(nodes_for_llm)} nodes → {len(node_batches)} batches")
-
-    # 批量提交 Call 2
-    edge_results, summary, one_liner = await _call2_batch(
-        prompt_module, node_batches, content_for_call2, call_llm, parse_json,
-    )
-
-    from anchor.extract.schemas.nodes import VALID_EDGE_TYPES
-
-    for result2 in edge_results:
+    for result2 in compute_result.edge_results:
         for e in result2.edges:
             src_id = temp_id_to_db_id.get(e.source_id)
             tgt_id = temp_id_to_db_id.get(e.target_id)
@@ -500,13 +532,13 @@ async def extract_generic(
     # ── 更新 RawPost ──────────────────────────────────────────────────────
     raw_post.is_processed = True
     raw_post.processed_at = _utcnow()
-    if summary:
-        raw_post.content_summary = summary
+    if compute_result.summary:
+        raw_post.content_summary = compute_result.summary
     session.add(raw_post)
     await session.commit()
 
     logger.info(
-        f"[Generic] Done: {len(db_nodes)} nodes, {edges_written} edges, "
+        f"[Generic] Write done: {len(db_nodes)} nodes, {edges_written} edges, "
         f"domain={domain}"
     )
 
@@ -515,6 +547,36 @@ async def extract_generic(
         "skip_reason": None,
         "nodes": db_nodes,
         "edges": edges_written,
-        "summary": summary,
-        "one_liner": one_liner,
+        "summary": compute_result.summary,
+        "one_liner": compute_result.one_liner,
     }
+
+
+# ── 主入口（向后兼容，串行 compute + write）──────────────────────────────
+
+async def extract_generic(
+    raw_post: RawPost,
+    session: AsyncSession,
+    content: str,
+    platform: str,
+    author: str,
+    today: str,
+    domain: str,
+    author_intent: str | None = None,
+    force: bool = False,
+) -> dict | None:
+    """统一提取入口：2-call LLM pipeline → Node/Edge 写入 DB。
+
+    向后兼容接口，内部调用 compute + write 两阶段。
+    并发场景请直接使用 extract_generic_compute + extract_generic_write。
+
+    Returns:
+        dict with keys: is_relevant_content, skip_reason, nodes, edges, summary
+        or None if LLM call failed.
+    """
+    compute_result = await extract_generic_compute(
+        content, platform, author, today, domain,
+    )
+    return await extract_generic_write(
+        raw_post, session, domain, compute_result,
+    )

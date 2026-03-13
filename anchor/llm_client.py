@@ -315,6 +315,40 @@ async def _openai_batch(
 
 
 # ---------------------------------------------------------------------------
+# Embedding（节点归一化预筛用）
+# ---------------------------------------------------------------------------
+
+
+async def get_embeddings(texts: list[str]) -> list[list[float]] | None:
+    """批量获取文本 embedding 向量。使用 OpenAI 兼容 API。
+
+    Returns:
+        与 texts 等长的向量列表，失败返回 None。
+    """
+    from loguru import logger
+
+    api_key = settings.embedding_api_key or settings.llm_api_key
+    base_url = settings.embedding_base_url or settings.llm_base_url or None
+    model = settings.embedding_model or "text-embedding-v3"
+
+    if not api_key:
+        logger.warning("[Embedding] API key 未配置，跳过 embedding")
+        return None
+
+    try:
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        resp = await client.embeddings.create(model=model, input=texts)
+        vectors = [item.embedding for item in sorted(resp.data, key=lambda x: x.index)]
+        logger.debug(f"[Embedding] {len(texts)} texts → {len(vectors[0])}d vectors")
+        return vectors
+    except Exception as exc:
+        logger.warning(f"[Embedding] 失败: {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # OpenAI 兼容后端（Qwen / DeepSeek 等）
 # ---------------------------------------------------------------------------
 

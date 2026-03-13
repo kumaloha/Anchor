@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     # RSS — 空则使用内置列表
     rss_feeds: str = ""
 
+    # ── Embedding（节点归一化预筛用）──────────────────────────────────────────
+    # 使用 OpenAI 兼容 embedding API；不填则复用 llm_api_key / llm_base_url
+    # Anthropic 无 embedding API，需单独配置 OpenAI 兼容端点（如 DashScope）
+    embedding_api_key: str = ""
+    embedding_base_url: str = ""
+    embedding_model: str = "text-embedding-v3"  # DashScope 默认；OpenAI 用 text-embedding-3-small
+
     # ── 语音转录（YouTube 音频 → 文字）──────────────────────────────────────
     # 使用 OpenAI Whisper 兼容 API；不填则复用 llm_api_key
     asr_api_key: str = ""

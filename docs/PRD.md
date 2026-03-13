@@ -552,33 +552,34 @@ def resolve_content_mode(domain, nature, content_type=None) -> str:
 
 ### 10.1 管线架构
 
-所有 6 个领域使用同一管线 `extract_generic()`，只换提示词：
+所有 6 个领域使用同一管线 `extract_generic()`，只换提示词。
+
+管线已拆分为 **compute + write 两阶段**，支持并发提取：
 
 ```
-extract_generic(raw_post, session, content_mode, ...)
+extract_generic_compute(content, platform, author, today, domain)
+  │
+  ├── Call 1: 提取节点（纯 LLM，可并发）
+  │   输入: content + domain + 领域节点类型定义
+  │   输出: NodeExtractionResult → valid_nodes
+  │   → 验证 node_type ∈ DOMAIN_NODE_TYPES[domain]
+  │
+  ├── Call 2: 发现边 + 生成摘要（纯 LLM，可并发）
+  │   输入: content + Call 1 的节点列表
+  │   输出: EdgeExtractionResult → edge_results + summary
+  │
+  └── 返回: ExtractionComputeResult（无 DB 操作）
+
+extract_generic_write(raw_post, session, domain, compute_result)
   │
   ├── 清除旧数据：DELETE Node/Edge WHERE raw_post_id = ?
-  │
-  ├── Call 1: 提取节点
-  │   输入: content + domain + 领域节点类型定义
-  │   输出: NodeExtractionResult {
-  │            is_relevant_content: bool,
-  │            skip_reason: str?,
-  │            nodes: [{temp_id, node_type, claim, summary, metadata}]
-  │          }
-  │   → 验证 node_type ∈ DOMAIN_NODE_TYPES[domain]
-  │   → 写入 Node 表
-  │
-  ├── Call 2: 发现边 + 生成摘要
-  │   输入: content + Call 1 的节点列表
-  │   输出: EdgeExtractionResult {
-  │            edges: [{source_id, target_id, note}],
-  │            summary: str
-  │          }
-  │   → 写入 Edge 表
-  │   → 更新 RawPost.content_summary
+  ├── 写入 Node 表 + canonical_node_id 初始化
+  ├── 写入 Edge 表
+  ├── 更新 RawPost.content_summary
   │
   └── 返回: {is_relevant_content, nodes, edges, summary, skip_reason}
+
+extract_generic() — 向后兼容包装，串行调用 compute + write
 ```
 
 ### 10.2 Pydantic Schema
@@ -945,6 +946,15 @@ anchor/
 │   ├── author_profiler.py          # 作者档案分析（credibility_tier 1-5）
 │   └── web_searcher.py             # Serper.dev 搜索集成
 │
+├── pipeline/                       # 批量 pipeline 执行
+│   └── concurrent.py              # ConcurrentBatchRunner + WritePool（并发提取 + FIFO 写入）
+│
+├── chains/
+│   ├── content_extraction.py      # Chain 1 封装
+│   ├── general_assessment.py      # Chain 2（2D 分类 + 作者档案）
+│   ├── fact_verification.py       # Chain 3（注册表式验证）
+│   └── canonicalize.py            # 节点归一化（embedding 预筛 + LLM 精判 + Union-Find）
+│
 ├── commands/                       # CLI 命令实现
 │   ├── run_url.py                  # anchor run-url
 │   ├── monitor.py                  # anchor monitor
@@ -1003,12 +1013,25 @@ docs/
 - [x] Web UI（FastAPI，Node/Edge 渲染）
 - [x] arXiv→ar5iv 重定向
 
+### 已完成（v8.1）
+
+- [x] **两层 DB 架构**：ExtractionNode/Edge（per-article）+ KnowledgeNode/Edge（cross-article）
+- [x] **节点归一化**（`anchor/chains/canonicalize.py`）：Embedding 预筛 + LLM 精判 + Union-Find 合并，写回 canonical_node_id
+- [x] **Embedding API 集成**（`anchor/llm_client.py`）：OpenAI 兼容 embedding API，用于归一化预筛
+- [x] **12 种有类型边**：causes / produces / derives / supports / contradicts / implements / constrains / amplifies / mitigates / resolves / measures / competes
+- [x] **权威等级字段**：Node/Edge.authority（0=一手信息，1+=作者 tier）
+- [x] **有效期字段**：valid_from / valid_until（LLM 判断的内容时效性）
+- [x] **并发批量提取**（`anchor/pipeline/concurrent.py`）：
+  - `ConcurrentBatchRunner`：asyncio.Semaphore 控制并发数
+  - `WritePool`：FIFO 队列串行写入 DB，避免并发写入冲突
+  - `extract_generic` 拆分为 `extract_generic_compute`（纯 LLM，可并发）+ `extract_generic_write`（纯 DB，走 WritePool）
+  - 架构：LLM 调用并发 → 提取完放入队列 → DB 写入 FIFO 串行
+
 ### 近期规划
 
 - [ ] Twitter/X 自动监控（订阅流水线集成）
 - [ ] 节点可视化（导出为 PNG/SVG，支持交互式知识图浏览）
 - [ ] 批量处理 API（批量 URL 提交、进度查询）
-- [ ] 跨文章节点去重与归一化（同一概念跨文章合并）
 
 ### 中长期规划
 
@@ -1019,4 +1042,4 @@ docs/
 
 ---
 
-> 文档状态：v8.0（2026-03-12），通用节点+边架构 — 6 领域统一 2-call 管线
+> 文档状态：v8.1（2026-03-12），两层 DB 架构 + 并发提取 + 节点归一化
