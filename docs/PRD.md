@@ -402,7 +402,75 @@ DOMAIN_NODE_TYPES = {
 | `post_quality_assessments` | 单篇内容质量评估 |
 | `author_stats` | 作者综合统计（准确率、可信度评分） |
 
-### 7.6 旧表（v7 遗留，保留只读）
+### 7.6 政策模型表
+
+| 表名 | 描述 | 关键字段 |
+|------|------|---------|
+| `policy_documents` | 政策文件 | title, doc_type(strategy\|plan\|annual\|budget\|monetary\|review), issuing_body, authority_level(top\|ministry_joint\|ministry\|local), period_start, period_end, published_at, parent_doc_id(FK→self) |
+| `policy_directives` | 政策指令（树状） | doc_id(FK), parent_id(FK→self), level(part\|chapter\|section\|directive), title, content, summary, directive_type(goal\|instrument\|resource\|constraint\|accountability), force_direction(promote\|restrict\|regulate\|neutral), specificity(directional\|targeted\|quantified), target_value, sectors_json, entities_json, rationale, rationale_type |
+| `policy_links` | 政策关联 | source_id(FK), target_id(FK), link_type(implements\|funds\|constrains\|supersedes\|enables\|conflicts\|measures) |
+
+### 7.7 公司模型表（巴菲特标准）
+
+**设计原则**：Layer 1 提取层完整覆盖 10-K + Proxy Statement (DEF 14A) 全部内容，为 Layer 2 模型层（商业模式/护城河/财务健康）提供输入。
+
+**数据来源**：
+- **10-K / 年报**：三表、经营议题、叙事、下游/上游商业模式、地域收入、非财务KPI、债务、诉讼、税务、SBC、股东权益
+- **Proxy Statement (DEF 14A)**：管理层薪酬（Summary Compensation Table）、董事薪酬、关联交易、主要持股、CEO Pay Ratio
+
+| 表名 | 描述 | 关键字段 |
+|------|------|---------|
+| `company_profiles` | 公司档案（最小标识） | name, ticker(unique), market(us\|cn_a\|cn_h\|hk\|jp), industry, summary |
+| `company_narratives` | 叙事（管理层承诺） | company_id(FK), narrative(≤300字), capital_required, promised_outcome(≤200字), deadline, status(announced\|in_progress\|delivered\|missed\|abandoned) |
+| `financial_statements` | 财务报表头 | company_id(FK), period, period_type(quarterly\|annual), statement_type, currency, reported_at |
+| `financial_line_items` | 财务科目（长表） | statement_id(FK), item_key, item_label, value, parent_key, ordinal, note |
+| `debt_obligations` | 债务/义务明细 | company_id(FK), period, instrument_name, debt_type(bond\|loan\|lease\|convertible\|credit_facility), principal, interest_rate, maturity_date, is_secured, is_current |
+| `litigations` | 诉讼/或有事项 | company_id(FK), case_name, case_type(lawsuit\|regulatory\|patent\|antitrust\|environmental\|tax), status, counterparty, claimed_amount, accrued_amount, description, resolution |
+| `executive_compensations` | 管理层/董事薪酬 | company_id(FK), period, role_type(executive\|director), name, title, base_salary(董事=fees_earned_cash), bonus, stock_awards, option_awards, non_equity_incentive, other_comp, total_comp, pay_ratio(CEO only), median_employee_comp(CEO only) |
+| `stock_ownership` | 持股信息 | company_id(FK), period, name, title, shares_beneficially_owned, percent_of_class |
+| `downstream_segments` | 下游（客户或收入流，每期一行） | company_id(FK), period, segment(业务线,null=公司级), customer_name(客户名或收入流名), customer_type, products, channels, revenue, revenue_pct, growth_yoy, backlog($M), backlog_note, pricing_model, contract_duration, revenue_type(product_sale\|subscription\|license\|...), is_recurring, recognition_method(point_in_time\|over_time), description |
+| `upstream_segments` | 上游（每供应商每期一行） | company_id(FK), period, segment(业务线,null=公司级), supplier_name, supply_type(foundry\|memory\|assembly_test\|substrate\|component\|contract_mfg\|software\|logistics), material_or_service, process_node, geographic_location, is_sole_source, purchase_obligation(采购义务$M), lead_time, contract_type, prepaid_amount, concentration_risk, description |
+| `geographic_revenues` | 地域收入 | company_id(FK), period, region, revenue, revenue_share, growth_yoy |
+| `non_financial_kpis` | 非财务KPI | company_id(FK), period, kpi_name, kpi_value, kpi_unit, yoy_change, category(workforce\|customer\|product\|esg\|operational) |
+| `related_party_transactions` | 关联交易 | company_id(FK), period, related_party, relationship(director\|officer\|major_shareholder\|subsidiary\|affiliate\|family), transaction_type(sale\|purchase\|lease\|loan\|guarantee\|service\|license\|other), amount, terms, is_ongoing, description |
+| `tech_insights` | 技术洞察（论文/专利共用，支持演进链 DAG） | raw_post_id(FK), source_type(paper\|patent), technology_domain(GPU\|HBM\|interconnect\|...), problem, solutions_json(list), effects_json(list), limitations_json(list), next_problem_id(FK→self, 演进链) |
+| `patent_rights` | 专利法律权利 | raw_post_id(FK), patent_number, title, claims_summary, claims_count, prior_art_json(list), assignee, inventors, filing_date, priority_date, expiry_date, legal_status(active\|expired\|pending\|abandoned), patent_family_json, classification(CPC/IPC) |
+| `patent_commercials` | 专利商业化 | raw_post_id(FK), patent_number, event_type(license\|litigation\|cross_license\|FRAND\|sale\|pool), counterparty, amount($M), rate, license_type(exclusive\|non-exclusive\|cross_license\|FRAND), territory, duration, status, source, description |
+
+**`statement_type` 枚举**（FinancialStatement.statement_type）：
+- `income` — 利润表
+- `balance_sheet` — 资产负债表
+- `cashflow` — 现金流量表
+- `equity` — 股东权益变动表
+- `tax_detail` — 所得税明细（有效税率、递延税项等）
+- `sbc_detail` — 股权激励明细（SBC 费用、未归属股份等）
+
+**Layer 1 提取覆盖 18 张表**（10-K + Proxy Statement）：
+
+来源: 10-K：
+1. 利润表 (`income`)
+2. 资产负债表 (`balance_sheet`)
+3. 现金流量表 (`cashflow`)
+4. 股东权益变动表 (`equity`)
+5. 所得税明细 (`tax_detail`)
+6. 股权激励明细 (`sbc_detail`)
+7. 债务/义务明细 (`debt_obligations`)
+8. 诉讼/或有事项 (`litigations`)
+9. 经营议题表 (`operational_issues`) — 每行一个经营议题，含表现(定性)/归因/风险/指引四列
+10. 叙事表 (`company_narratives`)
+11. 下游表 (`downstream_segments`) — 每客户每期一行，segment 可选(null=公司级)，含 backlog
+12. 上游表 (`upstream_segments`) — 每供应商每期一行，segment 可选(null=公司级)，含采购义务
+13. 地域收入表 (`geographic_revenues`)
+14. 非财务KPI表 (`non_financial_kpis`)
+
+来源: Proxy Statement (DEF 14A)：
+15. 管理层/董事薪酬 (`executive_compensations`, role_type 区分) — 含 CEO Pay Ratio
+16. 持股信息 (`stock_ownership`)
+17. 关联交易表 (`related_party_transactions`)
+
+**经营议题表设计**：来源为 CEO致股东信/MD&A。每行代表一个经营议题（如"数据中心供应链"），表现字段为定性描述（财务数字在三表），归因/风险/指引为该议题的其他维度。后续事项（Subsequent Events）归入经营议题表。
+
+### 7.8 旧表（v7 遗留，保留只读）
 
 以下表在 v8 中不再写入新数据，DB 中保留供历史数据查询：
 
@@ -1029,6 +1097,10 @@ docs/
 
 ### 近期规划
 
+- [ ] **两层专利/技术分析架构**：
+  - **浅层（统计）**：PatentsView API 批量拉取专利景观数据 → 专利量排名、被引次数、技术覆盖度、时间序列趋势（`scripts/patentsview_landscape.py`）
+  - **深层（理解）**：TechInsight 演进链 DAG — 局限 = 下一代问题的种子，`next_problem_id` 自引用构成技术路线图；`technology_domain` 标签支持按领域过滤
+  - 回答三个战略问题：谁在主导行业标准 / 谁的技术有明显领先优势 / 是否有代际差
 - [ ] Twitter/X 自动监控（订阅流水线集成）
 - [ ] 节点可视化（导出为 PNG/SVG，支持交互式知识图浏览）
 - [ ] 批量处理 API（批量 URL 提交、进度查询）

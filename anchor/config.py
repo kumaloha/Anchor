@@ -11,7 +11,8 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
 
     # LLM 统一配置（优先级高于 anthropic_api_key）
-    # llm_provider: "anthropic" | "openai"（兼容 Qwen/DeepSeek 等 OpenAI 接口）
+    # llm_provider: "anthropic" | "openai"（兼容 Qwen/DeepSeek/Ollama 等 OpenAI 接口）
+    # Ollama 本地模型示例：LLM_PROVIDER=openai, LLM_BASE_URL=http://localhost:11434/v1, LLM_MODEL=qwen2.5:14b
     llm_provider: str = "anthropic"
     llm_api_key: str = ""
     llm_base_url: str = ""
