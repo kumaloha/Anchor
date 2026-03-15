@@ -144,7 +144,10 @@ async def chat_completion_multimodal(
 
 
 def _is_openai_mode() -> bool:
-    return settings.llm_provider.lower() == "openai" and bool(settings.llm_api_key)
+    # Ollama 等本地模型无需 API key，有 base_url 即可
+    return settings.llm_provider.lower() == "openai" and (
+        bool(settings.llm_api_key) or bool(settings.llm_base_url)
+    )
 
 
 def _get_openai_model() -> str:
@@ -181,7 +184,7 @@ async def _openai_batch(
 
     use_model = model or _get_openai_model()
     client = AsyncOpenAI(
-        api_key=settings.llm_api_key,
+        api_key=settings.llm_api_key or "ollama",
         base_url=settings.llm_base_url or None,
     )
 
@@ -327,12 +330,12 @@ async def get_embeddings(texts: list[str]) -> list[list[float]] | None:
     """
     from loguru import logger
 
-    api_key = settings.embedding_api_key or settings.llm_api_key
+    api_key = settings.embedding_api_key or settings.llm_api_key or "ollama"
     base_url = settings.embedding_base_url or settings.llm_base_url or None
     model = settings.embedding_model or "text-embedding-v3"
 
-    if not api_key:
-        logger.warning("[Embedding] API key 未配置，跳过 embedding")
+    if api_key == "ollama" and not base_url:
+        logger.warning("[Embedding] API key 和 base_url 均未配置，跳过 embedding")
         return None
 
     try:
@@ -406,7 +409,7 @@ async def _openai_completion(
     from openai import AsyncOpenAI, APIError
 
     client = AsyncOpenAI(
-        api_key=settings.llm_api_key,
+        api_key=settings.llm_api_key or "ollama",  # Ollama 不需要真实 key
         base_url=settings.llm_base_url or None,
     )
     try:
@@ -477,7 +480,7 @@ async def _openai_vision_completion(
     from openai import AsyncOpenAI, APIError
 
     client = AsyncOpenAI(
-        api_key=settings.llm_api_key,
+        api_key=settings.llm_api_key or "ollama",
         base_url=settings.llm_base_url or None,
     )
     try:
