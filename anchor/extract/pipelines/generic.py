@@ -497,10 +497,6 @@ async def extract_generic_write(
 
     for n, db_node in zip(compute_result.valid_nodes, db_nodes):
         temp_id_to_db_id[n.temp_id] = db_node.id
-        db_node.canonical_node_id = db_node.id
-        session.add(db_node)
-
-    await session.flush()
 
     # ── 写入边 ────────────────────────────────────────────────────────────
     edges_written = 0
