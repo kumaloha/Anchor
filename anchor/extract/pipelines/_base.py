@@ -69,6 +69,31 @@ def parse_json(raw: str, model_cls, step_name: str):
         return None
 
 
+# ── 通用安全转换工具 ─────────────────────────────────────────────────────
+
+
+def safe_float(val) -> float | None:
+    """清洗并转换为 float，处理 '0.309%' 等。"""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip().rstrip("%")
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def safe_str(val) -> str | None:
+    """任意值转字符串，list 自动拼接。"""
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return ", ".join(str(v) for v in val) if val else None
+    return str(val)
+
+
 async def get_or_create_author(session: AsyncSession, raw_post: RawPost) -> Author:
     if raw_post.author_platform_id:
         result = await session.exec(

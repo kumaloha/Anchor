@@ -1,11 +1,11 @@
 """
-router.py — Extractor 门面（v8 — 统一 Node/Edge 架构）
-======================================================
-所有 content_mode 统一分发到 generic pipeline，只换领域提示词。
+router.py — Extractor 门面（v9 — 域专用管线架构）
+==================================================
+company 域走专用提取管线（13 张表），其他域暂时禁用。
 
 Usage:
     extractor = Extractor()
-    result = await extractor.extract(raw_post, session, content_mode="expert")
+    result = await extractor.extract(raw_post, session, content_mode="company")
 """
 
 from __future__ import annotations
@@ -15,14 +15,15 @@ import datetime
 from loguru import logger
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from anchor.config import settings
 from anchor.models import RawPost
 
 
 class Extractor:
-    """观点提取器（v8 统一 Node/Edge 管线）"""
+    """观点提取器（v9 域专用管线）"""
 
     def __init__(self) -> None:
-        logger.info("Extractor initialized (v8 generic pipeline)")
+        logger.info("Extractor initialized (v9 domain-specific pipelines)")
 
     async def extract(
         self,
@@ -32,7 +33,7 @@ class Extractor:
         author_intent: str | None = None,
         force: bool = False,
     ) -> dict | None:
-        """对一条帖子执行节点+边提取，写入数据库，返回结果。
+        """对一条帖子执行提取，写入数据库，返回结果。
 
         Args:
             raw_post:      待处理的原始帖子
@@ -51,6 +52,17 @@ class Extractor:
             )
             return None
 
+        # ── 域开关检查 ─────────────────────────────────────────────────
+        if not settings.is_domain_enabled(content_mode):
+            logger.info(
+                f"[Extractor] Domain '{content_mode}' is disabled, skipping extraction"
+            )
+            return {
+                "is_relevant_content": False,
+                "skip_reason": f"域 '{content_mode}' 已禁用，跳过提取",
+                "domain_disabled": True,
+            }
+
         content = raw_post.enriched_content or raw_post.content
 
         if raw_post.media_json:
@@ -63,12 +75,18 @@ class Extractor:
         platform = raw_post.source
         author = raw_post.author_name
 
-        logger.info(f"[v8] Extracting RawPost id={raw_post.id} domain={content_mode}")
+        logger.info(f"[Extractor] Extracting RawPost id={raw_post.id} domain={content_mode}")
 
-        from anchor.extract.pipelines.generic import extract_generic
-        return await extract_generic(
-            raw_post, session, content, platform, author, today,
-            domain=content_mode,
-            author_intent=author_intent,
-            force=force,
-        )
+        # ── 域路由 ─────────────────────────────────────────────────────
+        if content_mode == "company":
+            from anchor.extract.pipelines.company import extract_company
+            return await extract_company(
+                raw_post, session, content, platform, author, today,
+            )
+
+        # 其他域暂时禁用（不应走到这里，因为域开关已过滤）
+        logger.warning(f"[Extractor] Domain '{content_mode}' has no pipeline, skipping")
+        return {
+            "is_relevant_content": False,
+            "skip_reason": f"域 '{content_mode}' 尚无专用管线",
+        }

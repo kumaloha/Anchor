@@ -1,20 +1,9 @@
 """
-事实验证 — Fact Verification（v8 Node/Edge 架构）
-===================================================
-输入：raw_post_id
-输出：Node.verdict 字段写入 DB
-
-基于 (domain, node_type) 的验证注册表：
-  ("expert", "事实")  → verify_fact     — 联网搜索核实
-  ("expert", "判断")  → derive_verdict  — 从支撑边推导
-  ("expert", "预测")  → monitor_prediction — 时间窗口监控
-  ("company", "表现") → verify_fact     — 财务数据核实
-  ("policy", "反馈")  → verify_fact     — 执行追踪
-
-验证搜索策略：
-  1. 用原文语言搜索（original_claim 或 claim）
-  2. 用英文交叉验证（自动翻译关键词）
-  3. 综合两组搜索结果给 LLM 判断
+事实验证 — Fact Verification
+=============================
+注意：v9 迁移后 ExtractionNode/Edge 已移除。
+company 域跳过验证（直接写入专用表），其他域暂时禁用。
+此模块保留供未来域专用验证管线使用。
 
 一手信息门控保留：content_nature="一手信息" 的内容跳过验证。
 """
@@ -30,7 +19,7 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from anchor.llm_client import batch_chat_completions, chat_completion
-from anchor.models import ExtractionEdge, ExtractionNode, RawPost, _utcnow
+from anchor.models import RawPost, _utcnow
 from anchor.verify.web_searcher import format_search_results, web_search
 
 _MAX_TOKENS = 1024
@@ -260,7 +249,8 @@ VERIFIABLE_TYPES: dict[tuple[str, str], object] = {
 async def run_verification(raw_post_id: int, session: AsyncSession) -> dict:
     """事实验证：对某帖子的所有可验证节点进行验证。
 
-    使用 Batch API 批量处理所有搜索+LLM 调用，节省 50% 成本。
+    注意：company 域已迁移到专用管线（无 ExtractionNode），直接跳过。
+    其他域暂时禁用，此函数仅保留向后兼容。
     """
     logger.info(f"[Verification] Starting for raw_post_id={raw_post_id}")
 
@@ -275,12 +265,30 @@ async def run_verification(raw_post_id: int, session: AsyncSession) -> dict:
             "skip_reason": "一手信息不验证",
         }
 
-    # ── 加载该帖子的所有节点 ───────────────────────────────────────────────
-    nodes = list(
-        (await session.exec(
-            select(ExtractionNode).where(ExtractionNode.raw_post_id == raw_post_id)
-        )).all()
+    # ── company 域跳过（已迁移到专用管线，无 ExtractionNode）─────────────
+    if post and post.content_domain == "公司":
+        logger.info(f"[Verification] Skip: company domain uses dedicated pipeline")
+        return {
+            "raw_post_id": raw_post_id,
+            "nodes_verified": 0,
+            "skipped": True,
+            "skip_reason": "company 域使用专用管线，跳过 Node/Edge 验证",
+        }
+
+    # ── 加载该帖子的所有节点（依赖旧 ExtractionNode 表，仅旧数据可用）────
+    logger.warning(
+        f"[Verification] ExtractionNode/Edge 已移除，"
+        f"非 company 域的验证暂不可用 (raw_post_id={raw_post_id})"
     )
+    return {
+        "raw_post_id": raw_post_id,
+        "nodes_verified": 0,
+        "skipped": True,
+        "skip_reason": "ExtractionNode/Edge 已移除，验证暂不可用",
+    }
+
+    # ── 以下代码保留供未来域专用验证管线参考 ────────────────────────────────
+    nodes = []  # type: ignore[unreachable]
 
     # ── 分类：哪些需要搜索验证、哪些从边推导 ─────────────────────────────
     search_nodes: list[Node] = []       # 需要搜索 + LLM

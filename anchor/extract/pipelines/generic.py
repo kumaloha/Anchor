@@ -1,8 +1,10 @@
 """
-pipelines/generic.py — 统一 2-call 提取管线
-=============================================
-所有 6 个领域使用同一管线，只换提示词。
+pipelines/generic.py — 统一 2-call 提取管线（已废弃）
+=====================================================
+注意：v9 迁移后此管线不再用于新域。保留供参考。
+所有已启用域使用各自的专用管线。
 
+原架构：所有 6 个领域使用同一管线，只换提示词。
 Call 1: 提取节点（长文档自动分段，多次调用）
 Call 2: 发现边 + 生成摘要（一次调用，基于全部节点）
 """
@@ -16,12 +18,22 @@ from loguru import logger
 from sqlmodel import delete
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from anchor.models import DOMAIN_NODE_TYPES, ExtractionEdge, ExtractionNode, RawPost, _utcnow
+from anchor.models import RawPost, _utcnow
 from anchor.extract.schemas.nodes import (
     EdgeExtractionResult,
     ExtractedNode,
     NodeExtractionResult,
 )
+
+# DOMAIN_NODE_TYPES 已从 models.py 移除，此处内联保留供 generic pipeline 使用
+DOMAIN_NODE_TYPES = {
+    "policy":     ["主旨", "目标", "战略", "战术", "资源", "考核", "约束", "反馈", "外溢"],
+    "industry":   ["格局", "驱动", "趋势", "技术路线", "资金流向", "机会威胁", "标的"],
+    "technology": ["问题", "方案", "效果性能", "局限场景", "玩家"],
+    "futures":    ["供给", "需求", "库存", "头寸", "冲击", "缺口"],
+    "company":    ["叙事"],
+    "expert":     ["事实", "判断", "预测", "建议"],
+}
 
 import re as _re
 from datetime import date as _date
@@ -446,106 +458,15 @@ async def extract_generic_write(
     domain: str,
     compute_result: ExtractionComputeResult,
 ) -> dict | None:
-    """DB 写入阶段：将 compute 阶段的结果写入数据库。
+    """DB 写入阶段（已废弃）。
 
-    设计为可串行调用（通过 WritePool FIFO 排队），避免并发写入冲突。
+    ExtractionNode/Edge 模型已移除。此函数仅保留签名供向后兼容。
+    所有已启用域应使用各自的专用 write 函数。
     """
-    from anchor.extract.schemas.nodes import VALID_EDGE_TYPES
-
-    # ── 清除旧数据 ────────────────────────────────────────────────────────
-    await session.exec(delete(ExtractionEdge).where(ExtractionEdge.added_by_post_id == raw_post.id))
-    await session.exec(delete(ExtractionNode).where(ExtractionNode.raw_post_id == raw_post.id))
-    await session.flush()
-
-    if not compute_result.is_relevant or not compute_result.valid_nodes:
-        raw_post.is_processed = True
-        raw_post.processed_at = _utcnow()
-        session.add(raw_post)
-        await session.flush()
-        return {
-            "is_relevant_content": False,
-            "skip_reason": compute_result.skip_reason or "no valid nodes",
-            "nodes": [],
-            "edges": 0,
-            "summary": None,
-        }
-
-    # ── 计算权威等级 ────────────────────────────────────────────────────
-    authority = await _resolve_authority(raw_post, session)
-
-    # ── 写入节点 ──────────────────────────────────────────────────────────
-    temp_id_to_db_id: dict[str, int] = {}
-    db_nodes: list[ExtractionNode] = []
-
-    for n in compute_result.valid_nodes:
-        node = ExtractionNode(
-            raw_post_id=raw_post.id,
-            domain=domain,
-            node_type=n.node_type,
-            claim=n.claim[:300],
-            summary=n.summary[:30],
-            abstract=n.abstract[:100] if n.abstract else None,
-            metadata_json=json.dumps(n.metadata, ensure_ascii=False) if n.metadata else None,
-            valid_from=_parse_date(n.valid_from),
-            valid_until=_parse_date(n.valid_until),
-            authority=authority,
-        )
-        session.add(node)
-        db_nodes.append(node)
-
-    await session.flush()
-
-    for n, db_node in zip(compute_result.valid_nodes, db_nodes):
-        temp_id_to_db_id[n.temp_id] = db_node.id
-
-    # ── 写入边 ────────────────────────────────────────────────────────────
-    edges_written = 0
-    for result2 in compute_result.edge_results:
-        for e in result2.edges:
-            src_id = temp_id_to_db_id.get(e.source_id)
-            tgt_id = temp_id_to_db_id.get(e.target_id)
-            if src_id is None or tgt_id is None:
-                logger.warning(f"[Generic] Edge ref invalid: {e.source_id}→{e.target_id}")
-                continue
-            if src_id == tgt_id:
-                continue
-
-            edge_type = e.edge_type if e.edge_type in VALID_EDGE_TYPES else "causes"
-
-            edge = ExtractionEdge(
-                source_node_id=src_id,
-                target_node_id=tgt_id,
-                edge_type=edge_type,
-                note=e.note[:80] if e.note else None,
-                added_by_post_id=raw_post.id,
-                authority=authority,
-            )
-            session.add(edge)
-            edges_written += 1
-
-    await session.flush()
-
-    # ── 更新 RawPost ──────────────────────────────────────────────────────
-    raw_post.is_processed = True
-    raw_post.processed_at = _utcnow()
-    if compute_result.summary:
-        raw_post.content_summary = compute_result.summary
-    session.add(raw_post)
-    await session.commit()
-
-    logger.info(
-        f"[Generic] Write done: {len(db_nodes)} nodes, {edges_written} edges, "
-        f"domain={domain}"
+    raise NotImplementedError(
+        f"extract_generic_write 已废弃：ExtractionNode/Edge 模型已移除。"
+        f"域 '{domain}' 应使用专用管线。"
     )
-
-    return {
-        "is_relevant_content": True,
-        "skip_reason": None,
-        "nodes": db_nodes,
-        "edges": edges_written,
-        "summary": compute_result.summary,
-        "one_liner": compute_result.one_liner,
-    }
 
 
 # ── 主入口（向后兼容，串行 compute + write）──────────────────────────────
@@ -561,18 +482,11 @@ async def extract_generic(
     author_intent: str | None = None,
     force: bool = False,
 ) -> dict | None:
-    """统一提取入口：2-call LLM pipeline → Node/Edge 写入 DB。
+    """统一提取入口（已废弃）。
 
-    向后兼容接口，内部调用 compute + write 两阶段。
-    并发场景请直接使用 extract_generic_compute + extract_generic_write。
-
-    Returns:
-        dict with keys: is_relevant_content, skip_reason, nodes, edges, summary
-        or None if LLM call failed.
+    ExtractionNode/Edge 模型已移除。所有已启用域应使用各自的专用管线。
     """
-    compute_result = await extract_generic_compute(
-        content, platform, author, today, domain,
-    )
-    return await extract_generic_write(
-        raw_post, session, domain, compute_result,
+    raise NotImplementedError(
+        f"extract_generic 已废弃：ExtractionNode/Edge 模型已移除。"
+        f"域 '{domain}' 应使用专用管线。"
     )

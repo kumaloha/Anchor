@@ -191,24 +191,40 @@ async def _run_pipeline(raw_post_id: int, label: str) -> None:
             author_intent=pre.get("author_intent"),
             force=True,
         )
-    if result3 and result3.get("is_relevant_content"):
-        nodes = result3.get("nodes", [])
-        edges = result3.get("edges", 0)
-        n_count = len(nodes) if isinstance(nodes, list) else nodes
-        print(f"      {n_count} nodes  {edges} edges  domain={content_mode}")
+    if result3 and result3.get("domain_disabled"):
+        print(f"      域 '{content_mode}' 已禁用，跳过提取")
+    elif result3 and result3.get("is_relevant_content"):
+        # company 域返回 table_counts 而非 nodes/edges
+        table_counts = result3.get("table_counts")
+        if table_counts is not None:
+            # Company 域专用展示
+            company_name = result3.get("company_name", "?")
+            company_ticker = result3.get("company_ticker", "?")
+            total_rows = sum(table_counts.values())
+            print(f"      公司: {company_name} ({company_ticker})")
+            print(f"      写入 {total_rows} 行，分布于 {len([v for v in table_counts.values() if v])} 张表：")
+            for tbl, cnt in table_counts.items():
+                if cnt > 0:
+                    print(f"        {tbl}: {cnt}")
+        else:
+            # 通用 Node/Edge 展示（向后兼容）
+            nodes = result3.get("nodes", [])
+            edges = result3.get("edges", 0)
+            n_count = len(nodes) if isinstance(nodes, list) else nodes
+            print(f"      {n_count} nodes  {edges} edges  domain={content_mode}")
+            if isinstance(nodes, list):
+                for node in nodes:
+                    node_type = node.node_type if hasattr(node, "node_type") else "?"
+                    abstract = node.abstract if hasattr(node, "abstract") and node.abstract else None
+                    claim = node.claim if hasattr(node, "claim") else str(node)
+                    label = abstract or claim[:80]
+                    print(f"        [{node_type}] {label}")
         one_liner = result3.get("one_liner")
         if one_liner:
             print(f"      一句话: {one_liner}")
         summary = result3.get("summary")
         if summary:
             print(f"      摘要: {summary}")
-        if isinstance(nodes, list):
-            for node in nodes:
-                node_type = node.node_type if hasattr(node, "node_type") else "?"
-                abstract = node.abstract if hasattr(node, "abstract") and node.abstract else None
-                claim = node.claim if hasattr(node, "claim") else str(node)
-                label = abstract or claim[:80]
-                print(f"        [{node_type}] {label}")
     elif result3:
         print(f"      内容不相关: {result3.get('skip_reason')}")
     else:
@@ -236,7 +252,7 @@ async def _refetch_and_update(raw_post_id: int, url: str) -> None:
     """重新抓取 URL 内容，更新 RawPost 并清除旧实体数据。"""
     from anchor.database.session import AsyncSessionLocal
     from anchor.collect.input_handler import parse_url, _get_fetcher
-    from anchor.models import ExtractionEdge, ExtractionNode, RawPost, PostQualityAssessment
+    from anchor.models import RawPost, PostQualityAssessment
     from sqlmodel import select, delete
 
     parsed = parse_url(url)
@@ -260,9 +276,7 @@ async def _refetch_and_update(raw_post_id: int, url: str) -> None:
         rp.collected_at = datetime.utcnow()
         s.add(rp)
 
-        # 清除旧数据（Node/Edge + PostQualityAssessment）
-        await s.exec(delete(ExtractionEdge).where(ExtractionEdge.added_by_post_id == raw_post_id))
-        await s.exec(delete(ExtractionNode).where(ExtractionNode.raw_post_id == raw_post_id))
+        # 清除旧数据（PostQualityAssessment）
         await s.exec(delete(PostQualityAssessment).where(PostQualityAssessment.raw_post_id == raw_post_id))
 
         await s.commit()

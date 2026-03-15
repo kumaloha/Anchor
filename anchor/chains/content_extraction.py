@@ -24,7 +24,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from anchor.extract.extractor import Extractor
 from anchor.collect.input_handler import parse_url, process_url
-from anchor.models import ExtractionEdge, ExtractionNode, RawPost
+from anchor.models import RawPost
 
 
 async def run_extraction(url: str, session: AsyncSession) -> dict:
@@ -125,17 +125,10 @@ async def run_extraction(url: str, session: AsyncSession) -> dict:
             "summary": None,
         }
 
-    # ── Step 5：从 DB 读取写入的实体汇总 ────────────────────────────────
-    nodes = list(
-        (await session.exec(select(ExtractionNode).where(ExtractionNode.raw_post_id == raw_post_id))).all()
-    )
-    edges = list(
-        (await session.exec(select(ExtractionEdge).where(ExtractionEdge.added_by_post_id == raw_post_id))).all()
-    )
-
+    # ── Step 5：返回提取结果 ────────────────────────────────────────────
     logger.info(
-        f"[Extraction] Done: {len(nodes)} nodes, {len(edges)} edges, "
-        f"domain={content_mode}"
+        f"[Extraction] Done: domain={content_mode}, "
+        f"result keys={list(extraction.keys()) if extraction else 'None'}"
     )
 
     return {
@@ -144,7 +137,5 @@ async def run_extraction(url: str, session: AsyncSession) -> dict:
         "author_name": author_name,
         "skipped": False,
         "extraction_result": extraction,
-        "nodes": nodes,
-        "edges": edges,
         "summary": extraction.get("summary"),
     }

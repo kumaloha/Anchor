@@ -162,6 +162,14 @@ class ConcurrentBatchRunner:
             result.content_mode = content_mode
             result.assessment_summary = assessment.get("assessment_summary")
 
+            # ── 域开关检查 ──
+            from anchor.config import settings
+            if not settings.is_domain_enabled(content_mode):
+                result.skipped = True
+                result.skip_reason = f"域 '{content_mode}' 已禁用"
+                result.success = True
+                return result
+
             # ── Step 3a: 提取计算（纯 LLM，无 DB）── 并发核心！
             logger.info(f"{tag} [3/3] 提取: post_id={raw_post_id} mode={content_mode}")
             compute_result = await self._step_extract_compute(
@@ -261,7 +269,6 @@ class ConcurrentBatchRunner:
         import datetime as _dt
         from anchor.database.session import AsyncSessionLocal
         from anchor.models import RawPost
-        from anchor.extract.pipelines.generic import extract_generic_compute
         from sqlmodel import select
 
         async with AsyncSessionLocal() as s:
@@ -280,6 +287,11 @@ class ConcurrentBatchRunner:
             platform = rp.source
             author = rp.author_name
 
+        if content_mode == "company":
+            from anchor.extract.pipelines.company import extract_company_compute
+            return await extract_company_compute(content, platform, author, today)
+
+        from anchor.extract.pipelines.generic import extract_generic_compute
         return await extract_generic_compute(
             content, platform, author, today, domain=content_mode,
         )
@@ -288,13 +300,18 @@ class ConcurrentBatchRunner:
         """DB 写入（通过 WritePool 串行调用）。"""
         from anchor.database.session import AsyncSessionLocal
         from anchor.models import RawPost
-        from anchor.extract.pipelines.generic import extract_generic_write
         from sqlmodel import select
 
         async with AsyncSessionLocal() as s:
             rp = (await s.exec(
                 select(RawPost).where(RawPost.id == raw_post_id)
             )).first()
+
+            if content_mode == "company":
+                from anchor.extract.pipelines.company import extract_company_write
+                return await extract_company_write(rp, s, compute_result)
+
+            from anchor.extract.pipelines.generic import extract_generic_write
             return await extract_generic_write(rp, s, content_mode, compute_result)
 
     async def _step_notion(self, raw_post_id: int):

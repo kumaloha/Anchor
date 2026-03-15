@@ -1,9 +1,6 @@
 """
 Anchor 核心数据模型
 ==================
-提取层（per-article, write-once）：
-  ExtractionNode / ExtractionEdge
-
 政策模型（结构化政策文件）：
   PolicyDocument / PolicyDirective / PolicyLink
 
@@ -32,19 +29,6 @@ from sqlmodel import Field, SQLModel
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
-
-# ===========================================================================
-# 节点类型注册表（Python dict，不在 DB 中）
-# ===========================================================================
-
-DOMAIN_NODE_TYPES = {
-    "policy":     ["主旨", "目标", "战略", "战术", "资源", "考核", "约束", "反馈", "外溢"],
-    "industry":   ["格局", "驱动", "趋势", "技术路线", "资金流向", "机会威胁", "标的"],
-    "technology": ["问题", "方案", "效果性能", "局限场景", "玩家"],
-    "futures":    ["供给", "需求", "库存", "头寸", "冲击", "缺口"],
-    "company":    ["叙事"],  # 经营议题改用 OperationalIssue 表，不再走 ExtractionNode
-    "expert":     ["事实", "判断", "预测", "建议"],
-}
 
 
 # ===========================================================================
@@ -194,48 +178,6 @@ class RawPost(SQLModel, table=True):
     monitored_source_id: Optional[int] = Field(
         default=None, foreign_key="monitored_sources.id"
     )
-
-
-# ===========================================================================
-# Layer 1 — 提取层（per-article, write-once LLM 输出）
-# ===========================================================================
-
-
-class ExtractionNode(SQLModel, table=True):
-    """提取层节点 — 单篇文章的 LLM 提取结果，写入后不变"""
-
-    __tablename__ = "extraction_nodes"
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    raw_post_id: int = Field(foreign_key="raw_posts.id", index=True)
-    domain: str = Field(index=True)       # policy|industry|technology|futures|company|expert
-    node_type: str = Field(index=True)    # 主旨|目标|... 领域内的节点类型
-    claim: str                             # 主要内容 (≤300字符)
-    summary: str                           # 短摘要 (≤30字符)
-    abstract: Optional[str] = None         # 一句话总结 (≤100字符)
-    metadata_json: Optional[str] = None    # 领域特定扩展数据 (JSON)
-    valid_from: Optional[date] = None      # 生效日期（LLM 判断）
-    valid_until: Optional[date] = None     # 失效日期（LLM 判断）
-    authority: Optional[int] = None          # 权威等级：0=一手信息，其他=作者 credibility_tier
-    verdict: Optional[str] = None
-    verdict_evidence: Optional[str] = None
-    verdict_verified_at: Optional[datetime] = None
-    created_at: datetime = Field(default_factory=_utcnow)
-
-
-class ExtractionEdge(SQLModel, table=True):
-    """提取层边 — 单篇文章内节点间关系"""
-
-    __tablename__ = "extraction_edges"
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    source_node_id: int = Field(foreign_key="extraction_nodes.id", index=True)
-    target_node_id: int = Field(foreign_key="extraction_nodes.id", index=True)
-    edge_type: str = "causes"             # 12种：causes|produces|derives|supports|contradicts|implements|constrains|amplifies|mitigates|resolves|measures|competes
-    note: Optional[str] = None            # ≤80字说明
-    added_by_post_id: int = Field(foreign_key="raw_posts.id", index=True)
-    authority: Optional[int] = None          # 权威等级：0=一手信息，其他=作者 credibility_tier
-    created_at: datetime = Field(default_factory=_utcnow)
 
 
 
@@ -794,10 +736,13 @@ class PatentCommercial(SQLModel, table=True):
 
 
 # ===========================================================================
-# 旧表 class 定义（v7 及之前）— 注释掉，DB 中旧表数据保留只读
+# 旧表 class 定义 — 注释掉，DB 中旧表数据保留只读
 # ===========================================================================
-# 旧实体表：Fact, Assumption, ImplicitCondition, Conclusion, Prediction,
-#           Solution, Theory
+# v8 通用提取表（已迁移到域专用管线）：
+#   ExtractionNode, ExtractionEdge, DOMAIN_NODE_TYPES
+# v7 及更早的旧实体表：
+#   Fact, Assumption, ImplicitCondition, Conclusion, Prediction,
+#   Solution, Theory
 # 旧专用表：PolicyTheme, PolicyItem, Policy, PolicyMeasure,
 #           Issue, TechRoute, Metric, PaperAnalysis, EarningsAnalysis
 # 旧边表：  EntityRelationship, EdgeType enum

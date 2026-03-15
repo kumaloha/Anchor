@@ -92,6 +92,21 @@ class Settings(BaseSettings):
     # 设为 False 可暂停事实验证（仅跑通用判断 + 内容提取），调试时用
     enable_verification: bool = False
 
+    # ── 域开关（迁移中：只有 company 已实现专用管线）────────────────────────
+    # 值为 True 的域走专用提取管线，False 的域跳过提取
+    enabled_domains: dict[str, bool] = {
+        "company": True,
+        "policy": False,
+        "industry": False,
+        "technology": False,
+        "futures": False,
+        "expert": False,
+    }
+
+    def is_domain_enabled(self, domain: str) -> bool:
+        """检查某域是否启用。未注册的域默认禁用。"""
+        return self.enabled_domains.get(domain, False)
+
     # ── Batch 模式（Qwen/OpenAI 兼容端点 50% 成本优化）────────────────────
     # 开启后 LLM 调用走 OpenAI Batch API，异步提交 + 轮询获取结果
     # 仅 llm_provider=openai 时生效；Anthropic 模式自动忽略

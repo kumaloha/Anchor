@@ -20,8 +20,6 @@ from anchor.config import settings
 from anchor.models import (
     Author,
     AuthorStanceProfile,
-    ExtractionEdge,
-    ExtractionNode,
     MonitoredSource,
     PostQualityAssessment,
     RawPost,
@@ -459,46 +457,8 @@ async def sync_post_to_notion(post_id: int, session: AsyncSession) -> Optional[s
     if pqa and pqa.stance_label:
         author_stance = pqa.stance_label
 
-    # ── 3. 加载 ExtractionNode/ExtractionEdge（v8.1 两层架构）─────────────
-    nodes = list((await session.exec(select(ExtractionNode).where(ExtractionNode.raw_post_id == post_id))).all())
-    edges = list((await session.exec(select(ExtractionEdge).where(ExtractionEdge.added_by_post_id == post_id))).all())
-
-    # ── 4. 构建节点列表文本 ──────────────────────────────────────────────────
-    def _build_node_list(nodes: list, edges: list) -> str:
-        """将节点+边渲染为简洁的文本列表。"""
-        lines = []
-        # 按 domain + node_type 分组
-        by_type: dict[str, list] = {}
-        for n in nodes:
-            by_type.setdefault(n.node_type, []).append(n)
-
-        node_labels: dict[int, str] = {}
-        idx = 0
-        for ntype, ns in by_type.items():
-            for n in ns:
-                idx += 1
-                label = f"N{idx}"
-                node_labels[n.id] = label
-                verdict_sym = ""
-                if n.verdict:
-                    v_map = {"credible": "✓", "confirmed": "✓", "accurate": "✓",
-                             "vague": "≈", "partial": "≈", "directional": "≈",
-                             "unreliable": "✗", "refuted": "✗", "wrong": "✗"}
-                    verdict_sym = " " + v_map.get(n.verdict, "")
-                text = n.abstract or n.summary
-                lines.append(f"{label}{verdict_sym} [{ntype}] {text}")
-
-        if edges:
-            lines.append("")
-            for e in edges:
-                src = node_labels.get(e.source_node_id, "?")
-                tgt = node_labels.get(e.target_node_id, "?")
-                note = f" ({e.note})" if e.note else ""
-                lines.append(f"  {src} → {tgt}{note}")
-
-        return "\n".join(lines)
-
-    _logic_text = _build_node_list(nodes, edges)
+    # ── 3. 构建逻辑列文本（ExtractionNode/Edge 已移除，使用摘要替代）──────
+    _logic_text = post.content_summary or ""
 
     # ── 5. 构建 Notion 页面属性 ───────────────────────────────────────────────
     _raw_title = ""
