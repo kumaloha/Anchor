@@ -353,9 +353,56 @@ async def get_embeddings(texts: list[str]) -> list[list[float]] | None:
 # ---------------------------------------------------------------------------
 
 
+def _is_ollama() -> bool:
+    """检测当前 LLM 后端是否为本地 Ollama。"""
+    base = (settings.llm_base_url or "").rstrip("/")
+    return "localhost:11434" in base or "127.0.0.1:11434" in base
+
+
+async def _ollama_completion(
+    system: str, user: str, max_tokens: int, model: str | None = None
+) -> Optional[LLMResponse]:
+    """通过 Ollama 原生 /api/chat 调用，支持 think 参数。"""
+    import httpx
+
+    base = (settings.llm_base_url or "").rstrip("/")
+    # /v1 结尾则去掉，拼原生端点
+    api_url = base.removesuffix("/v1") + "/api/chat"
+    payload = {
+        "model": model or _get_openai_model(),
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "think": False,
+        "stream": False,
+        "options": {"num_predict": max_tokens},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            r = await client.post(api_url, json=payload)
+            r.raise_for_status()
+        data = r.json()
+        msg = data.get("message", {})
+        return LLMResponse(
+            content=msg.get("content", ""),
+            model=data.get("model", ""),
+            input_tokens=data.get("prompt_eval_count", 0),
+            output_tokens=data.get("eval_count", 0),
+        )
+    except Exception as exc:
+        from loguru import logger
+        logger.error(f"[LLMClient] Ollama API error: {exc}")
+        return None
+
+
 async def _openai_completion(
     system: str, user: str, max_tokens: int, model: str | None = None
 ) -> Optional[LLMResponse]:
+    # Ollama 原生 API 支持 think 参数，走专用路径
+    if _is_ollama():
+        return await _ollama_completion(system, user, max_tokens, model)
+
     from openai import AsyncOpenAI, APIError
 
     client = AsyncOpenAI(
