@@ -473,6 +473,9 @@ class DownstreamSegment(SQLModel, table=True):
     revenue_type: Optional[str] = None             # product_sale|subscription|license|royalty|service|NRE|cloud_service
     is_recurring: Optional[bool] = None            # 是否经常性收入
     recognition_method: Optional[str] = None       # point_in_time|over_time
+    # Axion 新增字段（v10）
+    contract_duration_months: Optional[int] = None  # 合同平均时长（月）
+    switching_cost_level: Optional[str] = None       # high|medium|low（客户转换成本）
     description: Optional[str] = None              # 补充说明
     raw_post_id: Optional[int] = Field(
         default=None, foreign_key="raw_posts.id", index=True
@@ -562,6 +565,7 @@ class DebtObligation(SQLModel, table=True):
     maturity_date: Optional[date] = None           # 到期日
     is_secured: bool = False                       # 是否有担保
     is_current: bool = False                       # 是否一年内到期
+    is_floating_rate: bool = False                 # 是否浮动利率（Axion v10）
     note: Optional[str] = None                     # 特殊条款备注
     raw_post_id: Optional[int] = Field(
         default=None, foreign_key="raw_posts.id", index=True
@@ -732,6 +736,212 @@ class PatentCommercial(SQLModel, table=True):
     status: Optional[str] = None                   # active|expired|pending|settled|terminated
     source: Optional[str] = None                   # 信息来源: 10-K|press_release|court_filing
     description: Optional[str] = None              # 补充说明
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+# ===========================================================================
+# Axion 数据契约 — 巴菲特模块新增表（v10）
+# ===========================================================================
+
+
+class PricingAction(SQLModel, table=True):
+    """定价行为记录 — 提价/降价事件，每次定价变化一行"""
+
+    __tablename__ = "pricing_actions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(foreign_key="company_profiles.id", index=True)
+    period: str = Field(index=True)
+    product_or_segment: str
+    price_change_pct: Optional[float] = None
+    volume_impact_pct: Optional[float] = None
+    effective_date: Optional[date] = None
+    raw_post_id: Optional[int] = Field(
+        default=None, foreign_key="raw_posts.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class CompetitorRelation(SQLModel, table=True):
+    """竞对关系 — 每对竞争关系一行"""
+
+    __tablename__ = "competitor_relations"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(foreign_key="company_profiles.id", index=True)
+    competitor_name: str
+    competitor_company_id: Optional[int] = Field(
+        default=None, foreign_key="company_profiles.id"
+    )
+    market_segment: Optional[str] = None
+    relationship_type: str = "direct_competitor"  # direct_competitor|indirect_competitor|potential_entrant
+    raw_post_id: Optional[int] = Field(
+        default=None, foreign_key="raw_posts.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class MarketShareData(SQLModel, table=True):
+    """市占率数据 — 每家公司每期每细分市场一行"""
+
+    __tablename__ = "market_share_data"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(foreign_key="company_profiles.id", index=True)
+    market_segment: str
+    period: str = Field(index=True)
+    share_pct: Optional[float] = None
+    source_description: Optional[str] = None
+    raw_post_id: Optional[int] = Field(
+        default=None, foreign_key="raw_posts.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class KnownIssue(SQLModel, table=True):
+    """已知问题清单 — 外部可识别的公司问题"""
+
+    __tablename__ = "known_issues"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(foreign_key="company_profiles.id", index=True)
+    period: str = Field(index=True)
+    issue_description: str
+    issue_category: str = "operational"  # financial|operational|legal|reputational|regulatory
+    severity: str = "major"              # critical|major|minor
+    source_type: str = "news"            # analyst_report|news|litigation|financial_anomaly
+    raw_post_id: Optional[int] = Field(
+        default=None, foreign_key="raw_posts.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class ManagementAcknowledgment(SQLModel, table=True):
+    """管理层问题回应 — 管理层对已知问题的提及或回应"""
+
+    __tablename__ = "management_acknowledgments"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(foreign_key="company_profiles.id", index=True)
+    period: str = Field(index=True)
+    known_issue_id: Optional[int] = Field(
+        default=None, foreign_key="known_issues.id"
+    )
+    issue_description: Optional[str] = None
+    response_quality: str = "forthright"  # forthright|downplay|deflect|deny
+    has_action_plan: bool = False
+    raw_post_id: Optional[int] = Field(
+        default=None, foreign_key="raw_posts.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class InsiderTransaction(SQLModel, table=True):
+    """内部人交易 — SEC Form 4 / 权益披露"""
+
+    __tablename__ = "insider_transactions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(foreign_key="company_profiles.id", index=True)
+    person_name: str
+    title: Optional[str] = None
+    transaction_type: str = "buy"        # buy|sell|option_exercise
+    shares: Optional[int] = None
+    price_per_share: Optional[float] = None
+    transaction_date: Optional[date] = None
+    raw_post_id: Optional[int] = Field(
+        default=None, foreign_key="raw_posts.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class ExecutiveChange(SQLModel, table=True):
+    """高管变动 — 入职/离职/晋升/降职"""
+
+    __tablename__ = "executive_changes"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(foreign_key="company_profiles.id", index=True)
+    person_name: str
+    title: Optional[str] = None
+    change_type: str = "joined"          # joined|departed|promoted|demoted
+    change_date: Optional[date] = None
+    reason: Optional[str] = None
+    raw_post_id: Optional[int] = Field(
+        default=None, foreign_key="raw_posts.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class AuditOpinion(SQLModel, table=True):
+    """审计意见 — 每个财年一行"""
+
+    __tablename__ = "audit_opinions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(foreign_key="company_profiles.id", index=True)
+    period: str = Field(index=True)
+    opinion_type: str = "unqualified"    # unqualified|qualified|adverse|disclaimer
+    auditor_name: Optional[str] = None
+    emphasis_matters: Optional[str] = None
+    raw_post_id: Optional[int] = Field(
+        default=None, foreign_key="raw_posts.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class AnalystEstimate(SQLModel, table=True):
+    """分析师预期 — 一致预期 vs 实际"""
+
+    __tablename__ = "analyst_estimates"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(foreign_key="company_profiles.id", index=True)
+    period: str = Field(index=True)
+    metric: str                          # eps|revenue|ebitda
+    consensus_estimate: Optional[float] = None
+    actual: Optional[float] = None
+    surprise_pct: Optional[float] = None
+    estimate_date: Optional[date] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class EquityOffering(SQLModel, table=True):
+    """股权融资事件 — IPO/增发/可转债"""
+
+    __tablename__ = "equity_offerings"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(foreign_key="company_profiles.id", index=True)
+    offering_date: Optional[date] = None
+    offering_type: str = "secondary"     # ipo|secondary|follow_on|atm|convertible
+    shares_offered: Optional[int] = None
+    price_per_share: Optional[float] = None
+    total_proceeds: Optional[float] = None
+    raw_post_id: Optional[int] = Field(
+        default=None, foreign_key="raw_posts.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class ManagementGuidance(SQLModel, table=True):
+    """管理层前瞻指引 — 每条 guidance 一行"""
+
+    __tablename__ = "management_guidance"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_id: int = Field(foreign_key="company_profiles.id", index=True)
+    source_period: str = Field(index=True)   # 发布期: "FY2025Q3"
+    target_period: Optional[str] = None      # 目标期: "FY2026"
+    metric: str                              # revenue|revenue_growth|operating_margin|net_margin|eps|capex|roic_target|free_cash_flow|gross_margin|tax_rate|share_repurchase|dividend|other
+    value_low: Optional[float] = None
+    value_high: Optional[float] = None
+    unit: str = "absolute"                   # pct|absolute|per_share
+    confidence_language: Optional[str] = None  # expect|target|aspire|preliminary
+    verbatim: Optional[str] = None           # 原文引用
+    raw_post_id: Optional[int] = Field(
+        default=None, foreign_key="raw_posts.id", index=True
+    )
     created_at: datetime = Field(default_factory=_utcnow)
 
 

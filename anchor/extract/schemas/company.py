@@ -45,6 +45,8 @@ class ExtractedDownstream(BaseModel):
     revenue_type: Optional[str] = None
     is_recurring: Optional[bool] = None
     recognition_method: Optional[str] = None
+    contract_duration_months: Optional[int] = None
+    switching_cost_level: Optional[str] = None
     description: Optional[str] = None
 
 
@@ -90,6 +92,7 @@ class ExtractedDebtObligation(BaseModel):
     maturity_date: Optional[str] = None
     is_secured: bool = False
     is_current: bool = False
+    is_floating_rate: bool = False
     note: Optional[str] = None
 
 
@@ -138,6 +141,81 @@ class ExtractedRelatedPartyTransaction(BaseModel):
     description: Optional[str] = None
 
 
+# ── Axion 新增表 schemas ──────────────────────────────────────────────
+
+
+class ExtractedPricingAction(BaseModel):
+    product_or_segment: str
+    price_change_pct: Optional[float] = None
+    volume_impact_pct: Optional[float] = None
+    effective_date: Optional[str] = None
+
+
+class ExtractedCompetitorRelation(BaseModel):
+    competitor_name: str
+    market_segment: Optional[str] = None
+    relationship_type: str = "direct_competitor"
+
+
+class ExtractedMarketShareData(BaseModel):
+    company_or_competitor: str
+    market_segment: str
+    share_pct: Optional[float] = None
+    source_description: Optional[str] = None
+
+
+class ExtractedKnownIssue(BaseModel):
+    issue_description: str
+    issue_category: str = "operational"
+    severity: str = "major"
+    source_type: str = "news"
+
+
+class ExtractedManagementAcknowledgment(BaseModel):
+    issue_description: str
+    response_quality: str = "forthright"
+    has_action_plan: bool = False
+
+
+class ExtractedExecutiveChange(BaseModel):
+    person_name: str
+    title: Optional[str] = None
+    change_type: str = "joined"
+    change_date: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class ExtractedAuditOpinion(BaseModel):
+    opinion_type: str = "unqualified"
+    auditor_name: Optional[str] = None
+    emphasis_matters: Optional[str] = None
+
+
+class ExtractedManagementGuidance(BaseModel):
+    target_period: Optional[str] = None
+    metric: str
+    value_low: Optional[float] = None
+    value_high: Optional[float] = None
+    unit: str = "absolute"
+    confidence_language: Optional[str] = None
+    verbatim: Optional[str] = None
+
+
+class ExtractedFinancialLineItem(BaseModel):
+    item_key: str
+    item_label: str
+    value: float
+    note: Optional[str] = None
+
+
+class ExtractedFinancialStatements(BaseModel):
+    """三表财务数据（利润表、资产负债表、现金流量表）"""
+    currency: str = "USD"
+    income: list[ExtractedFinancialLineItem] = []
+    balance_sheet: list[ExtractedFinancialLineItem] = []
+    cashflow: list[ExtractedFinancialLineItem] = []
+
+
 # ── 顶层 LLM 输出模型 ──────────────────────────────────────────────────
 
 
@@ -159,7 +237,20 @@ class CompanyExtractionResult(BaseModel):
     company: Optional[CompanyProfile] = None
     period: str = ""  # "FY2025" / "2025Q4"
 
-    # 13 张表的数据
+    # 财务三表
+    financial_statements: Optional[ExtractedFinancialStatements] = None
+
+    # Axion 新增表
+    pricing_actions: list[ExtractedPricingAction] = []
+    competitor_relations: list[ExtractedCompetitorRelation] = []
+    market_share_data: list[ExtractedMarketShareData] = []
+    known_issues: list[ExtractedKnownIssue] = []
+    management_acknowledgments: list[ExtractedManagementAcknowledgment] = []
+    executive_changes: list[ExtractedExecutiveChange] = []
+    audit_opinion: Optional[ExtractedAuditOpinion] = None
+    management_guidance: list[ExtractedManagementGuidance] = []
+
+    # 业务表
     operational_issues: list[ExtractedOperationalIssue] = []
     narratives: list[ExtractedNarrative] = []
     downstream_segments: list[ExtractedDownstream] = []
